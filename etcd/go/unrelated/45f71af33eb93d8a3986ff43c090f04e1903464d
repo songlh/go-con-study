@@ -1,0 +1,163 @@
+commit 45f71af33eb93d8a3986ff43c090f04e1903464d
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Thu Sep 25 10:40:40 2014 -0700
+
+    pkg: move testutil to pkg
+
+diff --git a/etcdserver/server_test.go b/etcdserver/server_test.go
+index dcd1fd6..90615da 100644
+--- a/etcdserver/server_test.go
++++ b/etcdserver/server_test.go
+@@ -9,10 +9,10 @@ import (
+ 	"time"
+ 
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/pkg"
+ 	"github.com/coreos/etcd/raft"
+ 	"github.com/coreos/etcd/raft/raftpb"
+ 	"github.com/coreos/etcd/store"
+-	"github.com/coreos/etcd/testutil"
+ 	"github.com/coreos/etcd/third_party/code.google.com/p/go.net/context"
+ )
+ 
+@@ -572,7 +572,7 @@ func TestSync(t *testing.T) {
+ 		t.Errorf("CallSyncTime = %v, want < %v", d, time.Millisecond)
+ 	}
+ 
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	data := n.data()
+ 	if len(data) != 1 {
+ 		t.Fatalf("len(proposeData) = %d, want 1", len(data))
+@@ -603,7 +603,7 @@ func TestSyncTimeout(t *testing.T) {
+ 
+ 	// give time for goroutine in sync to cancel
+ 	// TODO: use fake clock
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	w := []action{action{name: "Propose blocked"}}
+ 	if g := n.Action(); !reflect.DeepEqual(g, w) {
+ 		t.Errorf("action = %v, want %v", g, w)
+@@ -743,7 +743,7 @@ func TestRecvSnapshot(t *testing.T) {
+ 	s.Start()
+ 	n.readyc <- raft.Ready{Snapshot: raftpb.Snapshot{Index: 1}}
+ 	// make goroutines move forward to receive snapshot
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	s.Stop()
+ 
+ 	wactions := []action{action{name: "Recovery"}}
+@@ -771,12 +771,12 @@ func TestRecvSlowSnapshot(t *testing.T) {
+ 	s.Start()
+ 	n.readyc <- raft.Ready{Snapshot: raftpb.Snapshot{Index: 1}}
+ 	// make goroutines move forward to receive snapshot
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	action := st.Action()
+ 
+ 	n.readyc <- raft.Ready{Snapshot: raftpb.Snapshot{Index: 1}}
+ 	// make goroutines move forward to receive snapshot
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	s.Stop()
+ 
+ 	if g := st.Action(); !reflect.DeepEqual(g, action) {
+diff --git a/pkg/test_util.go b/pkg/test_util.go
+new file mode 100644
+index 0000000..8925447
+--- /dev/null
++++ b/pkg/test_util.go
+@@ -0,0 +1,14 @@
++package pkg
++
++import (
++	"runtime"
++)
++
++// WARNING: This is a hack.
++// Remove this when we are able to block/check the status of the go-routines.
++func ForceGosched() {
++	// possibility enough to sched upto 10 go routines.
++	for i := 0; i < 10000; i++ {
++		runtime.Gosched()
++	}
++}
+diff --git a/raft/node_test.go b/raft/node_test.go
+index 782653a..41917e3 100644
+--- a/raft/node_test.go
++++ b/raft/node_test.go
+@@ -5,8 +5,8 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/coreos/etcd/pkg"
+ 	"github.com/coreos/etcd/raft/raftpb"
+-	"github.com/coreos/etcd/testutil"
+ 	"github.com/coreos/etcd/third_party/code.google.com/p/go.net/context"
+ )
+ 
+@@ -105,7 +105,7 @@ func TestBlockProposal(t *testing.T) {
+ 		errc <- n.Propose(context.TODO(), []byte("somedata"))
+ 	}()
+ 
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	select {
+ 	case err := <-errc:
+ 		t.Errorf("err = %v, want blocking", err)
+@@ -113,7 +113,7 @@ func TestBlockProposal(t *testing.T) {
+ 	}
+ 
+ 	n.Campaign(context.TODO())
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	select {
+ 	case err := <-errc:
+ 		if err != nil {
+@@ -225,7 +225,7 @@ func TestCompact(t *testing.T) {
+ 		Nodes: []int64{1},
+ 	}
+ 
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	select {
+ 	case <-n.Ready():
+ 	default:
+@@ -233,7 +233,7 @@ func TestCompact(t *testing.T) {
+ 	}
+ 
+ 	n.Compact(w.Data)
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	select {
+ 	case rd := <-n.Ready():
+ 		if !reflect.DeepEqual(rd.Snapshot, w) {
+@@ -242,7 +242,7 @@ func TestCompact(t *testing.T) {
+ 	default:
+ 		t.Fatalf("unexpected compact failure: unable to create a snapshot")
+ 	}
+-	testutil.ForceGosched()
++	pkg.ForceGosched()
+ 	// TODO: this test the run updates the snapi correctly... should be tested
+ 	// separately with other kinds of updates
+ 	select {
+diff --git a/testutil/testutil.go b/testutil/testutil.go
+deleted file mode 100644
+index 78ee249..0000000
+--- a/testutil/testutil.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-package testutil
+-
+-import (
+-	"runtime"
+-)
+-
+-// WARNING: This is a hack.
+-// Remove this when we are able to block/check the status of the go-routines.
+-func ForceGosched() {
+-	// possibility enough to sched upto 10 go routines.
+-	for i := 0; i < 10000; i++ {
+-		runtime.Gosched()
+-	}
+-}

@@ -1,0 +1,165 @@
+commit d2382c232e60689af4bb4c632d809f8dec5ba7fd
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Sat Jul 20 16:29:27 2013 -0700
+
+    not hardcode debug scheme
+
+diff --git a/client_handlers.go b/client_handlers.go
+index 522046e..6c1330c 100644
+--- a/client_handlers.go
++++ b/client_handlers.go
+@@ -1,7 +1,6 @@
+ package main
+ 
+ import (
+-	"fmt"
+ 	"github.com/coreos/etcd/store"
+ 	"net/http"
+ 	"strconv"
+@@ -116,10 +115,10 @@ func dispatch(c Command, w *http.ResponseWriter, req *http.Request, client bool)
+ 		} else {
+ 
+ 			if body == nil {
+-				fmt.Println("empty but not err!")
+ 				http.NotFound((*w), req)
+ 			} else {
+ 				body, ok := body.([]byte)
++				// this should not happen
+ 				if !ok {
+ 					panic("wrong type")
+ 				}
+diff --git a/etcd.go b/etcd.go
+index 3a2776b..20701f9 100644
+--- a/etcd.go
++++ b/etcd.go
+@@ -52,6 +52,8 @@ var ignore bool
+ 
+ var maxSize int
+ 
++var snapshot bool
++
+ func init() {
+ 	flag.BoolVar(&verbose, "v", false, "verbose logging")
+ 
+@@ -75,6 +77,8 @@ func init() {
+ 
+ 	flag.BoolVar(&ignore, "i", false, "ignore the old configuration, create a new node")
+ 
++	flag.BoolVar(&snapshot, "snapshot", false, "open or close snapshot")
++
+ 	flag.IntVar(&maxSize, "m", 1024, "the max size of result buffer")
+ }
+ 
+@@ -207,13 +211,15 @@ func startRaft(securityType int) {
+ 	}
+ 
+ 	// LoadSnapshot
+-	// err = raftServer.LoadSnapshot()
++	if snapshot {
++		err = raftServer.LoadSnapshot()
+ 
+-	// if err == nil {
+-	// 	debug("%s finished load snapshot", raftServer.Name())
+-	// } else {
+-	// 	debug(err)
+-	// }
++		if err == nil {
++			debug("%s finished load snapshot", raftServer.Name())
++		} else {
++			debug(err.Error())
++		}
++	}
+ 
+ 	raftServer.Initialize()
+ 	raftServer.SetElectionTimeout(ELECTIONTIMTOUT)
+@@ -267,7 +273,9 @@ func startRaft(securityType int) {
+ 	}
+ 
+ 	// open the snapshot
+-	//go raftServer.Snapshot()
++	if snapshot {
++		go raftServer.Snapshot()
++	}
+ 
+ 	// start to response to raft requests
+ 	go startRaftTransport(info.RaftPort, securityType)
+@@ -567,9 +575,6 @@ func joinCluster(s *raft.Server, serverName string) error {
+ 				json.NewEncoder(&b).Encode(command)
+ 				resp, err = t.Post(fmt.Sprintf("%s/join", address), &b)
+ 			} else {
+-				b, _ := ioutil.ReadAll(resp.Body)
+-				fmt.Println(string(b))
+-				resp.Body.Close()
+ 				return fmt.Errorf("Unable to join")
+ 			}
+ 		}
+diff --git a/raft_handlers.go b/raft_handlers.go
+index e3acb1c..face1d9 100644
+--- a/raft_handlers.go
++++ b/raft_handlers.go
+@@ -13,7 +13,7 @@ import (
+ 
+ // Get all the current logs
+ func GetLogHttpHandler(w http.ResponseWriter, req *http.Request) {
+-	debug("[recv] GET http://%v/log", raftServer.Name())
++	debug("[recv] GET %s/log", raftTransporter.scheme+raftServer.Name())
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(http.StatusOK)
+ 	json.NewEncoder(w).Encode(raftServer.LogEntries())
+@@ -24,7 +24,7 @@ func VoteHttpHandler(w http.ResponseWriter, req *http.Request) {
+ 	rvreq := &raft.RequestVoteRequest{}
+ 	err := decodeJsonRequest(req, rvreq)
+ 	if err == nil {
+-		debug("[recv] POST http://%v/vote [%s]", raftServer.Name(), rvreq.CandidateName)
++		debug("[recv] POST %s/vote [%s]", raftTransporter.scheme+raftServer.Name(), rvreq.CandidateName)
+ 		if resp := raftServer.RequestVote(rvreq); resp != nil {
+ 			w.WriteHeader(http.StatusOK)
+ 			json.NewEncoder(w).Encode(resp)
+@@ -41,7 +41,7 @@ func AppendEntriesHttpHandler(w http.ResponseWriter, req *http.Request) {
+ 	err := decodeJsonRequest(req, aereq)
+ 
+ 	if err == nil {
+-		debug("[recv] POST http://%s/log/append [%d]", raftServer.Name(), len(aereq.Entries))
++		debug("[recv] POST %s/log/append [%d]", raftTransporter.scheme+raftServer.Name(), len(aereq.Entries))
+ 		if resp := raftServer.AppendEntries(aereq); resp != nil {
+ 			w.WriteHeader(http.StatusOK)
+ 			json.NewEncoder(w).Encode(resp)
+@@ -60,7 +60,7 @@ func SnapshotHttpHandler(w http.ResponseWriter, req *http.Request) {
+ 	aereq := &raft.SnapshotRequest{}
+ 	err := decodeJsonRequest(req, aereq)
+ 	if err == nil {
+-		debug("[recv] POST http://%s/snapshot/ ", raftServer.Name())
++		debug("[recv] POST %s/snapshot/ ", raftTransporter.scheme+raftServer.Name())
+ 		if resp := raftServer.RequestSnapshot(aereq); resp != nil {
+ 			w.WriteHeader(http.StatusOK)
+ 			json.NewEncoder(w).Encode(resp)
+@@ -76,7 +76,7 @@ func SnapshotRecoveryHttpHandler(w http.ResponseWriter, req *http.Request) {
+ 	aereq := &raft.SnapshotRecoveryRequest{}
+ 	err := decodeJsonRequest(req, aereq)
+ 	if err == nil {
+-		debug("[recv] POST http://%s/snapshotRecovery/ ", raftServer.Name())
++		debug("[recv] POST %s/snapshotRecovery/ ", raftTransporter.scheme+raftServer.Name())
+ 		if resp := raftServer.SnapshotRecoveryRequest(aereq); resp != nil {
+ 			w.WriteHeader(http.StatusOK)
+ 			json.NewEncoder(w).Encode(resp)
+@@ -89,7 +89,7 @@ func SnapshotRecoveryHttpHandler(w http.ResponseWriter, req *http.Request) {
+ 
+ // Get the port that listening for client connecting of the server
+ func ClientHttpHandler(w http.ResponseWriter, req *http.Request) {
+-	debug("[recv] Get http://%v/client/ ", raftServer.Name())
++	debug("[recv] Get %s/client/ ", raftTransporter.scheme+raftServer.Name())
+ 	w.WriteHeader(http.StatusOK)
+ 	client := hostname + ":" + strconv.Itoa(clientPort)
+ 	w.Write([]byte(client))
+diff --git a/transporter.go b/transporter.go
+index c4cd0bf..460ce4d 100644
+--- a/transporter.go
++++ b/transporter.go
+@@ -104,7 +104,6 @@ func (t transporter) SendSnapshotRecoveryRequest(server *raft.Server, peer *raft
+ 		defer resp.Body.Close()
+ 		aersp = &raft.SnapshotRecoveryResponse{}
+ 		if err = json.NewDecoder(resp.Body).Decode(&aersp); err == nil || err == io.EOF {
+-
+ 			return aersp
+ 		}
+ 	}

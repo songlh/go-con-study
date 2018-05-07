@@ -1,0 +1,72 @@
+commit e3e4d096535e59995270db19496aedb92a3ecc77
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Feb 4 21:49:32 2016 -0800
+
+    clientv3/integration: add timeouts to TestTxnWriteFail
+    
+    so it doesn't take ten minutes to fail
+
+diff --git a/clientv3/integration/txn_test.go b/clientv3/integration/txn_test.go
+index ffc0131..da6b6d8 100644
+--- a/clientv3/integration/txn_test.go
++++ b/clientv3/integration/txn_test.go
+@@ -33,21 +33,48 @@ func TestTxnWriteFail(t *testing.T) {
+ 	clus.Members[0].Stop(t)
+ 	<-clus.Members[0].StopNotify()
+ 
+-	resp, err := kv.Txn().Then(clientv3.OpPut("foo", "bar", 0)).Commit()
+-	if err == nil {
+-		t.Fatalf("expected error, got response %v", resp)
++	donec := make(chan struct{})
++	go func() {
++		resp, err := kv.Txn().Then(clientv3.OpPut("foo", "bar", 0)).Commit()
++		if err == nil {
++			t.Fatalf("expected error, got response %v", resp)
++		}
++		donec <- struct{}{}
++	}()
++
++	select {
++	case <-time.After(5 * time.Second):
++		t.Fatalf("timed out waiting for txn to fail")
++	case <-donec:
++		// don't restart cluster until txn errors out
+ 	}
+ 
+-	// reconnect so cluster terminate doesn't complain about double-close
+-	clus.Members[0].Restart(t)
++	go func() {
++		// reconnect so terminate doesn't complain about double-close
++		clus.Members[0].Restart(t)
++		donec <- struct{}{}
+ 
+-	// and ensure the put didn't take
+-	gresp, gerr := kv.Get("foo", 0)
+-	if gerr != nil {
+-		t.Fatal(gerr)
++		// and ensure the put didn't take
++		gresp, gerr := kv.Get("foo", 0)
++		if gerr != nil {
++			t.Fatal(gerr)
++		}
++		if len(gresp.Kvs) != 0 {
++			t.Fatalf("expected no keys, got %v", gresp.Kvs)
++		}
++		donec <- struct{}{}
++	}()
++
++	select {
++	case <-time.After(5 * time.Second):
++		t.Fatalf("timed out waiting for restart")
++	case <-donec:
+ 	}
+-	if len(gresp.Kvs) != 0 {
+-		t.Fatalf("expected no keys, got %v", gresp.Kvs)
++
++	select {
++	case <-time.After(5 * time.Second):
++		t.Fatalf("timed out waiting for get")
++	case <-donec:
+ 	}
+ }
+ 

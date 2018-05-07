@@ -1,0 +1,139 @@
+commit 4f5f999847c3ac17529af8cf7396dc14c7ce3636
+Author: Pawel Palucki <pawel.palucki@intel.com>
+Date:   Tue Dec 15 15:49:09 2015 +0100
+
+    tools/functional-test: add docker support
+    
+    Commit adds docker bits to run functional tester within containers.
+    
+    requires:
+    - docker 1.9 (networking)
+    - docker-compose
+
+diff --git a/.gitignore b/.gitignore
+index e99f800..0022072 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,4 @@
+ *.swp
+ /hack/insta-discovery/.env
+ *.test
++tools/functional-tester/docker/bin
+diff --git a/tools/functional-tester/README.md b/tools/functional-tester/README.md
+index 1da3668..51d3ef3 100644
+--- a/tools/functional-tester/README.md
++++ b/tools/functional-tester/README.md
+@@ -14,4 +14,24 @@ etcd agent is a daemon on each machines. It can start, stop, restart, isolate an
+ 
+ ## etcd tester
+ 
+-etcd functional tester control the progress of the functional tests. It calls the the RPC of the etcd agent to simulate various test cases. For example, it can start a three members cluster by sending three start RPC calls to three different etcd agents. It can make one of the member failed by sending stop RPC call to one etcd agent.
+\ No newline at end of file
++etcd functional tester control the progress of the functional tests. It calls the RPC of the etcd agent to simulate various test cases. For example, it can start a three members cluster by sending three start RPC calls to three different etcd agents. It can make one of the member failed by sending stop RPC call to one etcd agent.
++
++## with Docker (optionally)
++
++To run the functional tests using Docker, the provided script can be used to set up an environment using Docker Compose. 
++
++Script (on linux):
++```sh
++./tools/functional-tester/test
++```
++
++Running the script requires:
++
++- Docker 1.9+ (with networking support) - to create isolated network
++- docker-compose - to create etcd cluster and tester
++- A multi-arch Go toolchain (OSX)
++
++Notes:
++- Docker image is based on Alpine Linux OS running in privileged mode to allow iptables manipulation.
++- To specify testing parameters (etcd-tester arguments) modify tools/functional-tester/docker/docker-compose.yml or start etcd-tester manually
++- (OSX) make sure that etcd binary is built for linux/amd64 (eg. `rm bin/etcd;GOOS=linux GOARCH=amd64 ./tools/functional-tester/test`) otherwise you get `exec format error`
+diff --git a/tools/functional-tester/build b/tools/functional-tester/build
+new file mode 100755
+index 0000000..d98d4a9
+--- /dev/null
++++ b/tools/functional-tester/build
+@@ -0,0 +1,4 @@
++#!/bin/sh -e
++CGO_ENABLED=0 go build -a -installsuffix cgo -ldflags "-s" -o bin/etcd-agent ./tools/functional-tester/etcd-agent
++CGO_ENABLED=0 go build -a -installsuffix cgo -ldflags "-s" -o bin/etcd-tester ./tools/functional-tester/etcd-tester
++
+diff --git a/tools/functional-tester/docker/Dockerfile b/tools/functional-tester/docker/Dockerfile
+new file mode 100644
+index 0000000..0c8e49f
+--- /dev/null
++++ b/tools/functional-tester/docker/Dockerfile
+@@ -0,0 +1,8 @@
++FROM alpine
++RUN apk update 
++RUN apk add -v iptables sudo
++ADD bin/etcd-agent /
++ADD bin/etcd /
++ADD bin/etcd-tester /
++RUN mkdir /failure_archive
++CMD ["./etcd-agent", "-etcd-path", "./etcd"]
+diff --git a/tools/functional-tester/docker/docker-compose.yml b/tools/functional-tester/docker/docker-compose.yml
+new file mode 100644
+index 0000000..5aa7659
+--- /dev/null
++++ b/tools/functional-tester/docker/docker-compose.yml
+@@ -0,0 +1,28 @@
++# build according provided Dockerfile
++a1:
++  build: .
++  privileged: true
++  net: etcd-functional
++a2:
++  build: .
++  privileged: true
++  net: etcd-functional
++a3:
++  build: .
++  privileged: true
++  net: etcd-functional
++tester:
++  build: .
++  privileged: true
++  net: etcd-functional
++  command:
++    - /etcd-tester
++    - -agent-endpoints
++    - "172.20.0.2:9027,172.20.0.3:9027,172.20.0.4:9027"
++    - -limit 
++    - "1"
++    - -stress-key-count
++    - "1"
++    - -stress-key-size
++    - "1"
++      
+diff --git a/tools/functional-tester/test b/tools/functional-tester/test
+new file mode 100755
+index 0000000..e8d0e4c
+--- /dev/null
++++ b/tools/functional-tester/test
+@@ -0,0 +1,23 @@
++#!/bin/sh -e
++set -x
++set -e
++
++# 1. build etcd binaries
++[ -f bin/etcd ] || ./build
++
++# 2. build agent & tester
++[ -f bin/etcd-agent -a -f bin/etcd-tester ] || ./tools/functional-tester/build
++
++# 3. build docker image (alpine based)
++mkdir -p ./tools/functional-tester/docker/bin
++cp -v bin/etcd-agent bin/etcd-tester bin/etcd ./tools/functional-tester/docker/bin
++docker-compose -f tools/functional-tester/docker/docker-compose.yml build
++
++# 4. create network (assumption - no overlaps)
++docker network ls | grep etcd-functional || docker network create --subnet 172.20.0.0/16 etcd-functional
++
++# 5. run cluster and tester (assumption - agents'll get first ip addresses)
++docker-compose -f tools/functional-tester/docker/docker-compose.yml up -d a1 a2 a3
++
++# 6. run tester
++docker-compose -f tools/functional-tester/docker/docker-compose.yml run tester

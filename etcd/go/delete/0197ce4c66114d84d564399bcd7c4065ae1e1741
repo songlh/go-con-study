@@ -1,0 +1,144 @@
+commit 0197ce4c66114d84d564399bcd7c4065ae1e1741
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Wed Jul 30 13:58:26 2014 -0700
+
+    server: move TestMultiNodeKillAllAndRecovery to etcd/
+
+diff --git a/etcd/etcd_functional_test.go b/etcd/etcd_functional_test.go
+index d1ce17c..948fae5 100644
+--- a/etcd/etcd_functional_test.go
++++ b/etcd/etcd_functional_test.go
+@@ -217,6 +217,53 @@ func TestMultiNodeKillOne(t *testing.T) {
+ 	afterTest(t)
+ }
+ 
++func TestMultiNodeKillAllAndRecovery(t *testing.T) {
++	tests := []int{5}
++
++	for i, tt := range tests {
++		es, hs := buildCluster(tt, false)
++		waitCluster(t, es)
++		waitLeader(es)
++
++		c := etcd.NewClient([]string{hs[0].URL})
++		for i := 0; i < 10; i++ {
++			if _, err := c.Set("foo", "bar", 0); err != nil {
++				panic(err)
++			}
++		}
++
++		for k := range es {
++			es[k].Stop()
++			hs[k].Close()
++		}
++
++		for k := range es {
++			c := config.New()
++			c.DataDir = es[k].config.DataDir
++			c.Addr = hs[k].Listener.Addr().String()
++			id := es[k].id
++			e, h, err := buildServer(t, c, id)
++			if err != nil {
++				t.Fatalf("#%d.%d: %v", i, k, err)
++			}
++			es[k] = e
++			hs[k] = h
++		}
++
++		waitLeader(es)
++		res, err := c.Set("foo", "bar", 0)
++		if err != nil {
++			t.Fatalf("#%d: set err after recovery: %v", err)
++		}
++		if g := res.Node.ModifiedIndex; g != 16 {
++			t.Errorf("#%d: modifiedIndex = %d, want %d", i, g, 16)
++		}
++
++		destoryCluster(t, es, hs)
++	}
++	afterTest(t)
++}
++
+ func BenchmarkEndToEndSet(b *testing.B) {
+ 	es, hs := buildCluster(3, false)
+ 	waitLeader(es)
+diff --git a/tests/functional/multi_node_kill_all_and_recovery_test.go b/tests/functional/multi_node_kill_all_and_recovery_test.go
+index a5f1e1e..451af4d 100644
+--- a/tests/functional/multi_node_kill_all_and_recovery_test.go
++++ b/tests/functional/multi_node_kill_all_and_recovery_test.go
+@@ -14,75 +14,6 @@ import (
+ 	"github.com/coreos/etcd/third_party/github.com/stretchr/testify/assert"
+ )
+ 
+-// Create a five nodes
+-// Kill all the nodes and restart
+-func TestMultiNodeKillAllAndRecovery(t *testing.T) {
+-	procAttr := new(os.ProcAttr)
+-	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
+-
+-	stop := make(chan bool)
+-	leaderChan := make(chan string, 1)
+-	all := make(chan bool, 1)
+-
+-	clusterSize := 5
+-	argGroup, etcds, err := CreateCluster(clusterSize, procAttr, false)
+-	defer DestroyCluster(etcds)
+-
+-	if err != nil {
+-		t.Fatal("cannot create cluster")
+-	}
+-
+-	c := etcd.NewClient(nil)
+-
+-	go Monitor(clusterSize, clusterSize, leaderChan, all, stop)
+-	<-all
+-	<-leaderChan
+-	stop <- true
+-
+-	c.SyncCluster()
+-
+-	// send 10 commands
+-	for i := 0; i < 10; i++ {
+-		// Test Set
+-		_, err := c.Set("foo", "bar", 0)
+-		if err != nil {
+-			panic(err)
+-		}
+-	}
+-
+-	time.Sleep(time.Second)
+-
+-	// kill all
+-	DestroyCluster(etcds)
+-
+-	time.Sleep(time.Second)
+-
+-	stop = make(chan bool)
+-	leaderChan = make(chan string, 1)
+-	all = make(chan bool, 1)
+-
+-	time.Sleep(time.Second)
+-
+-	for i := 0; i < clusterSize; i++ {
+-		etcds[i], err = os.StartProcess(EtcdBinPath, argGroup[i], procAttr)
+-	}
+-
+-	go Monitor(clusterSize, 1, leaderChan, all, stop)
+-
+-	<-all
+-	<-leaderChan
+-
+-	result, err := c.Set("foo", "bar", 0)
+-
+-	if err != nil {
+-		t.Fatalf("Recovery error: %s", err)
+-	}
+-
+-	if result.Node.ModifiedIndex != 17 {
+-		t.Fatalf("recovery failed! [%d/17]", result.Node.ModifiedIndex)
+-	}
+-}
+-
+ // TestTLSMultiNodeKillAllAndRecovery create a five nodes
+ // then kill all the nodes and restart
+ func TestTLSMultiNodeKillAllAndRecovery(t *testing.T) {

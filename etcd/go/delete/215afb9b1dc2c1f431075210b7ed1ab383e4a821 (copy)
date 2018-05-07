@@ -1,0 +1,181 @@
+commit 215afb9b1dc2c1f431075210b7ed1ab383e4a821
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu May 12 11:41:55 2016 -0700
+
+    etcd-runner: refactor round code
+
+diff --git a/tools/functional-tester/etcd-runner/main.go b/tools/functional-tester/etcd-runner/main.go
+index 4e8b055..2699e2a 100644
+--- a/tools/functional-tester/etcd-runner/main.go
++++ b/tools/functional-tester/etcd-runner/main.go
+@@ -36,7 +36,7 @@ func main() {
+ 	log.SetFlags(log.Lmicroseconds)
+ 
+ 	endpointStr := flag.String("endpoints", "localhost:2379", "endpoints of etcd cluster")
+-	mode := flag.String("mode", "lock-racer", "test mode (lock-racer)")
++	mode := flag.String("mode", "lock-racer", "test mode (lock-racer, lease-renewer)")
+ 	round := flag.Int("rounds", 100, "number of rounds to run")
+ 	flag.Parse()
+ 	eps := strings.Split(*endpointStr, ",")
+@@ -94,67 +94,92 @@ func runLeaseRenewer(eps []string) {
+ }
+ 
+ func runRacer(eps []string, round int) {
+-	nrace := 15
+-	prefix := "racers"
+-	racers := make([]*concurrency.Mutex, nrace)
+-	clis := make([]*clientv3.Client, nrace)
+-	progress := make([]int, nrace)
+-	finished := make(chan struct{}, 0)
+-
+-	var (
+-		mu  sync.Mutex
+-		cnt int
+-	)
++	rcs := make([]roundClient, 15)
+ 	ctx := context.Background()
++	cnt := 0
++	for i := range rcs {
++		rcs[i].c = randClient(eps)
++		m := concurrency.NewMutex(rcs[i].c, "racers")
++		rcs[i].acquire = func() error { return m.Lock(ctx) }
++		rcs[i].validate = func() error {
++			if cnt++; cnt != 1 {
++				return fmt.Errorf("bad lock; count: %d", cnt)
++			}
++			return nil
++		}
++		rcs[i].release = func() error {
++			if err := m.Unlock(); err != nil {
++				return err
++			}
++			cnt = 0
++			return nil
++		}
++	}
++	doRounds(rcs, round)
++}
+ 
+-	var wg sync.WaitGroup
++func randClient(eps []string) *clientv3.Client {
++	neps := make([]string, len(eps))
++	copy(neps, eps)
+ 
+-	for i := range racers {
+-		clis[i] = randClient(eps)
+-		racers[i] = concurrency.NewMutex(clis[i], prefix)
+-		wg.Add(1)
++	for i := range neps {
++		j := rand.Intn(i + 1)
++		neps[i], neps[j] = neps[j], neps[i]
++	}
+ 
+-		go func(i int) {
+-			defer wg.Done()
++	c, err := clientv3.New(clientv3.Config{
++		Endpoints:   eps,
++		DialTimeout: 5 * time.Second,
++	})
++	if err != nil {
++		log.Fatal(err)
++	}
++	return c
++}
+ 
+-			for {
+-				if progress[i] >= round {
+-					return
+-				}
++type roundClient struct {
++	c        *clientv3.Client
++	progress int
++	acquire  func() error
++	validate func() error
++	release  func() error
++}
+ 
+-				for {
+-					err := racers[i].Lock(ctx)
+-					if err == nil {
+-						break
+-					}
++func doRounds(rcs []roundClient, rounds int) {
++	var mu sync.Mutex
++	var wg sync.WaitGroup
++
++	wg.Add(len(rcs))
++	finished := make(chan struct{}, 0)
++	for i := range rcs {
++		go func(rc *roundClient) {
++			defer wg.Done()
++			for rc.progress < rounds {
++				for rc.acquire() != nil { /* spin */
+ 				}
+ 
+ 				mu.Lock()
+-				if cnt > 0 {
+-					log.Fatalf("bad lock")
++				if err := rc.validate(); err != nil {
++					log.Fatal(err)
+ 				}
+-				cnt = 1
+ 				mu.Unlock()
+ 
+ 				time.Sleep(10 * time.Millisecond)
+-				progress[i]++
++				rc.progress++
+ 				finished <- struct{}{}
+ 
+ 				mu.Lock()
+-				for {
+-					err := racers[i].Unlock()
+-					if err == nil {
+-						break
+-					}
++				for rc.release() != nil {
++					mu.Unlock()
++					mu.Lock()
+ 				}
+-				cnt = 0
+ 				mu.Unlock()
+ 			}
+-		}(i)
++		}(&rcs[i])
+ 	}
+ 
+ 	start := time.Now()
+-	for i := 1; i < nrace*round+1; i++ {
++	for i := 1; i < len(rcs)*rounds+1; i++ {
+ 		select {
+ 		case <-finished:
+ 			if i%100 == 0 {
+@@ -167,27 +192,7 @@ func runRacer(eps []string, round int) {
+ 	}
+ 
+ 	wg.Wait()
+-
+-	for _, cli := range clis {
+-		cli.Close()
++	for _, rc := range rcs {
++		rc.c.Close()
+ 	}
+ }
+-
+-func randClient(eps []string) *clientv3.Client {
+-	neps := make([]string, len(eps))
+-	copy(neps, eps)
+-
+-	for i := range neps {
+-		j := rand.Intn(i + 1)
+-		neps[i], neps[j] = neps[j], neps[i]
+-	}
+-
+-	c, err := clientv3.New(clientv3.Config{
+-		Endpoints:   eps,
+-		DialTimeout: 5 * time.Second,
+-	})
+-	if err != nil {
+-		log.Fatal(err)
+-	}
+-	return c
+-}

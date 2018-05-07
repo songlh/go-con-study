@@ -1,0 +1,789 @@
+commit ea6b11bbf6138b8a7a9d5c233ec5fd769449a1e0
+Author: Ben Johnson <benbjohnson@yahoo.com>
+Date:   Wed Nov 20 09:14:37 2013 -0700
+
+    Config clean up and usage messaging.
+
+diff --git a/etcd.go b/etcd.go
+index bfad9b5..3d19232 100644
+--- a/etcd.go
++++ b/etcd.go
+@@ -17,12 +17,8 @@ limitations under the License.
+ package main
+ 
+ import (
+-	"flag"
+ 	"fmt"
+-	"io/ioutil"
+ 	"os"
+-	"os/signal"
+-	"runtime/pprof"
+ 
+ 	"github.com/coreos/etcd/log"
+ 	"github.com/coreos/etcd/server"
+@@ -31,21 +27,30 @@ import (
+ )
+ 
+ func main() {
+-	parseFlags()
+-
+ 	// Load configuration.
+ 	var config = server.NewConfig()
+ 	if err := config.Load(os.Args[1:]); err != nil {
+-		log.Fatal("Configuration error:", err)
++		fmt.Println(server.Usage() + "\n")
++		fmt.Println(err.Error() + "\n")
++		os.Exit(1)
++	} else if config.ShowVersion {
++		fmt.Println(server.ReleaseVersion)
++		os.Exit(0)
++	} else if config.ShowHelp {
++		fmt.Println(server.Usage() + "\n")
++		os.Exit(0)
+ 	}
+ 
+-	// Turn on logging.
++	// Enable options.
+ 	if config.VeryVerbose {
+ 		log.Verbose = true
+ 		raft.SetLogLevel(raft.Debug)
+ 	} else if config.Verbose {
+ 		log.Verbose = true
+ 	}
++	if config.CPUProfileFile != "" {
++		profile(config.CPUProfileFile)
++	}
+ 
+ 	// Setup a default directory based on the machine name
+ 	if config.DataDir == "" {
+@@ -116,39 +121,3 @@ func main() {
+ 	}()
+ 	log.Fatal(s.ListenAndServe())
+ }
+-
+-// Parses non-configuration flags.
+-func parseFlags() {
+-	var versionFlag bool
+-	var cpuprofile string
+-
+-	f := flag.NewFlagSet(os.Args[0], -1)
+-	f.SetOutput(ioutil.Discard)
+-	f.BoolVar(&versionFlag, "version", false, "print the version and exit")
+-	f.StringVar(&cpuprofile, "cpuprofile", "", "write cpu profile to file")
+-	f.Parse(os.Args[1:])
+-
+-	// Print version if necessary.
+-	if versionFlag {
+-		fmt.Println(server.ReleaseVersion)
+-		os.Exit(0)
+-	}
+-
+-	// Begin CPU profiling if specified.
+-	if cpuprofile != "" {
+-		f, err := os.Create(cpuprofile)
+-		if err != nil {
+-			log.Fatal(err)
+-		}
+-		pprof.StartCPUProfile(f)
+-
+-		c := make(chan os.Signal, 1)
+-		signal.Notify(c, os.Interrupt)
+-		go func() {
+-			sig := <-c
+-			log.Infof("captured %v, stopping profiler and exiting..", sig)
+-			pprof.StopCPUProfile()
+-			os.Exit(1)
+-		}()
+-	}
+-}
+diff --git a/profile.go b/profile.go
+new file mode 100644
+index 0000000..b954a1b
+--- /dev/null
++++ b/profile.go
+@@ -0,0 +1,27 @@
++package main
++
++import (
++	"os"
++	"os/signal"
++	"runtime/pprof"
++
++	"github.com/coreos/etcd/log"
++)
++
++// profile starts CPU profiling.
++func profile(path string) {
++	f, err := os.Create(path)
++	if err != nil {
++		log.Fatal(err)
++	}
++	pprof.StartCPUProfile(f)
++
++	c := make(chan os.Signal, 1)
++	signal.Notify(c, os.Interrupt)
++	go func() {
++		sig := <-c
++		log.Infof("captured %v, stopping profiler and exiting..", sig)
++		pprof.StopCPUProfile()
++		os.Exit(1)
++	}()
++}
+diff --git a/server/config.go b/server/config.go
+index 67a36f7..0740b45 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -21,23 +21,23 @@ const DefaultSystemConfigPath = "/etc/etcd/etcd.conf"
+ 
+ // A lookup of deprecated flags to their new flag name.
+ var newFlagNameLookup = map[string]string{
+-	"C": "peers",
+-	"CF": "peers-file",
+-	"n": "name",
+-	"c": "addr",
+-	"cl": "bind-addr",
+-	"s": "peer-addr",
+-	"sl": "peer-bind-addr",
+-	"d": "data-dir",
+-	"m": "max-result-buffer",
+-	"r": "max-retry-attempts",
+-	"maxsize": "max-cluster-size",
+-	"clientCAFile": "ca-file",
+-	"clientCert": "cert-file",
+-	"clientKey": "key-file",
+-	"serverCAFile": "peer-ca-file",
+-	"serverCert": "peer-cert-file",
+-	"serverKey": "peer-key-file",
++	"C":             "peers",
++	"CF":            "peers-file",
++	"n":             "name",
++	"c":             "addr",
++	"cl":            "bind-addr",
++	"s":             "peer-addr",
++	"sl":            "peer-bind-addr",
++	"d":             "data-dir",
++	"m":             "max-result-buffer",
++	"r":             "max-retry-attempts",
++	"maxsize":       "max-cluster-size",
++	"clientCAFile":  "ca-file",
++	"clientCert":    "cert-file",
++	"clientKey":     "key-file",
++	"serverCAFile":  "peer-ca-file",
++	"serverCert":    "peer-cert-file",
++	"serverKey":     "peer-key-file",
+ 	"snapshotCount": "snapshot-count",
+ }
+ 
+@@ -45,10 +45,11 @@ var newFlagNameLookup = map[string]string{
+ type Config struct {
+ 	SystemPath string
+ 
+-	Addr             string   `toml:"addr" env:"ETCD_ADDR"`
+-	BindAddr         string   `toml:"bind_addr" env:"ETCD_BIND_ADDR"`
+-	CAFile           string   `toml:"ca_file" env:"ETCD_CA_FILE"`
+-	CertFile         string   `toml:"cert_file" env:"ETCD_CERT_FILE"`
++	Addr             string `toml:"addr" env:"ETCD_ADDR"`
++	BindAddr         string `toml:"bind_addr" env:"ETCD_BIND_ADDR"`
++	CAFile           string `toml:"ca_file" env:"ETCD_CA_FILE"`
++	CertFile         string `toml:"cert_file" env:"ETCD_CERT_FILE"`
++	CPUProfileFile   string
+ 	CorsOrigins      []string `toml:"cors" env:"ETCD_CORS"`
+ 	DataDir          string   `toml:"data_dir" env:"ETCD_DATA_DIR"`
+ 	Force            bool
+@@ -61,8 +62,10 @@ type Config struct {
+ 	Name             string   `toml:"name" env:"ETCD_NAME"`
+ 	Snapshot         bool     `toml:"snapshot" env:"ETCD_SNAPSHOT"`
+ 	SnapshotCount    int      `toml:"snapshot_count" env:"ETCD_SNAPSHOTCOUNT"`
+-	Verbose          bool     `toml:"verbose" env:"ETCD_VERBOSE"`
+-	VeryVerbose      bool     `toml:"very_verbose" env:"ETCD_VERY_VERBOSE"`
++	ShowHelp         bool
++	ShowVersion      bool
++	Verbose          bool `toml:"verbose" env:"ETCD_VERBOSE"`
++	VeryVerbose      bool `toml:"very_verbose" env:"ETCD_VERY_VERBOSE"`
+ 
+ 	Peer struct {
+ 		Addr     string `toml:"addr" env:"ETCD_PEER_ADDR"`
+@@ -117,15 +120,6 @@ func (c *Config) Load(arguments []string) error {
+ 		return err
+ 	}
+ 
+-	// Load from command line flags (deprecated).
+-	if err := c.LoadDeprecatedFlags(arguments); err != nil {
+-		if err, ok := err.(*DeprecationError); ok {
+-			fmt.Fprintln(os.Stderr, err.Error())
+-		} else {
+-			return err
+-		}
+-	}
+-
+ 	// Loads peers if a peer file was specified.
+ 	if err := c.LoadPeersFile(); err != nil {
+ 		return err
+@@ -133,7 +127,7 @@ func (c *Config) Load(arguments []string) error {
+ 
+ 	// Sanitize all the input fields.
+ 	if err := c.Sanitize(); err != nil {
+-		return fmt.Errorf("sanitize:", err)
++		return fmt.Errorf("sanitize: %v", err)
+ 	}
+ 
+ 	return nil
+@@ -195,100 +189,85 @@ func (c *Config) loadEnv(target interface{}) error {
+ 	return nil
+ }
+ 
+-// Loads deprecated configuration settings from the command line.
+-func (c *Config) LoadDeprecatedFlags(arguments []string) error {
+-	var peers string
+-
+-	f := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+-	f.SetOutput(ioutil.Discard)
+-
+-	f.StringVar(&peers, "C", "", "(deprecated)")
+-	f.StringVar(&c.PeersFile, "CF", c.PeersFile, "(deprecated)")
+-
+-	f.StringVar(&c.Name, "n", c.Name, "(deprecated)")
+-	f.StringVar(&c.Addr, "c", c.Addr, "(deprecated)")
+-	f.StringVar(&c.BindAddr, "cl", c.BindAddr, "the listening hostname for etcd client communication (defaults to advertised ip)")
+-	f.StringVar(&c.Peer.Addr, "s", c.Peer.Addr, "the advertised public hostname:port for raft server communication")
+-	f.StringVar(&c.Peer.BindAddr, "sl", c.Peer.BindAddr, "the listening hostname for raft server communication (defaults to advertised ip)")
+-
+-	f.StringVar(&c.Peer.CAFile, "serverCAFile", c.Peer.CAFile, "the path of the CAFile")
+-	f.StringVar(&c.Peer.CertFile, "serverCert", c.Peer.CertFile, "the cert file of the server")
+-	f.StringVar(&c.Peer.KeyFile, "serverKey", c.Peer.KeyFile, "the key file of the server")
+-
+-	f.StringVar(&c.CAFile, "clientCAFile", c.CAFile, "the path of the client CAFile")
+-	f.StringVar(&c.CertFile, "clientCert", c.CertFile, "the cert file of the client")
+-	f.StringVar(&c.KeyFile, "clientKey", c.KeyFile, "the key file of the client")
+-
+-	f.StringVar(&c.DataDir, "d", c.DataDir, "the directory to store log and snapshot")
+-	f.IntVar(&c.MaxResultBuffer, "m", c.MaxResultBuffer, "the max size of result buffer")
+-	f.IntVar(&c.MaxRetryAttempts, "r", c.MaxRetryAttempts, "the max retry attempts when trying to join a cluster")
+-	f.IntVar(&c.MaxClusterSize, "maxsize", c.MaxClusterSize, "the max size of the cluster")
+-
+-	f.IntVar(&c.SnapshotCount, "snapshotCount", c.SnapshotCount, "save the in-memory logs and states to a snapshot file a given number of transactions")
+-
+-	f.Parse(arguments)
+-
+-	// Convert some parameters to lists.
+-	if peers != "" {
+-		c.Peers = trimsplit(peers, ",")
+-	}
+-
+-	// Generate deprecation warning.
+-	warnings := make([]string, 0)
+-	f.Visit(func(f *flag.Flag) {
+-		warnings = append(warnings, fmt.Sprintf("[deprecated] use -%s, not -%s", newFlagNameLookup[f.Name], f.Name))
+-	})
+-	if len(warnings) > 0 {
+-		return &DeprecationError{strings.Join(warnings, "\n")}
+-	}
+-
+-	return nil
+-}
+-
+ // Loads configuration from command line flags.
+ func (c *Config) LoadFlags(arguments []string) error {
+-	var peers, cors string
++	var peers, cors, path string
+ 
+ 	f := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+ 	f.SetOutput(ioutil.Discard)
+ 
+-	f.BoolVar(&c.Force, "f", false, "force new node configuration if existing is found (WARNING: data loss!)")
+-	f.BoolVar(&c.Force, "force", false, "force new node configuration if existing is found (WARNING: data loss!)")
++	f.BoolVar(&c.ShowHelp, "h", false, "")
++	f.BoolVar(&c.ShowHelp, "help", false, "")
++	f.BoolVar(&c.ShowVersion, "version", false, "")
+ 
+-	f.BoolVar(&c.Verbose, "v", c.Verbose, "verbose logging")
+-	f.BoolVar(&c.VeryVerbose, "vv", c.Verbose, "very verbose logging")
++	f.BoolVar(&c.Force, "f", false, "")
++	f.BoolVar(&c.Force, "force", false, "")
+ 
+-	f.StringVar(&peers, "peers", "", "the ip address and port of a existing peers in the cluster, sepearate by comma")
+-	f.StringVar(&c.PeersFile, "peers-file", c.PeersFile, "the file contains a list of existing peers in the cluster, seperate by comma")
++	f.BoolVar(&c.Verbose, "v", c.Verbose, "")
++	f.BoolVar(&c.VeryVerbose, "vv", c.Verbose, "")
+ 
+-	f.StringVar(&c.Name, "name", c.Name, "the node name (required)")
+-	f.StringVar(&c.Addr, "addr", c.Addr, "the advertised public hostname:port for etcd client communication")
+-	f.StringVar(&c.BindAddr, "bind-addr", c.BindAddr, "the listening hostname for etcd client communication (defaults to advertised ip)")
+-	f.StringVar(&c.Peer.Addr, "peer-addr", c.Peer.Addr, "the advertised public hostname:port for raft server communication")
+-	f.StringVar(&c.Peer.BindAddr, "peer-bind-addr", c.Peer.BindAddr, "the listening hostname for raft server communication (defaults to advertised ip)")
++	f.StringVar(&peers, "peers", "", "")
++	f.StringVar(&c.PeersFile, "peers-file", c.PeersFile, "")
+ 
+-	f.StringVar(&c.Peer.CAFile, "peer-ca-file", c.Peer.CAFile, "the path of the CAFile")
+-	f.StringVar(&c.Peer.CertFile, "peer-cert-file", c.Peer.CertFile, "the cert file of the server")
+-	f.StringVar(&c.Peer.KeyFile, "peer-key-file", c.Peer.KeyFile, "the key file of the server")
++	f.StringVar(&c.Name, "name", c.Name, "")
++	f.StringVar(&c.Addr, "addr", c.Addr, "")
++	f.StringVar(&c.BindAddr, "bind-addr", c.BindAddr, "")
++	f.StringVar(&c.Peer.Addr, "peer-addr", c.Peer.Addr, "")
++	f.StringVar(&c.Peer.BindAddr, "peer-bind-addr", c.Peer.BindAddr, "")
+ 
+-	f.StringVar(&c.CAFile, "ca-file", c.CAFile, "the path of the client CAFile")
+-	f.StringVar(&c.CertFile, "cert-file", c.CertFile, "the cert file of the client")
+-	f.StringVar(&c.KeyFile, "key-file", c.KeyFile, "the key file of the client")
++	f.StringVar(&c.CAFile, "ca-file", c.CAFile, "")
++	f.StringVar(&c.CertFile, "cert-file", c.CertFile, "")
++	f.StringVar(&c.KeyFile, "key-file", c.KeyFile, "")
+ 
+-	f.StringVar(&c.DataDir, "data-dir", c.DataDir, "the directory to store log and snapshot")
+-	f.IntVar(&c.MaxResultBuffer, "max-result-buffer", c.MaxResultBuffer, "the max size of result buffer")
+-	f.IntVar(&c.MaxRetryAttempts, "max-retry-attempts", c.MaxRetryAttempts, "the max retry attempts when trying to join a cluster")
+-	f.IntVar(&c.MaxClusterSize, "max-cluster-size", c.MaxClusterSize, "the max size of the cluster")
+-	f.StringVar(&cors, "cors", "", "whitelist origins for cross-origin resource sharing (e.g. '*' or 'http://localhost:8001,etc')")
++	f.StringVar(&c.Peer.CAFile, "peer-ca-file", c.Peer.CAFile, "")
++	f.StringVar(&c.Peer.CertFile, "peer-cert-file", c.Peer.CertFile, "")
++	f.StringVar(&c.Peer.KeyFile, "peer-key-file", c.Peer.KeyFile, "")
+ 
+-	f.BoolVar(&c.Snapshot, "snapshot", c.Snapshot, "open or close snapshot")
+-	f.IntVar(&c.SnapshotCount, "snapshot-count", c.SnapshotCount, "save the in-memory logs and states to a snapshot file a given number of transactions")
++	f.StringVar(&c.DataDir, "data-dir", c.DataDir, "")
++	f.IntVar(&c.MaxResultBuffer, "max-result-buffer", c.MaxResultBuffer, "")
++	f.IntVar(&c.MaxRetryAttempts, "max-retry-attempts", c.MaxRetryAttempts, "")
++	f.IntVar(&c.MaxClusterSize, "max-cluster-size", c.MaxClusterSize, "")
++	f.StringVar(&cors, "cors", "", "")
+ 
+-	// These flags are ignored since they were already parsed.
+-	var path string
+-	f.StringVar(&path, "config", "", "path to config file")
++	f.BoolVar(&c.Snapshot, "snapshot", c.Snapshot, "")
++	f.IntVar(&c.SnapshotCount, "snapshot-count", c.SnapshotCount, "")
++	f.StringVar(&c.CPUProfileFile, "cpuprofile", "", "")
+ 
+-	f.Parse(arguments)
++	// BEGIN IGNORED FLAGS
++	f.StringVar(&path, "config", "", "")
++	// BEGIN IGNORED FLAGS
++
++	// BEGIN DEPRECATED FLAGS
++	f.StringVar(&peers, "C", "", "(deprecated)")
++	f.StringVar(&c.PeersFile, "CF", c.PeersFile, "(deprecated)")
++	f.StringVar(&c.Name, "n", c.Name, "(deprecated)")
++	f.StringVar(&c.Addr, "c", c.Addr, "(deprecated)")
++	f.StringVar(&c.BindAddr, "cl", c.BindAddr, "(deprecated)")
++	f.StringVar(&c.Peer.Addr, "s", c.Peer.Addr, "(deprecated)")
++	f.StringVar(&c.Peer.BindAddr, "sl", c.Peer.BindAddr, "(deprecated)")
++	f.StringVar(&c.Peer.CAFile, "serverCAFile", c.Peer.CAFile, "(deprecated)")
++	f.StringVar(&c.Peer.CertFile, "serverCert", c.Peer.CertFile, "(deprecated)")
++	f.StringVar(&c.Peer.KeyFile, "serverKey", c.Peer.KeyFile, "(deprecated)")
++	f.StringVar(&c.CAFile, "clientCAFile", c.CAFile, "(deprecated)")
++	f.StringVar(&c.CertFile, "clientCert", c.CertFile, "(deprecated)")
++	f.StringVar(&c.KeyFile, "clientKey", c.KeyFile, "(deprecated)")
++	f.StringVar(&c.DataDir, "d", c.DataDir, "(deprecated)")
++	f.IntVar(&c.MaxResultBuffer, "m", c.MaxResultBuffer, "(deprecated)")
++	f.IntVar(&c.MaxRetryAttempts, "r", c.MaxRetryAttempts, "(deprecated)")
++	f.IntVar(&c.MaxClusterSize, "maxsize", c.MaxClusterSize, "(deprecated)")
++	f.IntVar(&c.SnapshotCount, "snapshotCount", c.SnapshotCount, "(deprecated)")
++	// END DEPRECATED FLAGS
++
++	if err := f.Parse(arguments); err != nil {
++		return err
++	}
++
++	// Print deprecation warnings on STDERR.
++	f.Visit(func(f *flag.Flag) {
++		if len(newFlagNameLookup[f.Name]) > 0 {
++			fmt.Fprintf(os.Stderr, "[deprecated] use -%s, not -%s", newFlagNameLookup[f.Name], f.Name)
++		}
++	})
+ 
+ 	// Convert some parameters to lists.
+ 	if peers != "" {
+@@ -479,15 +458,3 @@ func sanitizeBindAddr(bindAddr string, addr string) (string, error) {
+ 
+ 	return net.JoinHostPort(bindAddr, aport), nil
+ }
+-
+-
+-// DeprecationError is a warning for CLI users that one or more arguments will
+-// not be supported in future released.
+-type DeprecationError struct {
+-	s string
+-}
+-
+-func (e *DeprecationError) Error() string {
+-	return e.s
+-}
+-
+diff --git a/server/config_test.go b/server/config_test.go
+index 9ebe705..f991c97 100644
+--- a/server/config_test.go
++++ b/server/config_test.go
+@@ -93,7 +93,7 @@ func TestConfigEnv(t *testing.T) {
+ 	c.LoadEnv()
+ 	assert.Equal(t, c.CAFile, "/tmp/file.ca", "")
+ 	assert.Equal(t, c.CertFile, "/tmp/file.cert", "")
+-	assert.Equal(t, c.CorsOrigins, []string{"localhost:4001", "localhost:4002"}, "") 
++	assert.Equal(t, c.CorsOrigins, []string{"localhost:4001", "localhost:4002"}, "")
+ 	assert.Equal(t, c.DataDir, "/tmp/data", "")
+ 	assert.Equal(t, c.KeyFile, "/tmp/file.key", "")
+ 	assert.Equal(t, c.BindAddr, "127.0.0.1:4003", "")
+@@ -113,6 +113,27 @@ func TestConfigEnv(t *testing.T) {
+ 	assert.Equal(t, c.Peer.BindAddr, "127.0.0.1:7003", "")
+ }
+ 
++// Ensures that the "help" flag can be parsed.
++func TestConfigHelpFlag(t *testing.T) {
++	c := NewConfig()
++	assert.Nil(t, c.LoadFlags([]string{"-help"}), "")
++	assert.True(t, c.ShowHelp)
++}
++
++// Ensures that the abbreviated "help" flag can be parsed.
++func TestConfigAbbreviatedHelpFlag(t *testing.T) {
++	c := NewConfig()
++	assert.Nil(t, c.LoadFlags([]string{"-h"}), "")
++	assert.True(t, c.ShowHelp)
++}
++
++// Ensures that the "version" flag can be parsed.
++func TestConfigVersionFlag(t *testing.T) {
++	c := NewConfig()
++	assert.Nil(t, c.LoadFlags([]string{"-version"}), "")
++	assert.True(t, c.ShowVersion)
++}
++
+ // Ensures that the "force config" flag can be parsed.
+ func TestConfigForceFlag(t *testing.T) {
+ 	c := NewConfig()
+@@ -405,6 +426,14 @@ func TestConfigPeerBindAddrEnv(t *testing.T) {
+ 	})
+ }
+ 
++// Ensures that a bad flag returns an error.
++func TestConfigBadFlag(t *testing.T) {
++	c := NewConfig()
++	err := c.LoadFlags([]string{"-no-such-flag"})
++	assert.Error(t, err)
++	assert.Equal(t, err.Error(), `flag provided but not defined: -no-such-flag`)
++}
++
+ // Ensures that a the Peer Listen Host file flag can be parsed.
+ func TestConfigPeerBindAddrFlag(t *testing.T) {
+ 	c := NewConfig()
+@@ -456,118 +485,165 @@ func TestConfigCLIArgsOverrideEnvVar(t *testing.T) {
+ //--------------------------------------
+ 
+ func TestConfigDeprecatedAddrFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-c", "127.0.0.1:4002"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -addr, not -c", "")
+-	assert.Equal(t, c.Addr, "127.0.0.1:4002", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-c", "127.0.0.1:4002"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Addr, "127.0.0.1:4002")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -addr, not -c")
+ }
+ 
+ func TestConfigDeprecatedBindAddrFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-cl", "127.0.0.1:4003"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -bind-addr, not -cl", "")
+-	assert.Equal(t, c.BindAddr, "127.0.0.1:4003", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-cl", "127.0.0.1:4003"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.BindAddr, "127.0.0.1:4003", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -bind-addr, not -cl", "")
+ }
+ 
+ func TestConfigDeprecatedCAFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-clientCAFile", "/tmp/file.ca"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -ca-file, not -clientCAFile", "")
+-	assert.Equal(t, c.CAFile, "/tmp/file.ca", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-clientCAFile", "/tmp/file.ca"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.CAFile, "/tmp/file.ca", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -ca-file, not -clientCAFile", "")
+ }
+ 
+ func TestConfigDeprecatedCertFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-clientCert", "/tmp/file.cert"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -cert-file, not -clientCert", "")
+-	assert.Equal(t, c.CertFile, "/tmp/file.cert", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-clientCert", "/tmp/file.cert"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.CertFile, "/tmp/file.cert", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -cert-file, not -clientCert", "")
+ }
+ 
+ func TestConfigDeprecatedKeyFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-clientKey", "/tmp/file.key"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -key-file, not -clientKey", "")
+-	assert.Equal(t, c.KeyFile, "/tmp/file.key", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-clientKey", "/tmp/file.key"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.KeyFile, "/tmp/file.key", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -key-file, not -clientKey", "")
+ }
+ 
+ func TestConfigDeprecatedPeersFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-C", "coreos.com:4001,coreos.com:4002"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peers, not -C", "")
+-	assert.Equal(t, c.Peers, []string{"coreos.com:4001", "coreos.com:4002"}, "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-C", "coreos.com:4001,coreos.com:4002"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Peers, []string{"coreos.com:4001", "coreos.com:4002"}, "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peers, not -C", "")
+ }
+ 
+ func TestConfigDeprecatedPeersFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-CF", "/tmp/machines"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peers-file, not -CF", "")
+-	assert.Equal(t, c.PeersFile, "/tmp/machines", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-CF", "/tmp/machines"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.PeersFile, "/tmp/machines", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peers-file, not -CF", "")
+ }
+ 
+ func TestConfigDeprecatedMaxClusterSizeFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-maxsize", "5"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -max-cluster-size, not -maxsize", "")
+-	assert.Equal(t, c.MaxClusterSize, 5, "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-maxsize", "5"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.MaxClusterSize, 5, "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -max-cluster-size, not -maxsize", "")
+ }
+ 
+ func TestConfigDeprecatedMaxResultBufferFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-m", "512"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -max-result-buffer, not -m", "")
+-	assert.Equal(t, c.MaxResultBuffer, 512, "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-m", "512"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.MaxResultBuffer, 512, "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -max-result-buffer, not -m", "")
+ }
+ 
+ func TestConfigDeprecatedMaxRetryAttemptsFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-r", "10"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -max-retry-attempts, not -r", "")
+-	assert.Equal(t, c.MaxRetryAttempts, 10, "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-r", "10"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.MaxRetryAttempts, 10, "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -max-retry-attempts, not -r", "")
+ }
+ 
+ func TestConfigDeprecatedNameFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-n", "test-name"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -name, not -n", "")
+-	assert.Equal(t, c.Name, "test-name", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-n", "test-name"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Name, "test-name", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -name, not -n", "")
+ }
+ 
+ func TestConfigDeprecatedPeerAddrFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-s", "localhost:7002"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peer-addr, not -s", "")
+-	assert.Equal(t, c.Peer.Addr, "localhost:7002", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-s", "localhost:7002"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Peer.Addr, "localhost:7002", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peer-addr, not -s", "")
+ }
+ 
+ func TestConfigDeprecatedPeerBindAddrFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-sl", "127.0.0.1:4003"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peer-bind-addr, not -sl", "")
+-	assert.Equal(t, c.Peer.BindAddr, "127.0.0.1:4003", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-sl", "127.0.0.1:4003"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Peer.BindAddr, "127.0.0.1:4003", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peer-bind-addr, not -sl", "")
+ }
+ 
+ func TestConfigDeprecatedPeerCAFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-serverCAFile", "/tmp/peer/file.ca"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peer-ca-file, not -serverCAFile", "")
+-	assert.Equal(t, c.Peer.CAFile, "/tmp/peer/file.ca", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-serverCAFile", "/tmp/peer/file.ca"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Peer.CAFile, "/tmp/peer/file.ca", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peer-ca-file, not -serverCAFile", "")
+ }
+ 
+ func TestConfigDeprecatedPeerCertFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-serverCert", "/tmp/peer/file.cert"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peer-cert-file, not -serverCert", "")
+-	assert.Equal(t, c.Peer.CertFile, "/tmp/peer/file.cert", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-serverCert", "/tmp/peer/file.cert"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Peer.CertFile, "/tmp/peer/file.cert", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peer-cert-file, not -serverCert", "")
+ }
+ 
+ func TestConfigDeprecatedPeerKeyFileFlag(t *testing.T) {
+-	c := NewConfig()
+-	err := c.LoadDeprecatedFlags([]string{"-serverKey", "/tmp/peer/file.key"})
+-	assert.Equal(t, err.Error(), "[deprecated] use -peer-key-file, not -serverKey", "")
+-	assert.Equal(t, c.Peer.KeyFile, "/tmp/peer/file.key", "")
++	_, stderr := capture(func() {
++		c := NewConfig()
++		err := c.LoadFlags([]string{"-serverKey", "/tmp/peer/file.key"})
++		assert.NoError(t, err)
++		assert.Equal(t, c.Peer.KeyFile, "/tmp/peer/file.key", "")
++	})
++	assert.Equal(t, stderr, "[deprecated] use -peer-key-file, not -serverKey", "")
+ }
+ 
+-
+ //--------------------------------------
+ // Helpers
+ //--------------------------------------
+@@ -588,3 +664,27 @@ func withTempFile(content string, fn func(string)) {
+ 	defer os.Remove(f.Name())
+ 	fn(f.Name())
+ }
++
++// Captures STDOUT & STDERR and returns the output as strings.
++func capture(fn func()) (string, string) {
++	// Create temp files.
++	tmpout, _ := ioutil.TempFile("", "")
++	defer os.Remove(tmpout.Name())
++	tmperr, _ := ioutil.TempFile("", "")
++	defer os.Remove(tmperr.Name())
++
++	stdout, stderr := os.Stdout, os.Stderr
++	os.Stdout, os.Stderr = tmpout, tmperr
++
++	// Execute function argument and then reassign stdout/stderr.
++	fn()
++	os.Stdout, os.Stderr = stdout, stderr
++
++	// Close temp files and read them.
++	tmpout.Close()
++	bout, _ := ioutil.ReadFile(tmpout.Name())
++	tmperr.Close()
++	berr, _ := ioutil.ReadFile(tmperr.Name())
++
++	return string(bout), string(berr)
++}
+diff --git a/server/usage.go b/server/usage.go
+new file mode 100644
+index 0000000..ff23aac
+--- /dev/null
++++ b/server/usage.go
+@@ -0,0 +1,57 @@
++package server
++
++import (
++	"strings"
++)
++
++// usage defines the message shown when a help flag is passed to etcd.
++var usage = `
++etcd
++
++Usage:
++  etcd -name <name>
++  etcd -name <name> [-data-dir=<path>]
++  etcd -h | -help
++  etcd -version
++
++Options:
++  -h -help          Show this screen.
++  --version         Show version.
++  -f -force         Force a new configuration to be used.
++  -config=<path>    Path to configuration file.
++  -name=<name>      Name of this node in the etcd cluster.
++  -data-dir=<path>  Path to the data directory.
++  -cors=<origins>   Comma-separated list of CORS origins.
++  -v                Enabled verbose logging.
++  -vv               Enabled very verbose logging.
++
++Cluster Configuration Options:
++  -peers=<peers>      Comma-separated list of peers (ip + port) in the cluster.
++  -peers-file=<path>  Path to a file containing the peer list.
++
++Client Communication Options:
++  -addr=<host:port>   The public host:port used for client communication.
++  -bind-addr=<host>   The listening hostname used for client communication.
++  -ca-file=<path>     Path to the client CA file.
++  -cert-file=<path>   Path to the client cert file.
++  -key-file=<path>    Path to the client key file.
++
++Peer Communication Options:
++  -peer-addr=<host:port>  The public host:port used for peer communication.
++  -peer-bind-addr=<host>  The listening hostname used for peer communication.
++  -peer-ca-file=<path>    Path to the peer CA file.
++  -peer-cert-file=<path>  Path to the peer cert file.
++  -peer-key-file=<path>   Path to the peer key file.
++
++Other Options:
++  -max-result-buffer   Max size of the result buffer.
++  -max-retry-attempts  Number of times a node will try to join a cluster.
++  -max-cluster-size    Maximum number of nodes in the cluster.
++  -snapshot            Open or close the snapshot.
++  -snapshot-count      Number of transactions before issuing a snapshot.
++`
++
++// Usage returns the usage message for etcd.
++func Usage() string {
++	return strings.TrimSpace(usage)
++}

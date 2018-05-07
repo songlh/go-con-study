@@ -1,0 +1,133 @@
+commit 22c8ec0a80e443c582c56bd8934f563573f54af7
+Author: Blake Mizerany <blake.mizerany@gmail.com>
+Date:   Tue Sep 2 13:48:38 2014 -0700
+
+    ...
+
+diff --git a/etcdserver2/etcdhttp/http.go b/etcdserver2/etcdhttp/http.go
+index bb1faf2..929305e 100644
+--- a/etcdserver2/etcdhttp/http.go
++++ b/etcdserver2/etcdhttp/http.go
+@@ -66,6 +66,7 @@ func Sender(prefix string, p Peers) func(msgs []raftpb.Message) {
+ }
+ 
+ func httpPost(url string, data []byte) bool {
++	// TODO: set timeouts
+ 	resp, err := http.Post(url, "application/protobuf", bytes.NewBuffer(data))
+ 	if err != nil {
+ 		elog.TODO()
+diff --git a/etcdserver2/etcdhttp/http_test.go b/etcdserver2/etcdhttp/http_test.go
+index 08ac0f4..79e1a81 100644
+--- a/etcdserver2/etcdhttp/http_test.go
++++ b/etcdserver2/etcdhttp/http_test.go
+@@ -26,7 +26,7 @@ func TestSet(t *testing.T) {
+ 
+ 	st := store.New()
+ 
+-	n := raft.Start(ctx, 1, []int64{1})
++	n := raft.Start(1, []int64{1})
+ 	n.Campaign(ctx)
+ 
+ 	srv := &etcdserver.Server{
+diff --git a/main.go b/main.go
+index 2de8a14..d02cda4 100644
+--- a/main.go
++++ b/main.go
+@@ -1,73 +1,36 @@
+ package main
+ 
+ import (
+-	"crypto/tls"
+-	"fmt"
++	"flag"
+ 	"log"
+-	"net"
+ 	"net/http"
+-	"os"
+-	"time"
+ 
+-	"github.com/coreos/etcd/conf"
+-	"github.com/coreos/etcd/etcdserver"
++	etcdserver "github.com/coreos/etcd/etcdserver2"
++	"github.com/coreos/etcd/etcdserver2/etcdhttp"
++	"github.com/coreos/etcd/raft"
++	"github.com/coreos/etcd/raft/raftpb"
+ )
+ 
+-func main() {
+-	var cfg = conf.New()
+-	if err := cfg.Load(os.Args[1:]); err != nil {
+-		fmt.Println(etcdserver.Usage() + "\n")
+-		fmt.Println(err.Error(), "\n")
+-		os.Exit(1)
+-	} else if cfg.ShowVersion {
+-		fmt.Println("0.5")
+-		os.Exit(0)
+-	} else if cfg.ShowHelp {
+-		os.Exit(0)
+-	}
+-
+-	e, err := etcdserver.New(cfg)
+-	if err != nil {
+-		log.Fatal("etcd:", err)
+-	}
+-	go e.Run()
+-
+-	corsInfo, err := newCORSInfo(cfg.CorsOrigins)
+-	if err != nil {
+-		log.Fatal("cors:", err)
+-	}
+-
+-	readTimeout := time.Duration(cfg.HTTPReadTimeout) * time.Second
+-	writeTimeout := time.Duration(cfg.HTTPWriteTimeout) * time.Second
+-	go func() {
+-		serve("raft", cfg.Peer.BindAddr, cfg.PeerTLSInfo(), corsInfo, e.RaftHandler(), readTimeout, writeTimeout)
+-	}()
+-	serve("etcd", cfg.BindAddr, cfg.EtcdTLSInfo(), corsInfo, e, readTimeout, writeTimeout)
+-}
++var (
++	id = flag.String("id", "default", "The id of this server")
++)
+ 
+-func serve(who string, addr string, tinfo *conf.TLSInfo, cinfo *CORSInfo, handler http.Handler, readTimeout, writeTimeout time.Duration) {
+-	t, terr := tinfo.ServerConfig()
+-	l, err := net.Listen("tcp", addr)
+-	if err != nil {
+-		log.Fatal(err)
++func main() {
++	const V2Prefix = "/v2"
++
++	peers := etcdhttp.Discover(V2Prefix, peerips)
++	n := raft.Start(*id, peers.Ids())
++	s := &etcdserver.Server{
++		Node: n,
++		Save: func(st raftpb.State, ents []raftpb.Entry) {}, // TODO: use wal
++		Send: etcdhttp.Sender(V2Prefix),
+ 	}
+-	log.Printf("%v server starts listening on %v\n", who, addr)
+-
+-	switch tinfo.Scheme() {
+-	case "http":
+-		log.Printf("%v server starts serving HTTP\n", who)
+-
+-	case "https":
+-		if t == nil {
+-			log.Fatalf("failed to create %v tls: %v\n", who, terr)
+-		}
+-		l = tls.NewListener(l, t)
+-		log.Printf("%v server starts serving HTTPS\n", who)
+-	default:
+-		log.Fatal("unsupported http scheme", tinfo.Scheme())
++	etcdserver.Start(s)
++	h := &etcdhttp.Handler{
++		Timeout: timeout,
++		Server:  s,
++		Peers:   peers,
+ 	}
+-
+-	h := &CORSHandler{handler, cinfo}
+-	s := &http.Server{Handler: h, ReadTimeout: readTimeout, WriteTimeout: writeTimeout}
+-	log.Fatal(s.Serve(l))
++	http.Handle(V2Prefix, http.StripPrefix(V2Prefix, h))
++	log.Fatal(http.ListenAndServe(*laddr, nil))
+ }

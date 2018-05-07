@@ -1,0 +1,110 @@
+commit bd56b15b6e278b9fca4cdb634e790df66a1d512a
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Thu Feb 13 10:17:12 2014 -0800
+
+    fix(tests/discovery): use host as -peers parameter instead of url
+    
+    Or it cannot test the functionality correctly.
+    Moreover, add TestDiscoveryNoWithBackupPeers as the test for it.
+
+diff --git a/server/registry.go b/server/registry.go
+index 9ec515d..669cb00 100644
+--- a/server/registry.go
++++ b/server/registry.go
+@@ -94,6 +94,16 @@ func (r *Registry) clientURL(name string) (string, bool) {
+ 	return "", false
+ }
+ 
++// Retrieves the host part of peer URL for a given node by name.
++func (r *Registry) PeerHost(name string) (string, bool) {
++	rawurl, ok := r.PeerURL(name)
++	if ok {
++		u, _ := url.Parse(rawurl)
++		return u.Host, ok
++	}
++	return rawurl, ok
++}
++
+ // Retrieves the peer URL for a given node by name.
+ func (r *Registry) PeerURL(name string) (string, bool) {
+ 	r.Lock()
+diff --git a/server/server.go b/server/server.go
+index a660857..66d4680 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -79,6 +79,11 @@ func (s *Server) URL() string {
+ 	return s.url
+ }
+ 
++// Returns the host part of Peer URL for a given node name.
++func (s *Server) PeerHost(name string) (string, bool) {
++	return s.registry.PeerHost(name)
++}
++
+ // Retrives the Peer URL for a given node name.
+ func (s *Server) PeerURL(name string) (string, bool) {
+ 	return s.registry.PeerURL(name)
+diff --git a/tests/functional/discovery_test.go b/tests/functional/discovery_test.go
+index 2bff288..b8e2c97 100644
+--- a/tests/functional/discovery_test.go
++++ b/tests/functional/discovery_test.go
+@@ -65,7 +65,7 @@ func TestDiscoveryDownWithBackupPeers(t *testing.T) {
+ 		defer ts.Close()
+ 
+ 		discover := ts.URL + "/v2/keys/_etcd/registry/1"
+-		u, ok := s.PeerURL("ETCDTEST")
++		u, ok := s.PeerHost("ETCDTEST")
+ 		if !ok {
+ 			t.Fatalf("Couldn't find the URL")
+ 		}
+@@ -88,6 +88,29 @@ func TestDiscoveryDownWithBackupPeers(t *testing.T) {
+ 	})
+ }
+ 
++// TestDiscoveryNoWithBackupPeers ensures that etcd runs if it is started with
++// no discovery URL and a peer list.
++func TestDiscoveryNoWithBackupPeers(t *testing.T) {
++	etcdtest.RunServer(func(s *server.Server) {
++		u, ok := s.PeerHost("ETCDTEST")
++		if !ok {
++			t.Fatalf("Couldn't find the URL")
++		}
++		proc, err := startServer([]string{"-peers", u})
++
++		if err != nil {
++			t.Fatal(err.Error())
++		}
++		defer stopServer(proc)
++
++		client := http.Client{}
++		err = assertServerFunctional(client, "http")
++		if err != nil {
++			t.Fatal(err.Error())
++		}
++	})
++}
++
+ // TestDiscoveryFirstPeer ensures that etcd starts as the leader if it
+ // registers as the first peer.
+ func TestDiscoveryFirstPeer(t *testing.T) {
+diff --git a/tests/functional/etcd_tls_test.go b/tests/functional/etcd_tls_test.go
+index 2f24cc7..f2332ee 100644
+--- a/tests/functional/etcd_tls_test.go
++++ b/tests/functional/etcd_tls_test.go
+@@ -183,6 +183,16 @@ func assertServerFunctional(client http.Client, scheme string) error {
+ 		time.Sleep(1 * time.Second)
+ 
+ 		resp, err := client.PostForm(path, fields)
++		// If the status is Temporary Redirect, we should follow the
++		// new location, because the request did not go to the leader yet.
++		// TODO(yichengq): the difference between Temporary Redirect(307)
++		// and Created(201) could distinguish between leader and followers
++		for err == nil && resp.StatusCode == http.StatusTemporaryRedirect {
++			loc, _ := resp.Location()
++			newPath := loc.String()
++			resp, err = client.PostForm(newPath, fields)
++		}
++
+ 		if err == nil {
+ 			if resp.StatusCode != 201 {
+ 				return errors.New(fmt.Sprintf("resp.StatusCode == %s", resp.Status))

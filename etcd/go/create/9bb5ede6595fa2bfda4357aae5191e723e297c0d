@@ -1,0 +1,124 @@
+commit 9bb5ede6595fa2bfda4357aae5191e723e297c0d
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Wed Jul 12 10:05:16 2017 -0700
+
+    embed: configure 'ListenMetricsUrls'
+    
+    Signed-off-by: Gyu-Ho Lee <gyuhox@gmail.com>
+
+diff --git a/embed/config.go b/embed/config.go
+index 8041031..ee5fcce 100644
+--- a/embed/config.go
++++ b/embed/config.go
+@@ -112,10 +112,12 @@ type Config struct {
+ 
+ 	// debug
+ 
+-	Debug        bool   `json:"debug"`
+-	LogPkgLevels string `json:"log-package-levels"`
+-	EnablePprof  bool
+-	Metrics      string `json:"metrics"`
++	Debug                 bool   `json:"debug"`
++	LogPkgLevels          string `json:"log-package-levels"`
++	EnablePprof           bool
++	Metrics               string `json:"metrics"`
++	ListenMetricsUrls     []url.URL
++	ListenMetricsUrlsJSON string `json:"listen-metrics-urls"`
+ 
+ 	// ForceNewCluster starts a new cluster even if previously started; unsafe.
+ 	ForceNewCluster bool `json:"force-new-cluster"`
+@@ -255,6 +257,14 @@ func (cfg *configYAML) configFromFile(path string) error {
+ 		cfg.ACUrls = []url.URL(u)
+ 	}
+ 
++	if cfg.ListenMetricsUrlsJSON != "" {
++		u, err := types.NewURLs(strings.Split(cfg.ListenMetricsUrlsJSON, ","))
++		if err != nil {
++			plog.Fatalf("unexpected error setting up listen-metrics-urls: %v", err)
++		}
++		cfg.ListenMetricsUrls = []url.URL(u)
++	}
++
+ 	// If a discovery flag is set, clear default initial cluster set by InitialClusterFromName
+ 	if (cfg.Durl != "" || cfg.DNSCluster != "") && cfg.InitialCluster == defaultInitialCluster {
+ 		cfg.InitialCluster = ""
+@@ -285,6 +295,9 @@ func (cfg *Config) Validate() error {
+ 	if err := checkBindURLs(cfg.LCUrls); err != nil {
+ 		return err
+ 	}
++	if err := checkBindURLs(cfg.ListenMetricsUrls); err != nil {
++		return err
++	}
+ 
+ 	// Check if conflicting flags are passed.
+ 	nSet := 0
+diff --git a/embed/etcd.go b/embed/etcd.go
+index 64fbfac..5b7a17c 100644
+--- a/embed/etcd.go
++++ b/embed/etcd.go
+@@ -21,6 +21,7 @@ import (
+ 	defaultLog "log"
+ 	"net"
+ 	"net/http"
++	"net/url"
+ 	"path/filepath"
+ 	"sync"
+ 	"time"
+@@ -35,6 +36,7 @@ import (
+ 	"github.com/coreos/etcd/pkg/types"
+ 	"github.com/coreos/etcd/rafthttp"
+ 	"github.com/coreos/pkg/capnslog"
++	"github.com/prometheus/client_golang/prometheus"
+ )
+ 
+ var plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "embed")
+@@ -55,9 +57,10 @@ const (
+ 
+ // Etcd contains a running etcd server and its listeners.
+ type Etcd struct {
+-	Peers   []*peerListener
+-	Clients []net.Listener
+-	Server  *etcdserver.EtcdServer
++	Peers            []*peerListener
++	Clients          []net.Listener
++	metricsListeners []net.Listener
++	Server           *etcdserver.EtcdServer
+ 
+ 	cfg   Config
+ 	stopc chan struct{}
+@@ -205,6 +208,9 @@ func (e *Etcd) Close() {
+ 			e.Clients[i].Close()
+ 		}
+ 	}
++	for i := range e.metricsListeners {
++		e.metricsListeners[i].Close()
++	}
+ 
+ 	// close rafthttp transports
+ 	if e.Server != nil {
+@@ -400,6 +406,25 @@ func (e *Etcd) serve() (err error) {
+ 			e.errHandler(s.serve(e.Server, &e.cfg.ClientTLSInfo, h, e.errHandler))
+ 		}(sctx)
+ 	}
++
++	if len(e.cfg.ListenMetricsUrls) > 0 {
++		// TODO: maybe etcdhttp.MetricsPath or get the path from the user-provided URL
++		metricsMux := http.NewServeMux()
++		metricsMux.Handle("/metrics", prometheus.Handler())
++
++		for _, murl := range e.cfg.ListenMetricsUrls {
++			ml, err := transport.NewListener(murl.Host, murl.Scheme, &e.cfg.ClientTLSInfo)
++			if err != nil {
++				return err
++			}
++			e.metricsListeners = append(e.metricsListeners, ml)
++			go func(u url.URL, ln net.Listener) {
++				plog.Info("listening for metrics on ", u.String())
++				e.errHandler(http.Serve(ln, metricsMux))
++			}(murl, ml)
++		}
++	}
++
+ 	return nil
+ }
+ 

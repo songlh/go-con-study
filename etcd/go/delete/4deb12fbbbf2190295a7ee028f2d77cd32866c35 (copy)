@@ -1,0 +1,147 @@
+commit 4deb12fbbbf2190295a7ee028f2d77cd32866c35
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Tue Sep 15 15:46:25 2015 -0700
+
+    benchmarkv3: refactoring the main logic
+
+diff --git a/tools/v3benchmark/get.go b/tools/v3benchmark/get.go
+new file mode 100644
+index 0000000..4c5b679
+--- /dev/null
++++ b/tools/v3benchmark/get.go
+@@ -0,0 +1,42 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++import (
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/etcdserver/etcdserverpb"
++)
++
++func get(client etcdserverpb.EtcdClient, key, end []byte, requests <-chan struct{}) {
++	defer wg.Done()
++	req := &etcdserverpb.RangeRequest{Key: key, RangeEnd: end}
++
++	for _ = range requests {
++		st := time.Now()
++		_, err := client.Range(context.Background(), req)
++
++		var errStr string
++		if err != nil {
++			errStr = err.Error()
++		}
++		results <- &result{
++			errStr:   errStr,
++			duration: time.Now().Sub(st),
++		}
++		bar.Increment()
++	}
++}
+diff --git a/tools/v3benchmark/main.go b/tools/v3benchmark/main.go
+index b80f82b..613a895 100644
+--- a/tools/v3benchmark/main.go
++++ b/tools/v3benchmark/main.go
+@@ -22,11 +22,16 @@ import (
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/rakyll/pb"
+-	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+ 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
+ )
+ 
++var (
++	bar     *pb.ProgressBar
++	results chan *result
++	wg      sync.WaitGroup
++)
++
+ func main() {
+ 	var c, n int
+ 	var url string
+@@ -50,53 +55,32 @@ func main() {
+ 		rangeEnd = []byte(flag.Args()[2])
+ 	}
+ 
+-	results := make(chan *result, n)
+-	bar := pb.New(n)
++	results = make(chan *result, n)
++	bar = pb.New(n)
+ 	bar.Format("Bom !")
+ 	bar.Start()
++
+ 	start := time.Now()
+-	defer func() {
+-		bar.Finish()
+-		printReport(n, results, time.Now().Sub(start))
+-	}()
+ 
+-	var wg sync.WaitGroup
+ 	wg.Add(c)
+-	jobs := make(chan struct{}, n)
+-	for i := 0; i < c; i++ {
+-		go func() {
+-			defer wg.Done()
+-
+-			conn, err := grpc.Dial(url)
+-			if err != nil {
+-				fmt.Errorf("dial error: %v", err)
+-				os.Exit(1)
+-			}
+-			etcd := etcdserverpb.NewEtcdClient(conn)
+-			req := &etcdserverpb.RangeRequest{Key: key, RangeEnd: rangeEnd}
+-
+-			for _ = range jobs {
+-				st := time.Now()
+-				resp, err := etcd.Range(context.Background(), req)
++	requests := make(chan struct{}, n)
++	conn, err := grpc.Dial(url)
++	if err != nil {
++		fmt.Errorf("dial error: %v", err)
++		os.Exit(1)
++	}
+ 
+-				var errStr string
+-				if err != nil {
+-					errStr = err.Error()
+-				} else {
+-					errStr = resp.Header.Error
+-				}
+-				results <- &result{
+-					errStr:   errStr,
+-					duration: time.Now().Sub(st),
+-				}
+-				bar.Increment()
+-			}
+-		}()
++	for i := 0; i < c; i++ {
++		go get(etcdserverpb.NewEtcdClient(conn), key, rangeEnd, requests)
+ 	}
++
+ 	for i := 0; i < n; i++ {
+-		jobs <- struct{}{}
++		requests <- struct{}{}
+ 	}
+-	close(jobs)
++	close(requests)
+ 
+ 	wg.Wait()
++
++	bar.Finish()
++	printReport(n, results, time.Now().Sub(start))
+ }

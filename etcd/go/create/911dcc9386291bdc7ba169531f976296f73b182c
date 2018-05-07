@@ -1,0 +1,49 @@
+commit 911dcc9386291bdc7ba169531f976296f73b182c
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Sun Jul 31 20:08:27 2016 -0700
+
+    rafthttp: close http socket when pipeline handler gets a raft error
+    
+    Otherwise the http stream remains open and keeps receiving raft messages.
+    This can lead to "raft: stopped" log spam on closing an embedded server.
+    
+    Fixes #5981
+
+diff --git a/rafthttp/http.go b/rafthttp/http.go
+index 76b74bd..05f2461 100644
+--- a/rafthttp/http.go
++++ b/rafthttp/http.go
+@@ -123,6 +123,9 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		default:
+ 			plog.Warningf("failed to process raft message (%v)", err)
+ 			http.Error(w, "error processing raft message", http.StatusInternalServerError)
++			w.(http.Flusher).Flush()
++			// disconnect the http stream
++			panic(err)
+ 		}
+ 		return
+ 	}
+diff --git a/rafthttp/http_test.go b/rafthttp/http_test.go
+index a9efd2e..e276f11 100644
+--- a/rafthttp/http_test.go
++++ b/rafthttp/http_test.go
+@@ -152,7 +152,18 @@ func TestServeRaftPrefix(t *testing.T) {
+ 		req.Header.Set("X-Server-Version", version.Version)
+ 		rw := httptest.NewRecorder()
+ 		h := newPipelineHandler(NewNopTransporter(), tt.p, types.ID(0))
+-		h.ServeHTTP(rw, req)
++
++		// goroutine because the handler panics to disconnect on raft error
++		donec := make(chan struct{})
++		go func() {
++			defer func() {
++				recover()
++				close(donec)
++			}()
++			h.ServeHTTP(rw, req)
++		}()
++		<-donec
++
+ 		if rw.Code != tt.wcode {
+ 			t.Errorf("#%d: got code=%d, want %d", i, rw.Code, tt.wcode)
+ 		}

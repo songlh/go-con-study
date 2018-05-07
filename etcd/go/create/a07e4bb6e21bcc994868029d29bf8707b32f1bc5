@@ -1,0 +1,56 @@
+commit a07e4bb6e21bcc994868029d29bf8707b32f1bc5
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Wed Nov 18 16:07:38 2015 -0800
+
+    etcdserver: handle incoming v3 snapshot correctly
+    
+    1. we should update all kv reference (including the
+    on in snapStore).
+    
+    2. we should first restore a new KV and then close
+    the old one asynchronously.
+
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 5d796eb..df33c5a 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -496,21 +496,34 @@ func (s *EtcdServer) run() {
+ 				}
+ 
+ 				if s.cfg.V3demo {
+-					if err := s.kv.Close(); err != nil {
+-						plog.Panicf("close KV error: %v", err)
+-					}
+ 					snapfn, err := s.r.raftStorage.snapStore.getSnapFilePath(apply.snapshot.Metadata.Index)
+ 					if err != nil {
+ 						plog.Panicf("get snapshot file path error: %v", err)
+ 					}
++
+ 					fn := path.Join(s.cfg.StorageDir(), databaseFilename)
+ 					if err := os.Rename(snapfn, fn); err != nil {
+ 						plog.Panicf("rename snapshot file error: %v", err)
+ 					}
+-					s.kv = dstorage.New(fn, &s.consistIndex)
+-					if err := s.kv.Restore(); err != nil {
++
++					newKV := dstorage.New(fn, &s.consistIndex)
++					if err := newKV.Restore(); err != nil {
+ 						plog.Panicf("restore KV error: %v", err)
+ 					}
++
++					oldKV := s.kv
++					// TODO: swap the kv pointer atomically
++					s.kv = newKV
++					s.r.raftStorage.snapStore.kv = newKV
++
++					// Closing oldKV might block until all the txns
++					// on the kv are finished.
++					// We do not want to wait on closing the old kv.
++					go func() {
++						if err := oldKV.Close(); err != nil {
++							plog.Panicf("close KV error: %v", err)
++						}
++					}()
+ 				}
+ 				if err := s.store.Recovery(apply.snapshot.Data); err != nil {
+ 					plog.Panicf("recovery store error: %v", err)

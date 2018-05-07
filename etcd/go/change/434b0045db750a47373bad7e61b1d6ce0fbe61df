@@ -1,0 +1,84 @@
+commit 434b0045db750a47373bad7e61b1d6ce0fbe61df
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Sat Aug 10 23:37:26 2013 -0700
+
+    add snapshot
+
+diff --git a/etcd.go b/etcd.go
+index 9367def..50acc28 100644
+--- a/etcd.go
++++ b/etcd.go
+@@ -234,6 +234,7 @@ func main() {
+ 
+ 	// Create etcd key-value store
+ 	etcdStore = store.CreateStore(maxSize)
++	snapConf = newSnapshotConf()
+ 
+ 	startRaft(raftTLSConfig)
+ 
+@@ -346,7 +347,7 @@ func startRaft(tlsConfig TLSConfig) {
+ 
+ 	// open the snapshot
+ 	if snapshot {
+-		go raftServer.Snapshot()
++		go monitorSnapshot()
+ 	}
+ 
+ 	// start to response to raft requests
+diff --git a/etcd_handlers.go b/etcd_handlers.go
+index 704cb81..3936bf4 100644
+--- a/etcd_handlers.go
++++ b/etcd_handlers.go
+@@ -109,6 +109,7 @@ func DeleteHttpHandler(w *http.ResponseWriter, req *http.Request) {
+ func dispatch(c Command, w *http.ResponseWriter, req *http.Request, etcd bool) {
+ 	if raftServer.State() == "leader" {
+ 		if body, err := raftServer.Do(c); err != nil {
++			
+ 			if _, ok := err.(store.NotFoundError); ok {
+ 				(*w).WriteHeader(http.StatusNotFound)
+ 				(*w).Write(newJsonError(100, err.Error()))
+diff --git a/store/stats.go b/store/stats.go
+index 15b71e0..3270ae8 100644
+--- a/store/stats.go
++++ b/store/stats.go
+@@ -18,8 +18,16 @@ type EtcdStats struct {
+ 	TestAndSets uint64 `json:"testAndSets"`
+ }
+ 
+-// Stats returns the basic statistics information of etcd storage
++// Stats returns the basic statistics information of etcd storage since its recent start
+ func (s *Store) Stats() []byte {
+ 	b, _ := json.Marshal(s.BasicStats)
+ 	return b
+ }
++
++// TotalWrites returns the total write operations
++// It helps with snapshot
++func (s *Store) TotalWrites() uint64 {
++	bs := s.BasicStats
++
++	return bs.Deletes + bs.Sets + bs.TestAndSets
++}
+\ No newline at end of file
+diff --git a/third_party/github.com/coreos/go-raft/server.go b/third_party/github.com/coreos/go-raft/server.go
+index ab6aaba..fbf5c94 100644
+--- a/third_party/github.com/coreos/go-raft/server.go
++++ b/third_party/github.com/coreos/go-raft/server.go
+@@ -1025,16 +1025,7 @@ func (s *Server) RemovePeer(name string) error {
+ // Log compaction
+ //--------------------------------------
+ 
+-// The background snapshot function
+-func (s *Server) Snapshot() {
+-	for {
+-		// TODO: change this... to something reasonable
+-		time.Sleep(1 * time.Second)
+-		s.takeSnapshot()
+-	}
+-}
+-
+-func (s *Server) takeSnapshot() error {
++func (s *Server) TakeSnapshot() error {
+ 	//TODO put a snapshot mutex
+ 	s.debugln("take Snapshot")
+ 	if s.currentSnapshot != nil {

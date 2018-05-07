@@ -1,0 +1,217 @@
+commit f69582e1a2a14257c05e9789f3cc3b5ec5d7828e
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Wed Sep 16 09:58:16 2015 -0700
+
+    v3benchmark: add put benchmark
+
+diff --git a/tools/v3benchmark/get.go b/tools/v3benchmark/get.go
+index 4c5b679..73c1a31 100644
+--- a/tools/v3benchmark/get.go
++++ b/tools/v3benchmark/get.go
+@@ -18,9 +18,24 @@ import (
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+ 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
+ )
+ 
++func benchGet(conn *grpc.ClientConn, key, rangeEnd []byte, n, c int) {
++	wg.Add(c)
++	requests := make(chan struct{}, n)
++
++	for i := 0; i < c; i++ {
++		go get(etcdserverpb.NewEtcdClient(conn), key, rangeEnd, requests)
++	}
++
++	for i := 0; i < n; i++ {
++		requests <- struct{}{}
++	}
++	close(requests)
++}
++
+ func get(client etcdserverpb.EtcdClient, key, end []byte, requests <-chan struct{}) {
+ 	defer wg.Done()
+ 	req := &etcdserverpb.RangeRequest{Key: key, RangeEnd: end}
+diff --git a/tools/v3benchmark/main.go b/tools/v3benchmark/main.go
+index af22940..22dd3fe 100644
+--- a/tools/v3benchmark/main.go
++++ b/tools/v3benchmark/main.go
+@@ -18,12 +18,12 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/cheggaaa/pb"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+-	"github.com/coreos/etcd/etcdserver/etcdserverpb"
+ )
+ 
+ var (
+@@ -33,10 +33,15 @@ var (
+ )
+ 
+ func main() {
+-	var c, n int
+-	var url string
++	var (
++		c, n int
++		url  string
++		size int
++	)
++
+ 	flag.IntVar(&c, "c", 50, "number of connections")
+ 	flag.IntVar(&n, "n", 200, "number of requests")
++	flag.IntVar(&size, "s", 128, "size of put request")
+ 	// TODO: config the number of concurrency in each connection
+ 	flag.StringVar(&url, "u", "127.0.0.1:12379", "etcd server endpoint")
+ 	flag.Parse()
+@@ -45,14 +50,16 @@ func main() {
+ 		os.Exit(1)
+ 	}
+ 
+-	if act := flag.Args()[0]; act != "get" {
+-		fmt.Errorf("unsupported action %v", act)
++	var act string
++	if act = flag.Args()[0]; act != "get" && act != "put" {
++		fmt.Printf("unsupported action %v\n", act)
+ 		os.Exit(1)
+ 	}
+-	var rangeEnd []byte
+-	key := []byte(flag.Args()[1])
+-	if len(flag.Args()) > 2 {
+-		rangeEnd = []byte(flag.Args()[2])
++
++	conn, err := grpc.Dial(url)
++	if err != nil {
++		fmt.Errorf("dial error: %v", err)
++		os.Exit(1)
+ 	}
+ 
+ 	results = make(chan *result, n)
+@@ -62,22 +69,22 @@ func main() {
+ 
+ 	start := time.Now()
+ 
+-	wg.Add(c)
+-	requests := make(chan struct{}, n)
+-	conn, err := grpc.Dial(url)
+-	if err != nil {
+-		fmt.Errorf("dial error: %v", err)
+-		os.Exit(1)
+-	}
+-
+-	for i := 0; i < c; i++ {
+-		go get(etcdserverpb.NewEtcdClient(conn), key, rangeEnd, requests)
+-	}
+-
+-	for i := 0; i < n; i++ {
+-		requests <- struct{}{}
++	if act == "get" {
++		var rangeEnd []byte
++		key := []byte(flag.Args()[1])
++		if len(flag.Args()) > 2 {
++			rangeEnd = []byte(flag.Args()[2])
++		}
++		benchGet(conn, key, rangeEnd, n, c)
++	} else if act == "put" {
++		key := []byte(flag.Args()[1])
++		// number of different keys to put into etcd
++		kc, err := strconv.ParseInt(flag.Args()[2], 10, 32)
++		if err != nil {
++			panic(err)
++		}
++		benchPut(conn, key, int(kc), n, c, size)
+ 	}
+-	close(requests)
+ 
+ 	wg.Wait()
+ 
+diff --git a/tools/v3benchmark/put.go b/tools/v3benchmark/put.go
+new file mode 100644
+index 0000000..829002a
+--- /dev/null
++++ b/tools/v3benchmark/put.go
+@@ -0,0 +1,79 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++import (
++	"crypto/rand"
++	"encoding/binary"
++	"fmt"
++	"os"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
++	"github.com/coreos/etcd/etcdserver/etcdserverpb"
++)
++
++func benchPut(conn *grpc.ClientConn, key []byte, kc, n, c, size int) {
++	wg.Add(c)
++	requests := make(chan *etcdserverpb.PutRequest, n)
++
++	v := make([]byte, size)
++	_, err := rand.Read(v)
++	if err != nil {
++		fmt.Printf("failed to generate value: %v\n", err)
++		os.Exit(1)
++		return
++	}
++
++	for i := 0; i < c; i++ {
++		go put(etcdserverpb.NewEtcdClient(conn), requests)
++	}
++
++	suffixb := make([]byte, 8)
++	suffix := 0
++	for i := 0; i < n; i++ {
++		binary.BigEndian.PutUint64(suffixb, uint64(suffix))
++		r := &etcdserverpb.PutRequest{
++			Key:   append(key, suffixb...),
++			Value: v,
++		}
++		requests <- r
++		if suffix > kc {
++			suffix = 0
++		}
++		suffix++
++	}
++	close(requests)
++}
++
++func put(client etcdserverpb.EtcdClient, requests <-chan *etcdserverpb.PutRequest) {
++	defer wg.Done()
++
++	for r := range requests {
++		st := time.Now()
++		_, err := client.Put(context.Background(), r)
++
++		var errStr string
++		if err != nil {
++			errStr = err.Error()
++		}
++		results <- &result{
++			errStr:   errStr,
++			duration: time.Now().Sub(st),
++		}
++		bar.Increment()
++	}
++}

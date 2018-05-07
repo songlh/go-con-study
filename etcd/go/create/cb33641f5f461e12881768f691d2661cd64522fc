@@ -1,0 +1,303 @@
+commit cb33641f5f461e12881768f691d2661cd64522fc
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Tue Aug 13 18:40:53 2013 -0700
+
+    clean up
+
+diff --git a/config.go b/config.go
+index ebd2c55..e94fcb1 100644
+--- a/config.go
++++ b/config.go
+@@ -14,39 +14,14 @@ import (
+ // Config
+ //--------------------------------------
+ 
+-func parseInfo(path string) *Info {
+-	file, err := os.Open(path)
+-
+-	if err != nil {
+-		return nil
+-	}
+-	defer file.Close()
+-
+-	info := &Info{}
+-
+-	content, err := ioutil.ReadAll(file)
+-	if err != nil {
+-		fatalf("Unable to read info: %v", err)
+-		return nil
+-	}
+-
+-	if err = json.Unmarshal(content, &info); err != nil {
+-		fatalf("Unable to parse info: %v", err)
+-		return nil
+-	}
+-
+-	return info
+-}
+-
+ // Get the server info from previous conf file
+ // or from the user
+ func getInfo(path string) *Info {
+ 
+-	// Read in the server info if available.
+ 	infoPath := filepath.Join(path, "info")
+ 
+-	// Delete the old configuration if exist
+ 	if force {
++		// Delete the old configuration if exist
+ 		logPath := filepath.Join(path, "log")
+ 		confPath := filepath.Join(path, "conf")
+ 		snapshotPath := filepath.Join(path, "snapshot")
+@@ -54,15 +29,13 @@ func getInfo(path string) *Info {
+ 		os.Remove(logPath)
+ 		os.Remove(confPath)
+ 		os.RemoveAll(snapshotPath)
+-	}
+-
+-	info := parseInfo(infoPath)
+-	if info != nil {
++	} else if info := readInfo(infoPath); info != nil {
+ 		infof("Found node configuration in '%s'. Ignoring flags", infoPath)
+ 		return info
+ 	}
+ 
+-	info = &argInfo
++	// Read info from command line
++	info := &argInfo
+ 
+ 	// Write to file.
+ 	content, _ := json.MarshalIndent(info, "", " ")
+@@ -76,6 +49,31 @@ func getInfo(path string) *Info {
+ 	return info
+ }
+ 
++// readInfo reads from info file and decode to Info struct
++func readInfo(path string) *Info {
++	file, err := os.Open(path)
++
++	if err != nil {
++		return nil
++	}
++	defer file.Close()
++
++	info := &Info{}
++
++	content, err := ioutil.ReadAll(file)
++	if err != nil {
++		fatalf("Unable to read info: %v", err)
++		return nil
++	}
++
++	if err = json.Unmarshal(content, &info); err != nil {
++		fatalf("Unable to parse info: %v", err)
++		return nil
++	}
++
++	return info
++}
++
+ func tlsConfigFromInfo(info TLSInfo) (t TLSConfig, ok bool) {
+ 	var keyFile, certFile, CAFile string
+ 	var tlsCert tls.Certificate
+diff --git a/etcd.go b/etcd.go
+index 184ab9e..211184f 100644
+--- a/etcd.go
++++ b/etcd.go
+@@ -4,13 +4,11 @@ import (
+ 	"crypto/tls"
+ 	"flag"
+ 	"github.com/coreos/etcd/store"
+-	"github.com/coreos/etcd/web"
++	"github.com/coreos/go-raft"
+ 	"io/ioutil"
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+-	"os/signal"
+-	"runtime/pprof"
+ 	"strings"
+ 	"time"
+ )
+@@ -142,27 +140,12 @@ func main() {
+ 	flag.Parse()
+ 
+ 	if cpuprofile != "" {
+-		f, err := os.Create(cpuprofile)
+-		if err != nil {
+-			fatal(err)
+-		}
+-		pprof.StartCPUProfile(f)
+-		defer pprof.StopCPUProfile()
+-
+-		c := make(chan os.Signal, 1)
+-		signal.Notify(c, os.Interrupt)
+-		go func() {
+-			for sig := range c {
+-				infof("captured %v, stopping profiler and exiting..", sig)
+-				pprof.StopCPUProfile()
+-				os.Exit(1)
+-			}
+-		}()
+-
++		runCPUProfile()
+ 	}
+ 
+ 	if veryVerbose {
+ 		verbose = true
++		raft.SetLogLevel(raft.Debug)
+ 	}
+ 
+ 	if machines != "" {
+@@ -175,6 +158,7 @@ func main() {
+ 		cluster = strings.Split(string(b), ",")
+ 	}
+ 
++	// Check TLS arguments
+ 	raftTLSConfig, ok := tlsConfigFromInfo(argInfo.RaftTLS)
+ 	if !ok {
+ 		fatal("Please specify cert and key file or cert and key file and CAFile or none of the three")
+@@ -190,13 +174,11 @@ func main() {
+ 		fatal("ERROR: server name required. e.g. '-n=server_name'")
+ 	}
+ 
++	// Check host name arguments
+ 	argInfo.RaftURL = sanitizeURL(argInfo.RaftURL, raftTLSConfig.Scheme)
+ 	argInfo.EtcdURL = sanitizeURL(argInfo.EtcdURL, etcdTLSConfig.Scheme)
+ 	argInfo.WebURL = sanitizeURL(argInfo.WebURL, "http")
+ 
+-	// Setup commands.
+-	registerCommands()
+-
+ 	// Read server info from file or grab it from user.
+ 	if err := os.MkdirAll(dirPath, 0744); err != nil {
+ 		fatalf("Unable to create path: %s", err)
+@@ -208,21 +190,16 @@ func main() {
+ 	etcdStore = store.CreateStore(maxSize)
+ 	snapConf = newSnapshotConf()
+ 
+-	startRaft(raftTLSConfig)
++	startWebInterface()
+ 
+-	if argInfo.WebURL != "" {
+-		// start web
+-		argInfo.WebURL = sanitizeURL(argInfo.WebURL, "http")
+-		go webHelper()
+-		go web.Start(raftServer, argInfo.WebURL)
+-	}
++	startRaft(raftTLSConfig)
+ 
+-	startEtcdTransport(*info, etcdTLSConfig.Scheme, etcdTLSConfig.Server)
++	startEtcd(etcdTLSConfig)
+ 
+ }
+ 
+-// Start to listen and response client command
+-func startEtcdTransport(info Info, scheme string, tlsConf tls.Config) {
++// Start to listen and response etcd client command
++func startEtcd(tlsConf TLSConfig) {
+ 	u, err := url.Parse(info.EtcdURL)
+ 	if err != nil {
+ 		fatalf("invalid url '%s': %s", info.EtcdURL, err)
+@@ -231,11 +208,11 @@ func startEtcdTransport(info Info, scheme string, tlsConf tls.Config) {
+ 
+ 	server := http.Server{
+ 		Handler:   NewEtcdMuxer(),
+-		TLSConfig: &tlsConf,
++		TLSConfig: &tlsConf.Server,
+ 		Addr:      u.Host,
+ 	}
+ 
+-	if scheme == "http" {
++	if tlsConf.Scheme == "http" {
+ 		fatal(server.ListenAndServe())
+ 	} else {
+ 		fatal(server.ListenAndServeTLS(info.EtcdTLS.CertFile, info.EtcdTLS.KeyFile))
+diff --git a/raft_server.go b/raft_server.go
+index d97aa80..b090931 100644
+--- a/raft_server.go
++++ b/raft_server.go
+@@ -12,23 +12,21 @@ import (
+ 	"github.com/coreos/go-raft"
+ )
+ 
+-var raftTransporter transporter
+ var raftServer *raft.Server
+ 
+ // Start the raft server
+ func startRaft(tlsConfig TLSConfig) {
+-	if veryVerbose {
+-		raft.SetLogLevel(raft.Debug)
+-	}
+-
+-	var err error
+ 
+ 	raftName := info.Name
+ 
++	// Setup commands.
++	registerCommands()
++
+ 	// Create transporter for raft
+-	raftTransporter = newTransporter(tlsConfig.Scheme, tlsConfig.Client)
++	raftTransporter := newTransporter(tlsConfig.Scheme, tlsConfig.Client)
+ 
+ 	// Create raft server
++	var err error
+ 	raftServer, err = raft.NewServer(raftName, dirPath, raftTransporter, etcdStore, nil)
+ 
+ 	if err != nil {
+diff --git a/util.go b/util.go
+index 682eafb..4914a4a 100644
+--- a/util.go
++++ b/util.go
+@@ -10,6 +10,8 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"os"
++	"os/signal"
++	"runtime/pprof"
+ 	"strconv"
+ 	"time"
+ )
+@@ -48,6 +50,15 @@ func webHelper() {
+ 	}
+ }
+ 
++// startWebInterface starts web interface if webURL is not empty
++func startWebInterface() {
++	if argInfo.WebURL != "" {
++		// start web
++		go webHelper()
++		go web.Start(raftServer, argInfo.WebURL)
++	}
++}
++
+ //--------------------------------------
+ // HTTP Utilities
+ //--------------------------------------
+@@ -144,3 +155,25 @@ func fatal(v ...interface{}) {
+ 	logger.Println("FATAL " + fmt.Sprint(v...))
+ 	os.Exit(1)
+ }
++
++//--------------------------------------
++// CPU profile
++//--------------------------------------
++func runCPUProfile() {
++
++	f, err := os.Create(cpuprofile)
++	if err != nil {
++		fatal(err)
++	}
++	pprof.StartCPUProfile(f)
++
++	c := make(chan os.Signal, 1)
++	signal.Notify(c, os.Interrupt)
++	go func() {
++		for sig := range c {
++			infof("captured %v, stopping profiler and exiting..", sig)
++			pprof.StopCPUProfile()
++			os.Exit(1)
++		}
++	}()
++}

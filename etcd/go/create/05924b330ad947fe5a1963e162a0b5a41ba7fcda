@@ -1,0 +1,56 @@
+commit 05924b330ad947fe5a1963e162a0b5a41ba7fcda
+Author: Ben Darnell <ben@bendarnell.com>
+Date:   Fri Aug 28 11:17:59 2015 +0200
+
+    raft: Fix a nil-pointer panic in MultiNode.Propose.
+
+diff --git a/raft/multinode.go b/raft/multinode.go
+index b386a95..d5bd4ee 100644
+--- a/raft/multinode.go
++++ b/raft/multinode.go
+@@ -227,8 +227,10 @@ func (mn *multiNode) run() {
+ 			// We'll have to buffer somewhere on a group-by-group basis, or just let
+ 			// raft.Step drop any such proposals on the floor.
+ 			mm.msg.From = mn.id
+-			group = groups[mm.group]
+-			group.raft.Step(mm.msg)
++			var ok bool
++			if group, ok = groups[mm.group]; ok {
++				group.raft.Step(mm.msg)
++			}
+ 
+ 		case mm := <-mn.recvc:
+ 			group = groups[mm.group]
+diff --git a/raft/multinode_test.go b/raft/multinode_test.go
+index f15cb1f..e53a9fc 100644
+--- a/raft/multinode_test.go
++++ b/raft/multinode_test.go
+@@ -206,8 +206,26 @@ func TestMultiNodeProposeConfig(t *testing.T) {
+ 	}
+ }
+ 
+-// TestBlockProposal from node_test.go has no equivalent in multiNode
+-// because we cannot block proposals based on individual group leader status.
++// TestProposeUnknownGroup ensures that we gracefully handle proposals
++// for groups we don't know about (which can happen on a former leader
++// that has been removed from the group).
++//
++// It is analogous to TestBlockProposal from node_test.go but in
++// MultiNode we cannot block proposals based on individual group
++// leader status.
++func TestProposeUnknownGroup(t *testing.T) {
++	mn := newMultiNode(1)
++	go mn.run()
++	defer mn.Stop()
++
++	// A nil error from Propose() doesn't mean much. In this case the
++	// proposal will be dropped on the floor because we don't know
++	// anything about group 42. This is a very crude test that mainly
++	// guarantees that we don't panic in this case.
++	if err := mn.Propose(context.TODO(), 42, []byte("somedata")); err != nil {
++		t.Errorf("err = %v, want nil", err)
++	}
++}
+ 
+ // TestNodeTick from node_test.go has no equivalent in multiNode because
+ // it reaches into the raft object which is not exposed.

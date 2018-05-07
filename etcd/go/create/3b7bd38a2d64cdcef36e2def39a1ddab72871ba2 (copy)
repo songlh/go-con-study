@@ -1,0 +1,68 @@
+commit 3b7bd38a2d64cdcef36e2def39a1ddab72871ba2
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Feb 11 13:32:58 2016 -0800
+
+    clientv3: fix bad variable capture in watch request retry
+    
+    variables would be niled out when the goroutine runs, causing a crash
+
+diff --git a/clientv3/integration/watch_test.go b/clientv3/integration/watch_test.go
+index 2e13ab9..d33723c 100644
+--- a/clientv3/integration/watch_test.go
++++ b/clientv3/integration/watch_test.go
+@@ -157,6 +157,33 @@ func testWatchMultiWatcher(t *testing.T, wctx *watchctx) {
+ 	}
+ }
+ 
++// TestWatchReconnRequest tests the send failure path when requesting a watcher.
++func TestWatchReconnRequest(t *testing.T) {
++	runWatchTest(t, testWatchReconnRequest)
++}
++
++func testWatchReconnRequest(t *testing.T, wctx *watchctx) {
++	// take down watcher connection
++	donec := make(chan struct{})
++	go func() {
++		for {
++			wctx.wclient.ActiveConnection().Close()
++			select {
++			case <-donec:
++				return
++			default:
++			}
++		}
++	}()
++	// should reconnect when requesting watch
++	if wctx.ch = wctx.w.Watch(context.TODO(), "a", 0); wctx.ch == nil {
++		t.Fatalf("expected non-nil channel")
++	}
++	close(donec)
++	// ensure watcher works
++	putAndWatch(t, wctx, "a", "a")
++}
++
+ // TestWatchReconnInit tests watcher resumes correctly if connection lost
+ // before any data was sent.
+ func TestWatchReconnInit(t *testing.T) {
+diff --git a/clientv3/watch.go b/clientv3/watch.go
+index 80ecca4..79b78a4 100644
+--- a/clientv3/watch.go
++++ b/clientv3/watch.go
+@@ -286,13 +286,13 @@ func (w *watcher) run() {
+ 
+ 		// send failed; queue for retry
+ 		if failedReq != nil {
+-			go func() {
++			go func(wr *watchRequest) {
+ 				select {
+-				case w.reqc <- pendingReq:
+-				case <-pendingReq.ctx.Done():
++				case w.reqc <- wr:
++				case <-wr.ctx.Done():
+ 				case <-w.donec:
+ 				}
+-			}()
++			}(pendingReq)
+ 			failedReq = nil
+ 			pendingReq = nil
+ 		}

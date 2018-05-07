@@ -1,0 +1,153 @@
+commit 74bad576ed462870235727a62b99b960cf413143
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Fri Jan 13 10:01:32 2017 -0800
+
+    pkg/report: add 'Stats' to expose report raw data
+
+diff --git a/pkg/report/report.go b/pkg/report/report.go
+index bf8b477..78759ae 100644
+--- a/pkg/report/report.go
++++ b/pkg/report/report.go
+@@ -55,12 +55,30 @@ type report struct {
+ 	sps *secondPoints
+ }
+ 
++// Stats exposes results raw data.
++type Stats struct {
++	AvgTotal   float64
++	Fastest    float64
++	Slowest    float64
++	Average    float64
++	Stddev     float64
++	RPS        float64
++	Total      time.Duration
++	ErrorDist  map[string]int
++	Lats       []float64
++	TimeSeries TimeSeries
++}
++
+ // Report processes a result stream until it is closed, then produces a
+ // string with information about the consumed result data.
+ type Report interface {
+ 	Results() chan<- Result
++
++	// Run returns results in print-friendly format.
+ 	Run() <-chan string
+-	String() string
++
++	// Stats returns results in raw data.
++	Stats() <-chan Stats
+ }
+ 
+ func NewReport(precision string) Report {
+@@ -89,6 +107,41 @@ func (r *report) Run() <-chan string {
+ 	return donec
+ }
+ 
++func (r *report) Stats() <-chan Stats {
++	donec := make(chan Stats, 1)
++	go func() {
++		defer close(donec)
++		r.processResults()
++		donec <- Stats{
++			AvgTotal:   r.avgTotal,
++			Fastest:    r.fastest,
++			Slowest:    r.slowest,
++			Average:    r.average,
++			Stddev:     r.stddev,
++			RPS:        r.rps,
++			Total:      r.total,
++			ErrorDist:  copyMap(r.errorDist),
++			Lats:       copyFloats(r.lats),
++			TimeSeries: r.sps.getTimeSeries(),
++		}
++	}()
++	return donec
++}
++
++func copyMap(m map[string]int) (c map[string]int) {
++	c = make(map[string]int, len(m))
++	for k, v := range m {
++		c[k] = v
++	}
++	return
++}
++
++func copyFloats(s []float64) (c []float64) {
++	c = make([]float64, len(s))
++	copy(c, s)
++	return
++}
++
+ func (r *report) String() (s string) {
+ 	if len(r.lats) > 0 {
+ 		s += fmt.Sprintf("\nSummary:\n")
+@@ -158,7 +211,11 @@ func (r *report) processResults() {
+ 
+ var pctls = []float64{10, 25, 50, 75, 90, 95, 99, 99.9}
+ 
+-// percentiles returns percentile distribution of float64 slice.
++// Percentiles returns percentile distribution of float64 slice.
++func Percentiles(nums []float64) (pcs []float64, data []float64) {
++	return pctls, percentiles(nums)
++}
++
+ func percentiles(nums []float64) (data []float64) {
+ 	data = make([]float64, len(pctls))
+ 	j := 0
+diff --git a/pkg/report/timeseries.go b/pkg/report/timeseries.go
+index 76c1949..ba4a5f8 100644
+--- a/pkg/report/timeseries.go
++++ b/pkg/report/timeseries.go
+@@ -25,17 +25,17 @@ import (
+ 	"time"
+ )
+ 
+-type timeSeries struct {
+-	timestamp  int64
+-	avgLatency time.Duration
+-	throughPut int64
++type DataPoint struct {
++	Timestamp  int64
++	AvgLatency time.Duration
++	ThroughPut int64
+ }
+ 
+-type TimeSeries []timeSeries
++type TimeSeries []DataPoint
+ 
+ func (t TimeSeries) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
+ func (t TimeSeries) Len() int           { return len(t) }
+-func (t TimeSeries) Less(i, j int) bool { return t[i].timestamp < t[j].timestamp }
++func (t TimeSeries) Less(i, j int) bool { return t[i].Timestamp < t[j].Timestamp }
+ 
+ type secondPoint struct {
+ 	totalLatency time.Duration
+@@ -96,10 +96,10 @@ func (sp *secondPoints) getTimeSeries() TimeSeries {
+ 		if v.count > 0 {
+ 			lat = time.Duration(v.totalLatency) / time.Duration(v.count)
+ 		}
+-		tslice[i] = timeSeries{
+-			timestamp:  k,
+-			avgLatency: lat,
+-			throughPut: v.count,
++		tslice[i] = DataPoint{
++			Timestamp:  k,
++			AvgLatency: lat,
++			ThroughPut: v.count,
+ 		}
+ 		i++
+ 	}
+@@ -117,9 +117,9 @@ func (ts TimeSeries) String() string {
+ 	rows := [][]string{}
+ 	for i := range ts {
+ 		row := []string{
+-			fmt.Sprintf("%d", ts[i].timestamp),
+-			fmt.Sprintf("%s", ts[i].avgLatency),
+-			fmt.Sprintf("%d", ts[i].throughPut),
++			fmt.Sprintf("%d", ts[i].Timestamp),
++			fmt.Sprintf("%s", ts[i].AvgLatency),
++			fmt.Sprintf("%d", ts[i].ThroughPut),
+ 		}
+ 		rows = append(rows, row)
+ 	}

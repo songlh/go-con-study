@@ -1,0 +1,202 @@
+commit 215820dd4017920fa542c9c76397cccb4f3e8d23
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Wed Jul 30 10:21:54 2014 -0700
+
+    server: move TestMultiNodeKillOne to etcd/
+
+diff --git a/etcd/etcd_functional_test.go b/etcd/etcd_functional_test.go
+index c0588f6..d1ce17c 100644
+--- a/etcd/etcd_functional_test.go
++++ b/etcd/etcd_functional_test.go
+@@ -26,6 +26,8 @@ import (
+ 
+ 	"github.com/coreos/etcd/config"
+ 	"github.com/coreos/etcd/store"
++
++	"github.com/coreos/etcd/third_party/github.com/coreos/go-etcd/etcd"
+ )
+ 
+ func TestKillLeader(t *testing.T) {
+@@ -57,7 +59,7 @@ func TestKillLeader(t *testing.T) {
+ 			id := es[lead].id
+ 			e, h, err := buildServer(t, c, id)
+ 			if err != nil {
+-				t.Fatal("#%d.%d: %v", i, j, err)
++				t.Fatalf("#%d.%d: %v", i, j, err)
+ 			}
+ 			es[lead] = e
+ 			hs[lead] = h
+@@ -180,6 +182,41 @@ func TestClusterConfigReload(t *testing.T) {
+ 	afterTest(t)
+ }
+ 
++func TestMultiNodeKillOne(t *testing.T) {
++	tests := []int{5}
++
++	for i, tt := range tests {
++		es, hs := buildCluster(tt, false)
++		waitCluster(t, es)
++
++		stop := make(chan bool)
++		go keepSetting(hs[0].URL, stop)
++
++		for j := 0; j < 10; j++ {
++			idx := rand.Int() % tt
++			es[idx].Stop()
++			hs[idx].Close()
++
++			c := config.New()
++			c.DataDir = es[idx].config.DataDir
++			c.Addr = hs[idx].Listener.Addr().String()
++			id := es[idx].id
++			e, h, err := buildServer(t, c, id)
++			if err != nil {
++				t.Fatalf("#%d.%d: %v", i, j, err)
++			}
++			es[idx] = e
++			hs[idx] = h
++		}
++
++		stop <- true
++		<-stop
++
++		destoryCluster(t, es, hs)
++	}
++	afterTest(t)
++}
++
+ func BenchmarkEndToEndSet(b *testing.B) {
+ 	es, hs := buildCluster(3, false)
+ 	waitLeader(es)
+@@ -251,6 +288,41 @@ func TestModeSwitch(t *testing.T) {
+ 	afterTest(t)
+ }
+ 
++// Sending set commands
++func keepSetting(urlStr string, stop chan bool) {
++	stopSet := false
++	i := 0
++	c := etcd.NewClient([]string{urlStr})
++	for {
++		key := fmt.Sprintf("%s_%v", "foo", i)
++
++		result, err := c.Set(key, "bar", 0)
++
++		if err != nil || result.Node.Key != "/"+key || result.Node.Value != "bar" {
++			select {
++			case <-stop:
++				stopSet = true
++
++			default:
++			}
++		}
++
++		select {
++		case <-stop:
++			stopSet = true
++
++		default:
++		}
++
++		if stopSet {
++			break
++		}
++
++		i++
++	}
++	stop <- true
++}
++
+ type leadterm struct {
+ 	lead int64
+ 	term int64
+diff --git a/tests/functional/multi_node_kill_one_test.go b/tests/functional/multi_node_kill_one_test.go
+deleted file mode 100644
+index fe25d9f..0000000
+--- a/tests/functional/multi_node_kill_one_test.go
++++ /dev/null
+@@ -1,57 +0,0 @@
+-package test
+-
+-import (
+-	"fmt"
+-	"math/rand"
+-	"os"
+-	"testing"
+-	"time"
+-
+-	"github.com/coreos/etcd/third_party/github.com/coreos/go-etcd/etcd"
+-)
+-
+-// Create a five nodes
+-// Randomly kill one of the node and keep on sending set command to the cluster
+-func TestMultiNodeKillOne(t *testing.T) {
+-	procAttr := new(os.ProcAttr)
+-	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
+-
+-	clusterSize := 5
+-	argGroup, etcds, err := CreateCluster(clusterSize, procAttr, false)
+-
+-	if err != nil {
+-		t.Fatal("cannot create cluster")
+-	}
+-
+-	defer DestroyCluster(etcds)
+-
+-	time.Sleep(2 * time.Second)
+-
+-	c := etcd.NewClient(nil)
+-
+-	c.SyncCluster()
+-
+-	stop := make(chan bool)
+-	// Test Set
+-	go Set(stop)
+-
+-	for i := 0; i < 10; i++ {
+-		num := rand.Int() % clusterSize
+-		fmt.Println("kill node", num+1)
+-
+-		// kill
+-		etcds[num].Kill()
+-		etcds[num].Release()
+-		time.Sleep(time.Second)
+-
+-		// restart
+-		etcds[num], err = os.StartProcess(EtcdBinPath, argGroup[num], procAttr)
+-		if err != nil {
+-			panic(err)
+-		}
+-		time.Sleep(time.Second)
+-	}
+-	fmt.Println("stop")
+-	stop <- true
+-	<-stop
+-}
+diff --git a/wal/block.go b/wal/block.go
+index 937cca5..f017cd6 100644
+--- a/wal/block.go
++++ b/wal/block.go
+@@ -17,7 +17,6 @@ limitations under the License.
+ package wal
+ 
+ import (
+-	"fmt"
+ 	"io"
+ )
+ 
+@@ -47,13 +46,9 @@ func readBlock(r io.Reader, b *block) error {
+ 		return unexpectedEOF(err)
+ 	}
+ 	d := make([]byte, l)
+-	n, err := r.Read(d)
+-	if err != nil {
++	if _, err = io.ReadFull(r, d); err != nil {
+ 		return unexpectedEOF(err)
+ 	}
+-	if n != int(l) {
+-		return fmt.Errorf("len(data) = %d, want %d", n, l)
+-	}
+ 	b.t = t
+ 	b.d = d
+ 	return nil

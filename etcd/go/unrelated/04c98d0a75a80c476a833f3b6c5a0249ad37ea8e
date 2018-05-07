@@ -1,0 +1,241 @@
+commit 04c98d0a75a80c476a833f3b6c5a0249ad37ea8e
+Author: Ben Johnson <benbjohnson@yahoo.com>
+Date:   Fri Dec 20 15:39:22 2013 -0700
+
+    bump(github.com/coreos/go-systemd): 700560af03f8e1df35839041745c9f1fccba7c72
+
+diff --git a/third_party/github.com/coreos/go-systemd/README.md b/third_party/github.com/coreos/go-systemd/README.md
+index 9b8a2f8..2adbac5 100644
+--- a/third_party/github.com/coreos/go-systemd/README.md
++++ b/third_party/github.com/coreos/go-systemd/README.md
+@@ -1,3 +1,8 @@
+ # go-systemd
+ 
+ Go bindings to systemd socket activation, journal and D-BUS APIs.
++
++## Socket Activation
++
++See an example in `examples/activation/httpserver.go`. For easy debugging use
++`/usr/lib/systemd/systemd-activate`
+diff --git a/third_party/github.com/coreos/go-systemd/activation/files.go b/third_party/github.com/coreos/go-systemd/activation/files.go
+index a05dbcc..3f323d8 100644
+--- a/third_party/github.com/coreos/go-systemd/activation/files.go
++++ b/third_party/github.com/coreos/go-systemd/activation/files.go
+@@ -29,7 +29,7 @@ func Files(unsetEnv bool) []*os.File {
+ 	if err != nil || nfds == 0 {
+ 		return nil
+ 	}
+-	files := []*os.File(nil)
++	var files []*os.File
+ 	for fd := listenFdsStart; fd < listenFdsStart+nfds; fd++ {
+ 		syscall.CloseOnExec(fd)
+ 		files = append(files, os.NewFile(uintptr(fd), "LISTEN_FD_"+strconv.Itoa(fd)))
+diff --git a/third_party/github.com/coreos/go-systemd/activation/files_test.go b/third_party/github.com/coreos/go-systemd/activation/files_test.go
+new file mode 100644
+index 0000000..cee919e
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/activation/files_test.go
+@@ -0,0 +1,68 @@
++package activation
++
++import (
++	"bytes"
++	"io"
++	"os"
++	"os/exec"
++	"testing"
++)
++
++// correctStringWritten fails the text if the correct string wasn't written
++// to the other side of the pipe.
++func correctStringWritten(t *testing.T, r *os.File, expected string) bool {
++	bytes := make([]byte, len(expected))
++	io.ReadAtLeast(r, bytes, len(expected))
++
++	if string(bytes) != expected {
++		t.Fatalf("Unexpected string %s", string(bytes))
++	}
++
++	return true
++}
++
++// TestActivation forks out a copy of activation.go example and reads back two
++// strings from the pipes that are passed in.
++func TestActivation(t *testing.T) {
++	cmd := exec.Command("go", "run", "../examples/activation/activation.go")
++
++	r1, w1, _ := os.Pipe()
++	r2, w2, _ := os.Pipe()
++	cmd.ExtraFiles = []*os.File{
++		w1,
++		w2,
++	}
++
++	cmd.Env = os.Environ()
++	cmd.Env = append(cmd.Env, "LISTEN_FDS=2", "FIX_LISTEN_PID=1")
++
++	err := cmd.Run()
++	if err != nil {
++		t.Fatalf(err.Error())
++	}
++
++	correctStringWritten(t, r1, "Hello world")
++	correctStringWritten(t, r2, "Goodbye world")
++}
++
++func TestActivationNoFix(t *testing.T) {
++	cmd := exec.Command("go", "run", "../examples/activation/activation.go")
++	cmd.Env = os.Environ()
++	cmd.Env = append(cmd.Env, "LISTEN_FDS=2")
++
++	out, _ := cmd.CombinedOutput()
++	if bytes.Contains(out, []byte("No files")) == false {
++		t.Fatalf("Child didn't error out as expected")
++	}
++}
++
++func TestActivationNoFiles(t *testing.T) {
++	cmd := exec.Command("go", "run", "../examples/activation/activation.go")
++	cmd.Env = os.Environ()
++	cmd.Env = append(cmd.Env, "LISTEN_FDS=0", "FIX_LISTEN_PID=1")
++
++	out, _ := cmd.CombinedOutput()
++	if bytes.Contains(out, []byte("No files")) == false {
++		t.Fatalf("Child didn't error out as expected")
++	}
++}
+diff --git a/third_party/github.com/coreos/go-systemd/examples/activation/activation.go b/third_party/github.com/coreos/go-systemd/examples/activation/activation.go
+new file mode 100644
+index 0000000..b3cf70e
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/examples/activation/activation.go
+@@ -0,0 +1,44 @@
++// Activation example used by the activation unit tests.
++package main
++
++import (
++	"fmt"
++	"os"
++
++	"github.com/coreos/go-systemd/activation"
++)
++
++func fixListenPid() {
++	if os.Getenv("FIX_LISTEN_PID") != "" {
++		// HACK: real systemd would set LISTEN_PID before exec'ing but
++		// this is too difficult in golang for the purpose of a test.
++		// Do not do this in real code.
++		os.Setenv("LISTEN_PID", fmt.Sprintf("%d", os.Getpid()))
++	}
++}
++
++func main() {
++	fixListenPid()
++
++	files := activation.Files(false)
++
++	if len(files) == 0 {
++		panic("No files")
++	}
++
++	if os.Getenv("LISTEN_PID") == "" || os.Getenv("LISTEN_FDS") == "" {
++		panic("Should not unset envs")
++	}
++
++	files = activation.Files(true)
++
++	if os.Getenv("LISTEN_PID") != "" || os.Getenv("LISTEN_FDS") != "" {
++		panic("Can not unset envs")
++	}
++
++	// Write out the expected strings to the two pipes
++	files[0].Write([]byte("Hello world"))
++	files[1].Write([]byte("Goodbye world"))
++
++	return
++}
+diff --git a/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/README.md b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/README.md
+new file mode 100644
+index 0000000..91c7cbf
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/README.md
+@@ -0,0 +1 @@
++Example of using socket activation with systemd to serve a simple HTTP server on http://127.0.0.1:8076
+diff --git a/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/hello.service b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/hello.service
+new file mode 100644
+index 0000000..c8dea0f
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/hello.service
+@@ -0,0 +1,11 @@
++[Unit]
++Description=Hello World HTTP
++Requires=network.target
++After=multi-user.target
++
++[Service]
++Type=simple
++ExecStart=/usr/local/bin/httpserver
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/hello.socket b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/hello.socket
+new file mode 100644
+index 0000000..723ed7e
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/hello.socket
+@@ -0,0 +1,5 @@
++[Socket]
++ListenStream=127.0.0.1:8076
++
++[Install]
++WantedBy=sockets.target
+diff --git a/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/httpserver.go b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/httpserver.go
+new file mode 100644
+index 0000000..d47bfe5
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/examples/activation/httpserver/httpserver.go
+@@ -0,0 +1,29 @@
++package main
++
++import (
++	"io"
++	"net"
++	"net/http"
++
++	"github.com/coreos/go-systemd/activation"
++)
++
++func HelloServer(w http.ResponseWriter, req *http.Request) {
++	io.WriteString(w, "hello socket activated world!\n")
++}
++
++func main() {
++	files := activation.Files()
++
++	if len(files) != 1 {
++		panic("Unexpected number of socket activation fds")
++	}
++
++	l, err := net.FileListener(files[0])
++	if err != nil {
++		panic(err)
++	}
++
++	http.HandleFunc("/", HelloServer)
++	http.Serve(l, nil)
++}
+diff --git a/third_party/github.com/coreos/go-systemd/test b/third_party/github.com/coreos/go-systemd/test
+new file mode 100755
+index 0000000..ce0d9a6
+--- /dev/null
++++ b/third_party/github.com/coreos/go-systemd/test
+@@ -0,0 +1,9 @@
++#!/bin/sh -e
++
++PKG="github.com/coreos/go-systemd"
++
++rm -R src
++mkdir -p src/$(dirname $PKG)
++ln -s ../../../ src/$PKG
++
++go test -v ${PKG}/activation

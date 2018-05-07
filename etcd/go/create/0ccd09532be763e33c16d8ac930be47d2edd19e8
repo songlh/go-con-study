@@ -1,0 +1,116 @@
+commit 0ccd09532be763e33c16d8ac930be47d2edd19e8
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Wed Jul 16 09:14:48 2014 -0700
+
+    etcd: add joinThroughFollower test
+
+diff --git a/etcd/etcd_functional_test.go b/etcd/etcd_functional_test.go
+index 1842040..6bdd798 100644
+--- a/etcd/etcd_functional_test.go
++++ b/etcd/etcd_functional_test.go
+@@ -2,8 +2,11 @@ package etcd
+ 
+ import (
+ 	"math/rand"
++	"net/http/httptest"
+ 	"testing"
+ 	"time"
++
++	"github.com/coreos/etcd/config"
+ )
+ 
+ func TestKillLeader(t *testing.T) {
+@@ -64,6 +67,38 @@ func TestRandomKill(t *testing.T) {
+ 	afterTest(t)
+ }
+ 
++func TestJoinThroughFollower(t *testing.T) {
++	tests := []int{3, 4, 5, 6}
++
++	for _, tt := range tests {
++		es := make([]*Server, tt)
++		hs := make([]*httptest.Server, tt)
++		for i := 0; i < tt; i++ {
++			c := config.New()
++			if i > 0 {
++				c.Peers = []string{hs[i-1].URL}
++			}
++			es[i], hs[i] = initTestServer(c, int64(i), false)
++		}
++
++		go es[0].Bootstrap()
++
++		for i := 1; i < tt; i++ {
++			go es[i].Run()
++			waitLeader(es[:i])
++		}
++		waitCluster(t, es)
++
++		for i := range hs {
++			es[len(hs)-i-1].Stop()
++		}
++		for i := range hs {
++			hs[len(hs)-i-1].Close()
++		}
++	}
++	afterTest(t)
++}
++
+ type leadterm struct {
+ 	lead int64
+ 	term int64
+@@ -98,6 +133,9 @@ func isSameLead(ls []leadterm) bool {
+ 		m[ls[i]] = m[ls[i]] + 1
+ 	}
+ 	if len(m) == 1 {
++		if ls[0].lead == -1 {
++			return false
++		}
+ 		return true
+ 	}
+ 	// todo(xiangli): printout the current cluster status for debugging....
+diff --git a/tests/functional/join_test.go b/tests/functional/join_test.go
+deleted file mode 100644
+index 3eaff71..0000000
+--- a/tests/functional/join_test.go
++++ /dev/null
+@@ -1,39 +0,0 @@
+-package test
+-
+-import (
+-	"os"
+-	"testing"
+-	"time"
+-)
+-
+-func TestJoinThroughFollower(t *testing.T) {
+-	procAttr := new(os.ProcAttr)
+-	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
+-
+-	_, etcds, err := CreateCluster(2, procAttr, false)
+-	if err != nil {
+-		t.Fatal("cannot create cluster")
+-	}
+-	defer DestroyCluster(etcds)
+-
+-	time.Sleep(time.Second)
+-
+-	newEtcd, err := os.StartProcess(EtcdBinPath, []string{"etcd", "-data-dir=/tmp/node3", "-name=node3", "-addr=127.0.0.1:4003", "-peer-addr=127.0.0.1:7003", "-peers=127.0.0.1:7002", "-f"}, procAttr)
+-	if err != nil {
+-		t.Fatal("failed starting node3")
+-	}
+-	defer func() {
+-		newEtcd.Kill()
+-		newEtcd.Release()
+-	}()
+-
+-	time.Sleep(time.Second)
+-
+-	leader, err := getLeader("http://127.0.0.1:4003")
+-	if err != nil {
+-		t.Fatal("failed getting leader from node3:", err)
+-	}
+-	if leader != "http://127.0.0.1:7001" {
+-		t.Fatal("expect=http://127.0.0.1:7001 got=", leader)
+-	}
+-}

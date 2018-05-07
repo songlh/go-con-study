@@ -1,0 +1,158 @@
+commit 588f655b4e7dbae5686d32a64895bf0b4137fbdd
+Author: Hitoshi Mitake <mitake.hitoshi@lab.ntt.co.jp>
+Date:   Thu Jan 7 16:15:27 2016 +0900
+
+    etcdmain: add an option for pprof
+    
+    This commit adds a new option for activating profiling based on pprof
+    in etcd process.
+     - -enable-pprof: boolean type option which activates profiling
+    
+    For example, if a client URL is http://localhost:12379, users and
+    developers access heap profiler with this URL:
+    http://localhost:12379/debug/pprof/heap
+
+diff --git a/Documentation/configuration.md b/Documentation/configuration.md
+index 5d5627e..44a4128 100644
+--- a/Documentation/configuration.md
++++ b/Documentation/configuration.md
+@@ -263,6 +263,12 @@ Follow the instructions when using these flags.
+ + Print the version and exit.
+ + default: false
+ 
++## Profiling flags
++
++### -enable-pprof
+++ Enable runtime profiling data via HTTP server. Address is at client URL + "/debug/pprof"
+++ default: false
++
+ [build-cluster]: clustering.md#static
+ [reconfig]: runtime-configuration.md
+ [discovery]: clustering.md#discovery
+diff --git a/etcdmain/config.go b/etcdmain/config.go
+index f2aaa94..d466f01 100644
+--- a/etcdmain/config.go
++++ b/etcdmain/config.go
+@@ -123,6 +123,8 @@ type config struct {
+ 	v3demo   bool
+ 	gRPCAddr string
+ 
++	enablePprof bool
++
+ 	ignored []string
+ }
+ 
+@@ -230,6 +232,9 @@ func NewConfig() *config {
+ 	fs.Var(&flags.DeprecatedFlag{Name: "peers"}, "peers", "DEPRECATED: Use -initial-cluster instead.")
+ 	fs.Var(&flags.DeprecatedFlag{Name: "peers-file"}, "peers-file", "DEPRECATED: Use -initial-cluster instead.")
+ 
++	// pprof profiler via HTTP
++	fs.BoolVar(&cfg.enablePprof, "enable-pprof", false, "Enable runtime profiling data via HTTP server. Address is at client URL + \"/debug/pprof\"")
++
+ 	// ignored
+ 	for _, f := range cfg.ignored {
+ 		fs.Var(&flags.IgnoredFlag{Name: f}, f, "")
+diff --git a/etcdmain/etcd.go b/etcdmain/etcd.go
+index cc61af5..7ebf4a3 100644
+--- a/etcdmain/etcd.go
++++ b/etcdmain/etcd.go
+@@ -20,6 +20,7 @@ import (
+ 	"io/ioutil"
+ 	"net"
+ 	"net/http"
++	_ "net/http/pprof"
+ 	"os"
+ 	"path"
+ 	"reflect"
+@@ -294,6 +295,7 @@ func startEtcd(cfg *config) (<-chan struct{}, error) {
+ 		ElectionTicks:       cfg.electionTicks(),
+ 		V3demo:              cfg.v3demo,
+ 		StrictReconfigCheck: cfg.strictReconfigCheck,
++		EnablePprof:         cfg.enablePprof,
+ 	}
+ 	var s *etcdserver.EtcdServer
+ 	s, err = etcdserver.NewServer(srvcfg)
+diff --git a/etcdmain/help.go b/etcdmain/help.go
+index fd23d59..1860df2 100644
+--- a/etcdmain/help.go
++++ b/etcdmain/help.go
+@@ -139,5 +139,9 @@ experimental flags:
+ 		enable experimental v3 demo API.
+ 	--experimental-gRPC-addr '127.0.0.1:2378'
+ 		gRPC address for experimental v3 demo API.
++
++profiling flags:
++	--enable-pprof 'false'
++		Enable runtime profiling data via HTTP server. Address is at client URL + "/debug/pprof"
+ `
+ )
+diff --git a/etcdserver/config.go b/etcdserver/config.go
+index 2afb7a8..16e8bb6 100644
+--- a/etcdserver/config.go
++++ b/etcdserver/config.go
+@@ -52,6 +52,8 @@ type ServerConfig struct {
+ 	V3demo bool
+ 
+ 	StrictReconfigCheck bool
++
++	EnablePprof bool
+ }
+ 
+ // VerifyBootstrapConfig sanity-checks the initial config for bootstrap case
+diff --git a/etcdserver/etcdhttp/client.go b/etcdserver/etcdhttp/client.go
+index fec6ca8..3910417 100644
+--- a/etcdserver/etcdhttp/client.go
++++ b/etcdserver/etcdhttp/client.go
+@@ -21,6 +21,7 @@ import (
+ 	"fmt"
+ 	"io/ioutil"
+ 	"net/http"
++	"net/http/pprof"
+ 	"net/url"
+ 	"path"
+ 	"strconv"
+@@ -54,6 +55,7 @@ const (
+ 	healthPath               = "/health"
+ 	versionPath              = "/version"
+ 	configPath               = "/config"
++	pprofPrefix              = "/debug/pprof"
+ )
+ 
+ // NewClientHandler generates a muxed http.Handler with the given parameters to serve etcd client requests.
+@@ -108,6 +110,23 @@ func NewClientHandler(server *etcdserver.EtcdServer, timeout time.Duration) http
+ 	mux.Handle(deprecatedMachinesPrefix, dmh)
+ 	handleAuth(mux, sech)
+ 
++	if server.IsPprofEnabled() {
++		plog.Infof("pprof is enabled under %s", pprofPrefix)
++
++		mux.HandleFunc(pprofPrefix, pprof.Index)
++		mux.HandleFunc(pprofPrefix+"/profile", pprof.Profile)
++		mux.HandleFunc(pprofPrefix+"/symbol", pprof.Symbol)
++		mux.HandleFunc(pprofPrefix+"/cmdline", pprof.Cmdline)
++		// TODO: currently, we don't create an entry for pprof.Trace,
++		// because go 1.4 doesn't provide it. After support of go 1.4 is dropped,
++		// we should add the entry.
++
++		mux.Handle(pprofPrefix+"/heap", pprof.Handler("heap"))
++		mux.Handle(pprofPrefix+"/goroutine", pprof.Handler("goroutine"))
++		mux.Handle(pprofPrefix+"/threadcreate", pprof.Handler("threadcreate"))
++		mux.Handle(pprofPrefix+"/block", pprof.Handler("block"))
++	}
++
+ 	return requestLogger(mux)
+ }
+ 
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index a79929a..3d9683b 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -844,6 +844,8 @@ func (s *EtcdServer) Lead() uint64 { return atomic.LoadUint64(&s.r.lead) }
+ 
+ func (s *EtcdServer) Leader() types.ID { return types.ID(s.Lead()) }
+ 
++func (s *EtcdServer) IsPprofEnabled() bool { return s.cfg.EnablePprof }
++
+ // configure sends a configuration change through consensus and
+ // then waits for it to be applied to the server. It
+ // will block until the change is performed or there is an error.

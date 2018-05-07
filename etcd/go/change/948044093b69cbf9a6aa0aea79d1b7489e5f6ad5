@@ -1,0 +1,149 @@
+commit 948044093b69cbf9a6aa0aea79d1b7489e5f6ad5
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Fri Sep 6 23:36:11 2013 -0400
+
+    support create directory
+
+diff --git a/file_system/file_system.go b/file_system/file_system.go
+index 3049d2f..eb19e2e 100644
+--- a/file_system/file_system.go
++++ b/file_system/file_system.go
+@@ -19,7 +19,7 @@ type FileSystem struct {
+ 
+ func New() *FileSystem {
+ 	return &FileSystem{
+-		Root:       newDir("/", 0, 0, nil, ""),
++		Root:       newDir("/", 0, 0, nil, "", Permanent),
+ 		WatcherHub: newWatchHub(1000),
+ 	}
+ 
+@@ -36,6 +36,7 @@ func (fs *FileSystem) Get(keyPath string, recusive bool, index uint64, term uint
+ 	e := newEvent(Get, keyPath, index, term)
+ 
+ 	if n.IsDir() { // node is dir
++		e.Dir = true
+ 
+ 		children, _ := n.List()
+ 		e.KVPairs = make([]KeyValuePair, len(children))
+@@ -57,7 +58,6 @@ func (fs *FileSystem) Get(keyPath string, recusive bool, index uint64, term uint
+ 
+ 		// eliminate hidden nodes
+ 		e.KVPairs = e.KVPairs[:i]
+-
+ 	} else { // node is file
+ 		e.Value = n.Value
+ 	}
+@@ -91,11 +91,22 @@ func (fs *FileSystem) Create(keyPath string, value string, expireTime time.Time,
+ 	}
+ 
+ 	e := newEvent(Set, keyPath, fs.Index, fs.Term)
+-	e.Value = value
+ 
+-	f := newFile(keyPath, value, fs.Index, fs.Term, d, "", expireTime)
++	var n *Node
++
++	if len(value) != 0 { // create file
++		e.Value = value
++
++		n = newFile(keyPath, value, fs.Index, fs.Term, d, "", expireTime)
++
++	} else { // create directory
++		e.Dir = true
++
++		n = newDir(keyPath, fs.Index, fs.Term, d, "", expireTime)
++
++	}
+ 
+-	err = d.Add(f)
++	err = d.Add(n)
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -103,8 +114,8 @@ func (fs *FileSystem) Create(keyPath string, value string, expireTime time.Time,
+ 
+ 	// Node with TTL
+ 	if expireTime != Permanent {
+-		go f.Expire()
+-		e.Expiration = &f.ExpireTime
++		go n.Expire()
++		e.Expiration = &n.ExpireTime
+ 		e.TTL = int64(expireTime.Sub(time.Now()) / time.Second)
+ 	}
+ 
+@@ -268,7 +279,7 @@ func (fs *FileSystem) checkDir(parent *Node, dirName string) (*Node, error) {
+ 		return subDir, nil
+ 	}
+ 
+-	n := newDir(path.Join(parent.Path, dirName), fs.Index, fs.Term, parent, parent.ACL)
++	n := newDir(path.Join(parent.Path, dirName), fs.Index, fs.Term, parent, parent.ACL, Permanent)
+ 
+ 	parent.Children[dirName] = n
+ 
+diff --git a/file_system/file_system_test.go b/file_system/file_system_test.go
+index 8649c8e..04f5ad9 100644
+--- a/file_system/file_system_test.go
++++ b/file_system/file_system_test.go
+@@ -21,12 +21,32 @@ func TestCreateAndGet(t *testing.T) {
+ 	}
+ 
+ 	// meet file, create should fail
+-	_, err = fs.Create("/foo/bar/bar", "bar", Permanent, 1, 1)
++	_, err = fs.Create("/foo/bar/bar", "bar", Permanent, 2, 1)
+ 
+ 	if err == nil {
+ 		t.Fatal("Create should fail")
+ 	}
+ 
++	// create a directory
++	_, err = fs.Create("/fooDir", "", Permanent, 3, 1)
++
++	if err != nil {
++		t.Fatal("Cannot create /fooDir")
++	}
++
++	e, err := fs.Get("/fooDir", false, 3, 1)
++
++	if err != nil || e.Dir != true {
++		t.Fatal("Cannot create /fooDir ")
++	}
++
++	// create a file under directory
++	_, err = fs.Create("/fooDir/bar", "bar", Permanent, 4, 1)
++
++	if err != nil {
++		t.Fatal("Cannot create /fooDir/bar = bar")
++	}
++
+ }
+ 
+ func TestUpdateFile(t *testing.T) {
+diff --git a/file_system/node.go b/file_system/node.go
+index 8c67657..4d933f5 100644
+--- a/file_system/node.go
++++ b/file_system/node.go
+@@ -49,7 +49,7 @@ func newFile(keyPath string, value string, createIndex uint64, createTerm uint64
+ 	}
+ }
+ 
+-func newDir(keyPath string, createIndex uint64, createTerm uint64, parent *Node, ACL string) *Node {
++func newDir(keyPath string, createIndex uint64, createTerm uint64, parent *Node, ACL string, expireTime time.Time) *Node {
+ 	return &Node{
+ 		Path:        keyPath,
+ 		CreateIndex: createIndex,
+@@ -57,6 +57,7 @@ func newDir(keyPath string, createIndex uint64, createTerm uint64, parent *Node,
+ 		Parent:      parent,
+ 		ACL:         ACL,
+ 		stopExpire:  make(chan bool, 1),
++		ExpireTime:  expireTime,
+ 		Children:    make(map[string]*Node),
+ 	}
+ }
+@@ -210,7 +211,7 @@ func (n *Node) Clone() *Node {
+ 		return newFile(n.Path, n.Value, n.CreateIndex, n.CreateTerm, n.Parent, n.ACL, n.ExpireTime)
+ 	}
+ 
+-	clone := newDir(n.Path, n.CreateIndex, n.CreateTerm, n.Parent, n.ACL)
++	clone := newDir(n.Path, n.CreateIndex, n.CreateTerm, n.Parent, n.ACL, n.ExpireTime)
+ 
+ 	for key, child := range n.Children {
+ 		clone.Children[key] = child.Clone()

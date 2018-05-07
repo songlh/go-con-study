@@ -1,0 +1,199 @@
+commit 7a7e1f7a7c6c429d3805e56aab978c2be1b63db8
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Fri Apr 3 14:26:15 2015 -0700
+
+    etcdserver: metrics and monitor number of file descriptor
+    
+    It exposes the metrics of file descriptor limit and file descriptor used.
+    Moreover, it prints out warning when more than 80% of fd limit has been used.
+    
+    ```
+    2015/04/08 01:26:19 etcdserver: 80% of the file descriptor limit is open
+    [open = 969, limit = 1024]
+    ```
+
+diff --git a/etcdserver/metrics.go b/etcdserver/metrics.go
+index 7077eca..acae437 100644
+--- a/etcdserver/metrics.go
++++ b/etcdserver/metrics.go
+@@ -14,7 +14,13 @@
+ 
+ package etcdserver
+ 
+-import "github.com/coreos/etcd/Godeps/_workspace/src/github.com/prometheus/client_golang/prometheus"
++import (
++	"log"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/prometheus/client_golang/prometheus"
++	"github.com/coreos/etcd/pkg/runtime"
++)
+ 
+ var (
+ 	// TODO: with label in v3?
+@@ -32,10 +38,42 @@ var (
+ 		Name: "etcdserver_proposal_failed_total",
+ 		Help: "The total number of failed proposals.",
+ 	})
++
++	fileDescriptorUsed = prometheus.NewGauge(prometheus.GaugeOpts{
++		Name: "file_descriptors_used",
++		Help: "The number of file descriptors used",
++	})
+ )
+ 
+ func init() {
+ 	prometheus.MustRegister(proposeDurations)
+ 	prometheus.MustRegister(proposePending)
+ 	prometheus.MustRegister(proposeFailed)
++	prometheus.MustRegister(fileDescriptorUsed)
++}
++
++func monitorFileDescriptor(done <-chan struct{}) {
++	ticker := time.NewTicker(5 * time.Second)
++	defer ticker.Stop()
++	for {
++		used, err := runtime.FDUsage()
++		if err != nil {
++			log.Printf("etcdserver: cannot monitor file descriptor usage (%v)", err)
++			return
++		}
++		fileDescriptorUsed.Set(float64(used))
++		limit, err := runtime.FDLimit()
++		if err != nil {
++			log.Printf("etcdserver: cannot monitor file descriptor usage (%v)", err)
++			return
++		}
++		if used >= limit/5*4 {
++			log.Printf("etcdserver: 80%% of the file descriptor limit is used [used = %d, limit = %d]", used, limit)
++		}
++		select {
++		case <-ticker.C:
++		case <-done:
++			return
++		}
++	}
+ }
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 60ff6c8..0556a13 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -16,6 +16,7 @@ package etcdserver
+ 
+ import (
+ 	"encoding/json"
++	"expvar"
+ 	"fmt"
+ 	"log"
+ 	"math/rand"
+@@ -33,6 +34,7 @@ import (
+ 	"github.com/coreos/etcd/pkg/fileutil"
+ 	"github.com/coreos/etcd/pkg/idutil"
+ 	"github.com/coreos/etcd/pkg/pbutil"
++	"github.com/coreos/etcd/pkg/runtime"
+ 	"github.com/coreos/etcd/pkg/timeutil"
+ 	"github.com/coreos/etcd/pkg/types"
+ 	"github.com/coreos/etcd/pkg/wait"
+@@ -69,6 +71,16 @@ var (
+ 
+ func init() {
+ 	rand.Seed(time.Now().UnixNano())
++
++	expvar.Publish(
++		"file_descriptor_limit",
++		expvar.Func(
++			func() interface{} {
++				n, _ := runtime.FDLimit()
++				return n
++			},
++		),
++	)
+ }
+ 
+ type Response struct {
+@@ -271,6 +283,7 @@ func (s *EtcdServer) Start() {
+ 	s.start()
+ 	go s.publish(defaultPublishRetryInterval)
+ 	go s.purgeFile()
++	go monitorFileDescriptor(s.done)
+ }
+ 
+ // start prepares and starts server in a new goroutine. It is no longer safe to
+diff --git a/pkg/runtime/fds_linux.go b/pkg/runtime/fds_linux.go
+new file mode 100644
+index 0000000..85297c0
+--- /dev/null
++++ b/pkg/runtime/fds_linux.go
+@@ -0,0 +1,36 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package runtime
++
++import (
++	"io/ioutil"
++	"syscall"
++)
++
++func FDLimit() (uint64, error) {
++	var rlimit syscall.Rlimit
++	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
++		return 0, err
++	}
++	return rlimit.Cur, nil
++}
++
++func FDUsage() (uint64, error) {
++	fds, err := ioutil.ReadDir("/proc/self/fd")
++	if err != nil {
++		return 0, err
++	}
++	return uint64(len(fds)), nil
++}
+diff --git a/pkg/runtime/fds_other.go b/pkg/runtime/fds_other.go
+new file mode 100644
+index 0000000..0ed152f
+--- /dev/null
++++ b/pkg/runtime/fds_other.go
+@@ -0,0 +1,30 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build !linux
++
++package runtime
++
++import (
++	"fmt"
++	"runtime"
++)
++
++func FDLimit() (uint64, error) {
++	return 0, fmt.Errorf("cannot get FDLimit on %s", runtime.GOOS)
++}
++
++func FDUsage() (uint64, error) {
++	return 0, fmt.Errorf("cannot get FDUsage on %s", runtime.GOOS)
++}

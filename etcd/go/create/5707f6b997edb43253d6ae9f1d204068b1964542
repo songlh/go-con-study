@@ -1,0 +1,174 @@
+commit 5707f6b997edb43253d6ae9f1d204068b1964542
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Wed Mar 30 10:22:58 2016 -0700
+
+    pkg/expect: add expect package
+
+diff --git a/pkg/expect/expect.go b/pkg/expect/expect.go
+new file mode 100644
+index 0000000..03e6810
+--- /dev/null
++++ b/pkg/expect/expect.go
+@@ -0,0 +1,114 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package expect implements a small expect-style interface
++package expect
++
++import (
++	"bufio"
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++
++	"github.com/kr/pty"
++)
++
++type ExpectProcess struct {
++	cmd  *exec.Cmd
++	fpty *os.File
++	wg   sync.WaitGroup
++
++	ptyMu sync.Mutex // protects accessing fpty
++	cond  *sync.Cond // for broadcasting updates are avaiable
++	mu    sync.Mutex // protects lines and err
++	lines []string
++	err   error
++}
++
++// NewExpect creates a new process for expect testing.
++func NewExpect(name string, arg ...string) (ep *ExpectProcess, err error) {
++	ep = &ExpectProcess{cmd: exec.Command(name, arg...)}
++	ep.cond = sync.NewCond(&ep.mu)
++	ep.cmd.Stderr = ep.cmd.Stdout
++	ep.cmd.Stdin = nil
++
++	if ep.fpty, err = pty.Start(ep.cmd); err != nil {
++		return nil, err
++	}
++
++	ep.wg.Add(1)
++	go ep.read()
++	return ep, nil
++}
++
++func (ep *ExpectProcess) read() {
++	defer ep.wg.Done()
++	r := bufio.NewReader(ep.fpty)
++	for ep.err == nil {
++		ep.ptyMu.Lock()
++		l, rerr := r.ReadString('\n')
++		ep.ptyMu.Unlock()
++		ep.mu.Lock()
++		ep.err = rerr
++		if l != "" {
++			ep.lines = append(ep.lines, l)
++			if len(ep.lines) == 1 {
++				ep.cond.Signal()
++			}
++		}
++		ep.mu.Unlock()
++	}
++	ep.cond.Signal()
++}
++
++// Expect returns the first line containing the given string.
++func (ep *ExpectProcess) Expect(s string) (string, error) {
++	ep.mu.Lock()
++	for {
++		for len(ep.lines) == 0 && ep.err == nil {
++			ep.cond.Wait()
++		}
++		if len(ep.lines) == 0 {
++			break
++		}
++		l := ep.lines[0]
++		ep.lines = ep.lines[1:]
++		if strings.Contains(l, s) {
++			ep.mu.Unlock()
++			return l, nil
++		}
++	}
++	ep.mu.Unlock()
++	return "", ep.err
++}
++
++// Close waits for the expect process to close
++func (ep *ExpectProcess) Close() error {
++	if ep.cmd == nil {
++		return nil
++	}
++	ep.cmd.Process.Kill()
++	ep.ptyMu.Lock()
++	ep.fpty.Close()
++	ep.ptyMu.Unlock()
++	err := ep.cmd.Wait()
++	ep.wg.Wait()
++	if err != nil && strings.Contains(err.Error(), "signal:") {
++		// ignore signal errors; expected from pty
++		err = nil
++	}
++	ep.cmd = nil
++	return err
++}
+diff --git a/pkg/expect/expect_test.go b/pkg/expect/expect_test.go
+new file mode 100644
+index 0000000..6ad479f
+--- /dev/null
++++ b/pkg/expect/expect_test.go
+@@ -0,0 +1,42 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// build !windows
++
++package expect
++
++import (
++	"testing"
++)
++
++func TestEcho(t *testing.T) {
++	ep, err := NewExpect("/bin/echo", "hello world")
++	if err != nil {
++		t.Fatal(err)
++	}
++	l, eerr := ep.Expect("world")
++	if eerr != nil {
++		t.Fatal(eerr)
++	}
++	wstr := "hello world"
++	if l[:len(wstr)] != wstr {
++		t.Fatalf(`got "%v", expected "%v"`, l, wstr)
++	}
++	if cerr := ep.Close(); cerr != nil {
++		t.Fatal(cerr)
++	}
++	if _, eerr = ep.Expect("..."); eerr == nil {
++		t.Fatalf("expected error on closed expect process")
++	}
++}

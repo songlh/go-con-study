@@ -1,0 +1,62 @@
+commit d5766eab3e7f86d1275cf61f7dc59da205fdfd5b
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Fri Apr 8 00:54:05 2016 -0700
+
+    clientv3: add Snapshot to Maintenance
+
+diff --git a/clientv3/maintenance.go b/clientv3/maintenance.go
+index f200cc3..75c0df7 100644
+--- a/clientv3/maintenance.go
++++ b/clientv3/maintenance.go
+@@ -15,6 +15,7 @@
+ package clientv3
+ 
+ import (
++	"io"
+ 	"sync"
+ 
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+@@ -47,6 +48,9 @@ type Maintenance interface {
+ 
+ 	// Status gets the status of the member.
+ 	Status(ctx context.Context, endpoint string) (*StatusResponse, error)
++
++	// Snapshot provides a reader for a snapshot of a backend.
++	Snapshot(ctx context.Context) (io.ReadCloser, error)
+ }
+ 
+ type maintenance struct {
+@@ -145,6 +149,33 @@ func (m *maintenance) Status(ctx context.Context, endpoint string) (*StatusRespo
+ 	return (*StatusResponse)(resp), nil
+ }
+ 
++func (m *maintenance) Snapshot(ctx context.Context) (io.ReadCloser, error) {
++	ss, err := m.getRemote().Snapshot(ctx, &pb.SnapshotRequest{})
++	if err != nil {
++		return nil, err
++	}
++
++	pr, pw := io.Pipe()
++	go func() {
++		for {
++			resp, err := ss.Recv()
++			if err != nil {
++				pw.CloseWithError(err)
++				return
++			}
++			if resp == nil && err == nil {
++				break
++			}
++			if _, werr := pw.Write(resp.Blob); werr != nil {
++				pw.CloseWithError(werr)
++				return
++			}
++		}
++		pw.Close()
++	}()
++	return pr, nil
++}
++
+ func (m *maintenance) getRemote() pb.MaintenanceClient {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()

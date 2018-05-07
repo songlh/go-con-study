@@ -1,0 +1,1576 @@
+commit cf656ccfdd63b328cd286f79b0901a20ca0059fe
+Author: Ben Johnson <benbjohnson@yahoo.com>
+Date:   Thu Jan 2 16:41:25 2014 -0700
+
+    bump(github.com/BurntSushi/toml): 2fffd0e6ca4b88558be4bcab497231c95270cd07
+
+diff --git a/third_party/github.com/BurntSushi/toml/README.md b/third_party/github.com/BurntSushi/toml/README.md
+index f8c847d..49f43f3 100644
+--- a/third_party/github.com/BurntSushi/toml/README.md
++++ b/third_party/github.com/BurntSushi/toml/README.md
+@@ -1,6 +1,10 @@
+-# TOML parser for Go with reflection
++# TOML parser and encoder for Go with reflection
+ 
+-TOML stands for Tom's Obvious, Minimal Language.
++TOML stands for Tom's Obvious, Minimal Language. This Go package provides a
++reflection interface similar to Go's standard library `json` and `xml` 
++packages. This package also supports the `encoding.TextUnmarshaler` and
++`encoding.TextMarshaler` interfaces so that you can define custom data 
++representations. (There is an example of this below.)
+ 
+ Spec: https://github.com/mojombo/toml
+ 
+@@ -26,7 +30,8 @@ tomlv some-toml-file.toml
+ ## Testing
+ 
+ This package passes all tests in
+-[toml-test](https://github.com/BurntSushi/toml-test).
++[toml-test](https://github.com/BurntSushi/toml-test) for both the decoder
++and the encoder.
+ 
+ ## Examples
+ 
+@@ -78,6 +83,56 @@ type TOML struct {
+ }
+ ```
+ 
++## Using the `encoding.TextUnmarshaler` interface
++
++Here's an example that automatically parses duration strings into 
++`time.Duration` values:
++
++```toml
++[[song]]
++name = "Thunder Road"
++duration = "4m49s"
++
++[[song]]
++name = "Stairway to Heaven"
++duration = "8m03s"
++```
++
++Which can be decoded with:
++
++```go
++type song struct {
++  Name     string
++  Duration duration
++}
++type songs struct {
++  Song []song
++}
++var favorites songs
++if _, err := Decode(blob, &favorites); err != nil {
++  log.Fatal(err)
++}
++
++for _, s := range favorites.Song {
++  fmt.Printf("%s (%s)\n", s.Name, s.Duration)
++}
++```
++
++And you'll also need a `duration` type that satisfies the 
++`encoding.TextUnmarshaler` interface:
++
++```go
++type duration struct {
++	time.Duration
++}
++
++func (d *duration) UnmarshalText(text []byte) error {
++	var err error
++	d.Duration, err = time.ParseDuration(string(text))
++	return err
++}
++```
++
+ ## More complex usage
+ 
+ Here's an example of how to load the example from the official spec page:
+diff --git a/third_party/github.com/BurntSushi/toml/decode.go b/third_party/github.com/BurntSushi/toml/decode.go
+index 2597e0d..a106f36 100644
+--- a/third_party/github.com/BurntSushi/toml/decode.go
++++ b/third_party/github.com/BurntSushi/toml/decode.go
+@@ -1,6 +1,7 @@
+ package toml
+ 
+ import (
++	"encoding"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+@@ -43,11 +44,62 @@ func PrimitiveDecode(primValue Primitive, v interface{}) error {
+ // TOML hashes correspond to Go structs or maps. (Dealer's choice. They can be
+ // used interchangeably.)
+ //
++// TOML arrays of tables correspond to either a slice of structs or a slice
++// of maps.
++//
+ // TOML datetimes correspond to Go `time.Time` values.
+ //
+ // All other TOML types (float, string, int, bool and array) correspond
+ // to the obvious Go types.
+ //
++// An exception to the above rules is if a type implements the
++// encoding.TextUnmarshaler interface. In this case, any primitive TOML value
++// (floats, strings, integers, booleans and datetimes) will be converted to
++// a byte string and given to the value's UnmarshalText method. Here's an
++// example for parsing durations:
++//
++//	type duration struct {
++//		time.Duration
++//	}
++//
++//	func (d *duration) UnmarshalText(text []byte) error {
++//		var err error
++//		d.Duration, err = time.ParseDuration(string(text))
++//		return err
++//	}
++//
++//	func ExampleUnmarshaler() {
++//		blob := `
++//	[[song]]
++//	name = "Thunder Road"
++//	duration = "4m49s"
++//
++//	[[song]]
++//	name = "Stairway to Heaven"
++//	duration = "8m03s"
++//	`
++//		type song struct {
++//			Name     string
++//			Duration duration
++//		}
++//		type songs struct {
++//			Song []song
++//		}
++//		var favorites songs
++//		if _, err := Decode(blob, &favorites); err != nil {
++//			log.Fatal(err)
++//		}
++//
++//		for _, s := range favorites.Song {
++//			fmt.Printf("%s (%s)\n", s.Name, s.Duration)
++//		}
++//		// Output:
++//		// Thunder Road (4m49s)
++//		// Stairway to Heaven (8m3s)
++//	}
++//
++// Key mapping
++//
+ // TOML keys can map to either keys in a Go map or field names in a Go
+ // struct. The special `toml` struct tag may be used to map TOML keys to
+ // struct fields that don't match the key name exactly. (See the example.)
+@@ -100,11 +152,17 @@ func unify(data interface{}, rv reflect.Value) error {
+ 		return unifyAnything(data, rv)
+ 	}
+ 
+-	// Special case. Go's `time.Time` is a struct, which we don't want
+-	// to confuse with a user struct.
+-	if rv.Type().AssignableTo(rvalue(time.Time{}).Type()) {
+-		return unifyDatetime(data, rv)
++	// Special case. Look for a value satisfying the TextUnmarshaler interface.
++	if v, ok := rv.Interface().(encoding.TextUnmarshaler); ok {
++		return unifyText(data, v)
+ 	}
++	// BUG(burntsushi)
++	// The behavior here is incorrect whenever a Go type satisfies the
++	// encoding.TextUnmarshaler interface but also corresponds to a TOML
++	// hash or array. In particular, the unmarshaler should only be applied
++	// to primitive TOML values. But at this point, it will be applied to
++	// all kinds of values and produce an incorrect error whenever those values
++	// are hashes or arrays (including arrays of tables).
+ 
+ 	k := rv.Kind()
+ 
+@@ -177,7 +235,7 @@ func unifyStruct(mapping interface{}, rv reflect.Value) error {
+ 			}
+ 			sf := indirect(subv)
+ 
+-			if sf.CanSet() {
++			if isUnifiable(sf) {
+ 				if err := unify(datum, sf); err != nil {
+ 					return e("Type mismatch for '%s.%s': %s",
+ 						rv.Type().String(), f.name, err)
+@@ -299,7 +357,7 @@ func unifyBool(data interface{}, rv reflect.Value) error {
+ 		rv.SetBool(b)
+ 		return nil
+ 	}
+-	return badtype("integer", data)
++	return badtype("boolean", data)
+ }
+ 
+ func unifyAnything(data interface{}, rv reflect.Value) error {
+@@ -308,6 +366,34 @@ func unifyAnything(data interface{}, rv reflect.Value) error {
+ 	return nil
+ }
+ 
++func unifyText(data interface{}, v encoding.TextUnmarshaler) error {
++	var s string
++	switch sdata := data.(type) {
++	case encoding.TextMarshaler:
++		text, err := sdata.MarshalText()
++		if err != nil {
++			return err
++		}
++		s = string(text)
++	case fmt.Stringer:
++		s = sdata.String()
++	case string:
++		s = sdata
++	case bool:
++		s = fmt.Sprintf("%v", sdata)
++	case int64:
++		s = fmt.Sprintf("%d", sdata)
++	case float64:
++		s = fmt.Sprintf("%f", sdata)
++	default:
++		return badtype("primitive (string-like)", data)
++	}
++	if err := v.UnmarshalText([]byte(s)); err != nil {
++		return err
++	}
++	return nil
++}
++
+ // rvalue returns a reflect.Value of `v`. All pointers are resolved.
+ func rvalue(v interface{}) reflect.Value {
+ 	return indirect(reflect.ValueOf(v))
+@@ -316,8 +402,17 @@ func rvalue(v interface{}) reflect.Value {
+ // indirect returns the value pointed to by a pointer.
+ // Pointers are followed until the value is not a pointer.
+ // New values are allocated for each nil pointer.
++//
++// An exception to this rule is if the value satisfies an interface of
++// interest to us (like encoding.TextUnmarshaler).
+ func indirect(v reflect.Value) reflect.Value {
+ 	if v.Kind() != reflect.Ptr {
++		if v.CanAddr() {
++			pv := v.Addr()
++			if _, ok := pv.Interface().(encoding.TextUnmarshaler); ok {
++				return pv
++			}
++		}
+ 		return v
+ 	}
+ 	if v.IsNil() {
+@@ -326,6 +421,16 @@ func indirect(v reflect.Value) reflect.Value {
+ 	return indirect(reflect.Indirect(v))
+ }
+ 
++func isUnifiable(rv reflect.Value) bool {
++	if rv.CanSet() {
++		return true
++	}
++	if _, ok := rv.Interface().(encoding.TextUnmarshaler); ok {
++		return true
++	}
++	return false
++}
++
+ func tstring(rv reflect.Value) string {
+ 	return rv.Type().String()
+ }
+@@ -356,8 +461,6 @@ func insensitiveGet(
+ // MetaData allows access to meta information about TOML data that may not
+ // be inferrable via reflection. In particular, whether a key has been defined
+ // and the TOML type of a key.
+-//
+-// (XXX: If TOML gets NULL values, that information will be added here too.)
+ type MetaData struct {
+ 	mapping map[string]interface{}
+ 	types   map[string]tomlType
+diff --git a/third_party/github.com/BurntSushi/toml/decode_test.go b/third_party/github.com/BurntSushi/toml/decode_test.go
+index 853d7b0..c9cb64e 100644
+--- a/third_party/github.com/BurntSushi/toml/decode_test.go
++++ b/third_party/github.com/BurntSushi/toml/decode_test.go
+@@ -379,9 +379,50 @@ ip = "10.0.0.2"
+ 		fmt.Printf("Ports: %v\n", s.Config.Ports)
+ 	}
+ 
+-	// // Output:
++	// Output:
+ 	// Server: alpha (ip: 10.0.0.1) in Toronto created on 1987-07-05
+ 	// Ports: [8001 8002]
+ 	// Server: beta (ip: 10.0.0.2) in New Jersey created on 1887-01-05
+ 	// Ports: [9001 9002]
+ }
++
++type duration struct {
++	time.Duration
++}
++
++func (d *duration) UnmarshalText(text []byte) error {
++	var err error
++	d.Duration, err = time.ParseDuration(string(text))
++	return err
++}
++
++// Example Unmarshaler blah blah.
++func ExampleUnmarshaler() {
++	blob := `
++[[song]]
++name = "Thunder Road"
++duration = "4m49s"
++
++[[song]]
++name = "Stairway to Heaven"
++duration = "8m03s"
++`
++	type song struct {
++		Name     string
++		Duration duration
++	}
++	type songs struct {
++		Song []song
++	}
++	var favorites songs
++	if _, err := Decode(blob, &favorites); err != nil {
++		log.Fatal(err)
++	}
++
++	for _, s := range favorites.Song {
++		fmt.Printf("%s (%s)\n", s.Name, s.Duration)
++	}
++	// Output:
++	// Thunder Road (4m49s)
++	// Stairway to Heaven (8m3s)
++}
+diff --git a/third_party/github.com/BurntSushi/toml/encode.go b/third_party/github.com/BurntSushi/toml/encode.go
+index 7b080f4..b3d7487 100644
+--- a/third_party/github.com/BurntSushi/toml/encode.go
++++ b/third_party/github.com/BurntSushi/toml/encode.go
+@@ -15,27 +15,41 @@ package toml
+ 
+ import (
+ 	"bufio"
++	"encoding"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"reflect"
++	"sort"
++	"strconv"
+ 	"strings"
+ )
+ 
+-type encoder struct {
++var (
++	ErrArrayMixedElementTypes = errors.New(
++		"can't encode array with mixed element types")
++	ErrArrayNilElement = errors.New(
++		"can't encode array with nil element")
++)
++
++type Encoder struct {
+ 	// A single indentation level. By default it is two spaces.
+ 	Indent string
+ 
+ 	w *bufio.Writer
++
++	// hasWritten is whether we have written any output to w yet.
++	hasWritten bool
+ }
+ 
+-func newEncoder(w io.Writer) *encoder {
+-	return &encoder{
++func NewEncoder(w io.Writer) *Encoder {
++	return &Encoder{
+ 		w:      bufio.NewWriter(w),
+ 		Indent: "  ",
+ 	}
+ }
+ 
+-func (enc *encoder) Encode(v interface{}) error {
++func (enc *Encoder) Encode(v interface{}) error {
+ 	rv := eindirect(reflect.ValueOf(v))
+ 	if err := enc.encode(Key([]string{}), rv); err != nil {
+ 		return err
+@@ -43,49 +57,466 @@ func (enc *encoder) Encode(v interface{}) error {
+ 	return enc.w.Flush()
+ }
+ 
+-func (enc *encoder) encode(key Key, rv reflect.Value) error {
++func (enc *Encoder) encode(key Key, rv reflect.Value) error {
++	// Special case. If we can marshal the type to text, then we used that.
++	if _, ok := rv.Interface().(encoding.TextMarshaler); ok {
++		err := enc.eKeyEq(key)
++		if err != nil {
++			return err
++		}
++		return enc.eElement(rv)
++	}
++
+ 	k := rv.Kind()
+ 	switch k {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
++		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32,
++		reflect.Uint64,
++		reflect.Float32, reflect.Float64,
++		reflect.String, reflect.Bool:
++		err := enc.eKeyEq(key)
++		if err != nil {
++			return err
++		}
++		return enc.eElement(rv)
++	case reflect.Array, reflect.Slice:
++		return enc.eArrayOrSlice(key, rv)
++	case reflect.Interface:
++		if rv.IsNil() {
++			return nil
++		}
++		return enc.encode(key, rv.Elem())
++	case reflect.Map:
++		if rv.IsNil() {
++			return nil
++		}
++		return enc.eTable(key, rv)
++	case reflect.Ptr:
++		if rv.IsNil() {
++			return nil
++		}
++		return enc.encode(key, rv.Elem())
+ 	case reflect.Struct:
+-		return enc.eStruct(key, rv)
+-	case reflect.String:
+-		return enc.eString(key, rv)
++		return enc.eTable(key, rv)
+ 	}
+ 	return e("Unsupported type for key '%s': %s", key, k)
+ }
+ 
+-func (enc *encoder) eStruct(key Key, rv reflect.Value) error {
+-	rt := rv.Type()
+-	for i := 0; i < rt.NumField(); i++ {
+-		sft := rt.Field(i)
+-		sf := rv.Field(i)
+-		if err := enc.encode(key.add(sft.Name), sf); err != nil {
++// eElement encodes any value that can be an array element (primitives and
++// arrays).
++func (enc *Encoder) eElement(rv reflect.Value) error {
++	ws := func(s string) error {
++		_, err := io.WriteString(enc.w, s)
++		return err
++	}
++	// By the TOML spec, all floats must have a decimal with at least one
++	// number on either side.
++	floatAddDecimal := func(fstr string) string {
++		if !strings.Contains(fstr, ".") {
++			return fstr + ".0"
++		}
++		return fstr
++	}
++
++	// Special case. Use text marshaler if it's available for this value.
++	if v, ok := rv.Interface().(encoding.TextMarshaler); ok {
++		s, err := v.MarshalText()
++		if err != nil {
++			return err
++		}
++		return ws(string(s))
++	}
++
++	var err error
++	k := rv.Kind()
++	switch k {
++	case reflect.Bool:
++		err = ws(strconv.FormatBool(rv.Bool()))
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		err = ws(strconv.FormatInt(rv.Int(), 10))
++	case reflect.Uint, reflect.Uint8, reflect.Uint16,
++		reflect.Uint32, reflect.Uint64:
++		err = ws(strconv.FormatUint(rv.Uint(), 10))
++	case reflect.Float32:
++		err = ws(floatAddDecimal(strconv.FormatFloat(rv.Float(), 'f', -1, 32)))
++	case reflect.Float64:
++		err = ws(floatAddDecimal(strconv.FormatFloat(rv.Float(), 'f', -1, 64)))
++	case reflect.Array, reflect.Slice:
++		return enc.eArrayOrSliceElement(rv)
++	case reflect.Interface:
++		return enc.eElement(rv.Elem())
++	case reflect.String:
++		s := rv.String()
++		s = strings.NewReplacer(
++			"\t", "\\t",
++			"\n", "\\n",
++			"\r", "\\r",
++			"\"", "\\\"",
++			"\\", "\\\\",
++		).Replace(s)
++		err = ws("\"" + s + "\"")
++	default:
++		return e("Unexpected primitive type: %s", k)
++	}
++	return err
++}
++
++func (enc *Encoder) eArrayOrSlice(key Key, rv reflect.Value) error {
++	// Determine whether this is an array of tables or of primitives.
++	elemV := reflect.ValueOf(nil)
++	if rv.Len() > 0 {
++		elemV = rv.Index(0)
++	}
++	isTableType, err := isTOMLTableType(rv.Type().Elem(), elemV)
++	if err != nil {
++		return err
++	}
++
++	if len(key) > 0 && isTableType {
++		return enc.eArrayOfTables(key, rv)
++	}
++
++	err = enc.eKeyEq(key)
++	if err != nil {
++		return err
++	}
++	return enc.eArrayOrSliceElement(rv)
++}
++
++func (enc *Encoder) eArrayOrSliceElement(rv reflect.Value) error {
++	if _, err := enc.w.Write([]byte{'['}); err != nil {
++		return err
++	}
++
++	length := rv.Len()
++	if length > 0 {
++		arrayElemType, isNil := tomlTypeName(rv.Index(0))
++		if isNil {
++			return ErrArrayNilElement
++		}
++
++		for i := 0; i < length; i++ {
++			elem := rv.Index(i)
++
++			// Ensure that the array's elements each have the same TOML type.
++			elemType, isNil := tomlTypeName(elem)
++			if isNil {
++				return ErrArrayNilElement
++			}
++			if elemType != arrayElemType {
++				return ErrArrayMixedElementTypes
++			}
++
++			if err := enc.eElement(elem); err != nil {
++				return err
++			}
++			if i != length-1 {
++				if _, err := enc.w.Write([]byte(", ")); err != nil {
++					return err
++				}
++			}
++		}
++	}
++
++	if _, err := enc.w.Write([]byte{']'}); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (enc *Encoder) eArrayOfTables(key Key, rv reflect.Value) error {
++	if enc.hasWritten {
++		_, err := enc.w.Write([]byte{'\n'})
++		if err != nil {
+ 			return err
+ 		}
+ 	}
++
++	for i := 0; i < rv.Len(); i++ {
++		trv := rv.Index(i)
++		if isNil(trv) {
++			continue
++		}
++
++		_, err := fmt.Fprintf(enc.w, "%s[[%s]]\n",
++			strings.Repeat(enc.Indent, len(key)-1), key.String())
++		if err != nil {
++			return err
++		}
++
++		err = enc.eMapOrStruct(key, trv)
++		if err != nil {
++			return err
++		}
++
++		if i != rv.Len()-1 {
++			if _, err := enc.w.Write([]byte("\n\n")); err != nil {
++				return err
++			}
++		}
++		enc.hasWritten = true
++	}
+ 	return nil
+ }
+ 
+-func (enc *encoder) eString(key Key, rv reflect.Value) error {
+-	s := rv.String()
+-	s = strings.NewReplacer(
+-		"\t", "\\t",
+-		"\n", "\\n",
+-		"\r", "\\r",
+-		"\"", "\\\"",
+-		"\\", "\\\\",
+-	).Replace(s)
+-	s = "\"" + s + "\""
+-	if err := enc.eKeyVal(key, s); err != nil {
++func isStructOrMap(rv reflect.Value) bool {
++	switch rv.Kind() {
++	case reflect.Interface, reflect.Ptr:
++		return isStructOrMap(rv.Elem())
++	case reflect.Map, reflect.Struct:
++		return true
++	default:
++		return false
++	}
++}
++
++func (enc *Encoder) eTable(key Key, rv reflect.Value) error {
++	if enc.hasWritten {
++		_, err := enc.w.Write([]byte{'\n'})
++		if err != nil {
++			return err
++		}
++	}
++	if len(key) > 0 {
++		_, err := fmt.Fprintf(enc.w, "%s[%s]\n",
++			strings.Repeat(enc.Indent, len(key)-1), key.String())
++		if err != nil {
++			return err
++		}
++	}
++	return enc.eMapOrStruct(key, rv)
++}
++
++func (enc *Encoder) eMapOrStruct(key Key, rv reflect.Value) error {
++	switch rv.Kind() {
++	case reflect.Map:
++		return enc.eMap(key, rv)
++	case reflect.Struct:
++		return enc.eStruct(key, rv)
++	case reflect.Ptr, reflect.Interface:
++		return enc.eMapOrStruct(key, rv.Elem())
++	default:
++		panic("eTable: unhandled reflect.Value Kind: " + rv.Kind().String())
++	}
++}
++
++func (enc *Encoder) eMap(key Key, rv reflect.Value) error {
++	rt := rv.Type()
++	if rt.Key().Kind() != reflect.String {
++		return errors.New("can't encode a map with non-string key type")
++	}
++
++	// Sort keys so that we have deterministic output. And write keys directly
++	// underneath this key first, before writing sub-structs or sub-maps.
++	var mapKeysDirect, mapKeysSub []string
++	for _, mapKey := range rv.MapKeys() {
++		k := mapKey.String()
++		mrv := rv.MapIndex(mapKey)
++		if isStructOrMap(mrv) {
++			mapKeysSub = append(mapKeysSub, k)
++		} else {
++			mapKeysDirect = append(mapKeysDirect, k)
++		}
++	}
++
++	var writeMapKeys = func(mapKeys []string) error {
++		sort.Strings(mapKeys)
++		for i, mapKey := range mapKeys {
++			mrv := rv.MapIndex(reflect.ValueOf(mapKey))
++			if isNil(mrv) {
++				// Don't write anything for nil fields.
++				continue
++			}
++			if err := enc.encode(key.add(mapKey), mrv); err != nil {
++				return err
++			}
++
++			if i != len(mapKeys)-1 {
++				if _, err := enc.w.Write([]byte{'\n'}); err != nil {
++					return err
++				}
++			}
++			enc.hasWritten = true
++		}
++
++		return nil
++	}
++
++	err := writeMapKeys(mapKeysDirect)
++	if err != nil {
++		return err
++	}
++	err = writeMapKeys(mapKeysSub)
++	if err != nil {
+ 		return err
+ 	}
+ 	return nil
+ }
+ 
+-func (enc *encoder) eKeyVal(key Key, value string) error {
+-	out := fmt.Sprintf("%s%s = %s",
+-		strings.Repeat(enc.Indent, len(key)-1), key[len(key)-1], value)
+-	if _, err := fmt.Fprintln(enc.w, out); err != nil {
++func (enc *Encoder) eStruct(key Key, rv reflect.Value) error {
++	// Write keys for fields directly under this key first, because if we write
++	// a field that creates a new table, then all keys under it will be in that
++	// table (not the one we're writing here).
++	rt := rv.Type()
++	var fieldsDirect, fieldsSub [][]int
++	var addFields func(rt reflect.Type, rv reflect.Value, start []int)
++	addFields = func(rt reflect.Type, rv reflect.Value, start []int) {
++		for i := 0; i < rt.NumField(); i++ {
++			f := rt.Field(i)
++			frv := rv.Field(i)
++			if f.Anonymous {
++				t := frv.Type()
++				if t.Kind() == reflect.Ptr {
++					t = t.Elem()
++					frv = frv.Elem()
++				}
++				addFields(t, frv, f.Index)
++			} else if isStructOrMap(frv) {
++				fieldsSub = append(fieldsSub, append(start, f.Index...))
++			} else {
++				fieldsDirect = append(fieldsDirect, append(start, f.Index...))
++			}
++		}
++	}
++	addFields(rt, rv, nil)
++
++	var writeFields = func(fields [][]int) error {
++		for i, fieldIndex := range fields {
++			sft := rt.FieldByIndex(fieldIndex)
++			sf := rv.FieldByIndex(fieldIndex)
++			if isNil(sf) {
++				// Don't write anything for nil fields.
++				continue
++			}
++
++			keyName := sft.Tag.Get("toml")
++			if keyName == "-" {
++				continue
++			}
++			if keyName == "" {
++				keyName = sft.Name
++			}
++
++			if err := enc.encode(key.add(keyName), sf); err != nil {
++				return err
++			}
++
++			if i != len(fields)-1 {
++				if _, err := enc.w.Write([]byte{'\n'}); err != nil {
++					return err
++				}
++			}
++			enc.hasWritten = true
++		}
++		return nil
++	}
++
++	err := writeFields(fieldsDirect)
++	if err != nil {
++		return err
++	}
++	if len(fieldsDirect) > 0 && len(fieldsSub) > 0 {
++		_, err = enc.w.Write([]byte{'\n'})
++		if err != nil {
++			return err
++		}
++	}
++	err = writeFields(fieldsSub)
++	if err != nil {
++		return err
++	}
++	return nil
++}
++
++// tomlTypeName returns the TOML type name of the Go value's type. It is used to
++// determine whether the types of array elements are mixed (which is forbidden).
++// If the Go value is nil, then it is illegal for it to be an array element, and
++// valueIsNil is returned as true.
++func tomlTypeName(rv reflect.Value) (typeName string, valueIsNil bool) {
++	if isNil(rv) {
++		return "", true
++	}
++	k := rv.Kind()
++	switch k {
++	case reflect.Bool:
++		return "bool", false
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
++		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32,
++		reflect.Uint64:
++		return "integer", false
++	case reflect.Float32, reflect.Float64:
++		return "float", false
++	case reflect.Array, reflect.Slice:
++		return "array", false
++	case reflect.Ptr, reflect.Interface:
++		return tomlTypeName(rv.Elem())
++	case reflect.String:
++		return "string", false
++	case reflect.Map, reflect.Struct:
++		return "table", false
++	default:
++		panic("unexpected reflect.Kind: " + k.String())
++	}
++}
++
++// isTOMLTableType returns whether this type and value represents a TOML table
++// type (true) or element type (false). Both rt and rv are needed to determine
++// this, in case the Go type is interface{} or in case rv is nil. If there is
++// some other impossible situation detected, an error is returned.
++func isTOMLTableType(rt reflect.Type, rv reflect.Value) (bool, error) {
++	k := rt.Kind()
++	switch k {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
++		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32,
++		reflect.Uint64,
++		reflect.Float32, reflect.Float64,
++		reflect.String, reflect.Bool:
++		return false, nil
++	case reflect.Array, reflect.Slice:
++		// Make sure that these eventually contain an underlying non-table type
++		// element.
++		elemV := reflect.ValueOf(nil)
++		if rv.Len() > 0 {
++			elemV = rv.Index(0)
++		}
++		hasUnderlyingTableType, err := isTOMLTableType(rt.Elem(), elemV)
++		if err != nil {
++			return false, err
++		}
++		if hasUnderlyingTableType {
++			return true, errors.New("TOML array element can't contain a table")
++		}
++		return false, nil
++	case reflect.Ptr:
++		return isTOMLTableType(rt.Elem(), rv.Elem())
++	case reflect.Interface:
++		if rv.Kind() == reflect.Interface {
++			return false, nil
++		}
++		return isTOMLTableType(rv.Type(), rv)
++	case reflect.Map, reflect.Struct:
++		return true, nil
++	default:
++		panic("unexpected reflect.Kind: " + k.String())
++	}
++}
++
++func isNil(rv reflect.Value) bool {
++	switch rv.Kind() {
++	case reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
++		return rv.IsNil()
++	default:
++		return false
++	}
++}
++
++func (enc *Encoder) eKeyEq(key Key) error {
++	_, err := io.WriteString(enc.w, strings.Repeat(enc.Indent, len(key)-1))
++	if err != nil {
++		return err
++	}
++	_, err = io.WriteString(enc.w, key[len(key)-1]+" = ")
++	if err != nil {
+ 		return err
+ 	}
+ 	return nil
+diff --git a/third_party/github.com/BurntSushi/toml/encode_test.go b/third_party/github.com/BurntSushi/toml/encode_test.go
+index 3f7fad8..3e2b13b 100644
+--- a/third_party/github.com/BurntSushi/toml/encode_test.go
++++ b/third_party/github.com/BurntSushi/toml/encode_test.go
+@@ -5,21 +5,278 @@ import (
+ 	"testing"
+ )
+ 
+-type encodeSimple struct {
+-	Location string
+-	// Ages []int
+-	// DOB time.Time
+-}
+-
++// XXX(burntsushi)
++// I think these tests probably should be removed. They are good, but they
++// ought to be obsolete by toml-test.
+ func TestEncode(t *testing.T) {
+-	v := encodeSimple{
+-		Location: "Westborough, MA",
++	tests := map[string]struct {
++		input      interface{}
++		wantOutput string
++		wantError  error
++	}{
++		"bool field": {
++			input: struct {
++				BoolTrue  bool
++				BoolFalse bool
++			}{true, false},
++			wantOutput: "BoolTrue = true\nBoolFalse = false",
++		},
++		"int fields": {
++			input: struct {
++				Int   int
++				Int8  int8
++				Int16 int16
++				Int32 int32
++				Int64 int64
++			}{1, 2, 3, 4, 5},
++			wantOutput: "Int = 1\nInt8 = 2\nInt16 = 3\nInt32 = 4\nInt64 = 5",
++		},
++		"uint fields": {
++			input: struct {
++				Uint   uint
++				Uint8  uint8
++				Uint16 uint16
++				Uint32 uint32
++				Uint64 uint64
++			}{1, 2, 3, 4, 5},
++			wantOutput: "Uint = 1\nUint8 = 2\nUint16 = 3\nUint32 = 4" +
++				"\nUint64 = 5",
++		},
++		"float fields": {
++			input: struct {
++				Float32 float32
++				Float64 float64
++			}{1.5, 2.5},
++			wantOutput: "Float32 = 1.5\nFloat64 = 2.5",
++		},
++		"string field": {
++			input:      struct{ String string }{"foo"},
++			wantOutput: `String = "foo"`,
++		},
++		"array fields": {
++			input: struct {
++				IntArray0 [0]int
++				IntArray3 [3]int
++			}{[0]int{}, [3]int{1, 2, 3}},
++			wantOutput: "IntArray0 = []\nIntArray3 = [1, 2, 3]",
++		},
++		"slice fields": {
++			input: struct{ IntSliceNil, IntSlice0, IntSlice3 []int }{
++				nil, []int{}, []int{1, 2, 3},
++			},
++			wantOutput: "IntSlice0 = []\nIntSlice3 = [1, 2, 3]",
++		},
++		"nested arrays and slices": {
++			input: struct {
++				SliceOfArrays         [][2]int
++				ArrayOfSlices         [2][]int
++				SliceOfArraysOfSlices [][2][]int
++				ArrayOfSlicesOfArrays [2][][2]int
++				SliceOfMixedArrays    [][2]interface{}
++				ArrayOfMixedSlices    [2][]interface{}
++			}{
++				[][2]int{[2]int{1, 2}, [2]int{3, 4}},
++				[2][]int{[]int{1, 2}, []int{3, 4}},
++				[][2][]int{
++					[2][]int{
++						[]int{1, 2}, []int{3, 4},
++					},
++					[2][]int{
++						[]int{5, 6}, []int{7, 8},
++					},
++				},
++				[2][][2]int{
++					[][2]int{
++						[2]int{1, 2}, [2]int{3, 4},
++					},
++					[][2]int{
++						[2]int{5, 6}, [2]int{7, 8},
++					},
++				},
++				[][2]interface{}{
++					[2]interface{}{1, 2}, [2]interface{}{"a", "b"},
++				},
++				[2][]interface{}{
++					[]interface{}{1, 2}, []interface{}{"a", "b"},
++				},
++			},
++			wantOutput: `SliceOfArrays = [[1, 2], [3, 4]]
++ArrayOfSlices = [[1, 2], [3, 4]]
++SliceOfArraysOfSlices = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
++ArrayOfSlicesOfArrays = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
++SliceOfMixedArrays = [[1, 2], ["a", "b"]]
++ArrayOfMixedSlices = [[1, 2], ["a", "b"]]`,
++		},
++		"(error) slice with element type mismatch (string and integer)": {
++			input:     struct{ Mixed []interface{} }{[]interface{}{1, "a"}},
++			wantError: ErrArrayMixedElementTypes,
++		},
++		"(error) slice with element type mismatch (integer and float)": {
++			input:     struct{ Mixed []interface{} }{[]interface{}{1, 2.5}},
++			wantError: ErrArrayMixedElementTypes,
++		},
++		"slice with elems of differing Go types, same TOML types": {
++			input: struct {
++				MixedInts   []interface{}
++				MixedFloats []interface{}
++			}{
++				[]interface{}{
++					int(1), int8(2), int16(3), int32(4), int64(5),
++					uint(1), uint8(2), uint16(3), uint32(4), uint64(5),
++				},
++				[]interface{}{float32(1.5), float64(2.5)},
++			},
++			wantOutput: "MixedInts = [1, 2, 3, 4, 5, 1, 2, 3, 4, 5]\n" +
++				"MixedFloats = [1.5, 2.5]",
++		},
++		"(error) slice w/ element type mismatch (one is nested array)": {
++			input: struct{ Mixed []interface{} }{
++				[]interface{}{1, []interface{}{2}},
++			},
++			wantError: ErrArrayMixedElementTypes,
++		},
++		"(error) slice with 1 nil element": {
++			input:     struct{ NilElement1 []interface{} }{[]interface{}{nil}},
++			wantError: ErrArrayNilElement,
++		},
++		"(error) slice with 1 nil element (and other non-nil elements)": {
++			input: struct{ NilElement []interface{} }{
++				[]interface{}{1, nil},
++			},
++			wantError: ErrArrayNilElement,
++		},
++		"simple map": {
++			input:      map[string]int{"a": 1, "b": 2},
++			wantOutput: "a = 1\nb = 2",
++		},
++		"map with interface{} value type": {
++			input:      map[string]interface{}{"a": 1, "b": "c"},
++			wantOutput: "a = 1\nb = \"c\"",
++		},
++		"map with interface{} value type, some of which are structs": {
++			input: map[string]interface{}{
++				"a": struct{ Int int }{2},
++				"b": 1,
++			},
++			wantOutput: "b = 1\n[a]\n  Int = 2",
++		},
++		"nested map": {
++			input: map[string]map[string]int{
++				"a": map[string]int{"b": 1},
++				"c": map[string]int{"d": 2},
++			},
++			wantOutput: "[a]\n  b = 1\n\n[c]\n  d = 2",
++		},
++		"nested struct": {
++			input: struct{ Struct struct{ Int int } }{
++				struct{ Int int }{1},
++			},
++			wantOutput: "[Struct]\n  Int = 1",
++		},
++		"nested struct and non-struct field": {
++			input: struct {
++				Struct struct{ Int int }
++				Bool   bool
++			}{struct{ Int int }{1}, true},
++			wantOutput: "Bool = true\n\n[Struct]\n  Int = 1",
++		},
++		"2 nested structs": {
++			input: struct{ Struct1, Struct2 struct{ Int int } }{
++				struct{ Int int }{1}, struct{ Int int }{2},
++			},
++			wantOutput: "[Struct1]\n  Int = 1\n\n[Struct2]\n  Int = 2",
++		},
++		"deeply nested structs": {
++			input: struct {
++				Struct1, Struct2 struct{ Struct3 *struct{ Int int } }
++			}{
++				struct{ Struct3 *struct{ Int int } }{&struct{ Int int }{1}},
++				struct{ Struct3 *struct{ Int int } }{nil},
++			},
++			wantOutput: "[Struct1]\n  [Struct1.Struct3]\n    Int = 1" +
++				"\n\n[Struct2]\n",
++		},
++		"nested struct with nil struct elem": {
++			input: struct {
++				Struct struct{ Inner *struct{ Int int } }
++			}{
++				struct{ Inner *struct{ Int int } }{nil},
++			},
++			wantOutput: "[Struct]\n",
++		},
++		"nested struct with no fields": {
++			input: struct {
++				Struct struct{ Inner struct{} }
++			}{
++				struct{ Inner struct{} }{struct{}{}},
++			},
++			wantOutput: "[Struct]\n  [Struct.Inner]\n",
++		},
++		"struct with tags": {
++			input: struct {
++				Struct struct {
++					Int int `toml:"_int"`
++				} `toml:"_struct"`
++				Bool bool `toml:"_bool"`
++			}{
++				struct {
++					Int int `toml:"_int"`
++				}{1}, true,
++			},
++			wantOutput: "_bool = true\n\n[_struct]\n  _int = 1",
++		},
++		"embedded struct": {
++			input:      struct{ Embedded }{Embedded{1}},
++			wantOutput: "_int = 1",
++		},
++		"embedded *struct": {
++			input:      struct{ *Embedded }{&Embedded{1}},
++			wantOutput: "_int = 1",
++		},
++		"nested embedded struct": {
++			input: struct {
++				Struct struct{ Embedded } `toml:"_struct"`
++			}{struct{ Embedded }{Embedded{1}}},
++			wantOutput: "[_struct]\n  _int = 1",
++		},
++		"nested embedded *struct": {
++			input: struct {
++				Struct struct{ *Embedded } `toml:"_struct"`
++			}{struct{ *Embedded }{&Embedded{1}}},
++			wantOutput: "[_struct]\n  _int = 1",
++		},
++		"array of tables": {
++			input: struct {
++				Structs []*struct{ Int int } `toml:"struct"`
++			}{
++				[]*struct{ Int int }{
++					{1}, nil, {3},
++				},
++			},
++			wantOutput: "[[struct]]\n  Int = 1\n\n[[struct]]\n  Int = 3",
++		},
+ 	}
+-
+-	buf := new(bytes.Buffer)
+-	e := newEncoder(buf)
+-	if err := e.Encode(v); err != nil {
+-		t.Fatal(err)
++	for label, test := range tests {
++		var buf bytes.Buffer
++		e := NewEncoder(&buf)
++		err := e.Encode(test.input)
++		if err != test.wantError {
++			if test.wantError != nil {
++				t.Errorf("%s: want Encode error %v, got %v",
++					label, test.wantError, err)
++			} else {
++				t.Errorf("%s: Encode failed: %s", label, err)
++			}
++		}
++		if err != nil {
++			continue
++		}
++		if got := buf.String(); test.wantOutput != got {
++			t.Errorf("%s: want %q, got %q", label, test.wantOutput, got)
++		}
+ 	}
+-	testf(buf.String())
++}
++
++type Embedded struct {
++	Int int `toml:"_int"`
+ }
+diff --git a/third_party/github.com/BurntSushi/toml/parse.go b/third_party/github.com/BurntSushi/toml/parse.go
+index 57e4a70..2abb173 100644
+--- a/third_party/github.com/BurntSushi/toml/parse.go
++++ b/third_party/github.com/BurntSushi/toml/parse.go
+@@ -159,6 +159,8 @@ func (p *parser) value(it item) (interface{}, tomlType) {
+ 	case itemInteger:
+ 		num, err := strconv.ParseInt(it.val, 10, 64)
+ 		if err != nil {
++			// See comment below for floats describing why we make a
++			// distinction between a bug and a user error.
+ 			if e, ok := err.(*strconv.NumError); ok &&
+ 				e.Err == strconv.ErrRange {
+ 
+@@ -172,6 +174,13 @@ func (p *parser) value(it item) (interface{}, tomlType) {
+ 	case itemFloat:
+ 		num, err := strconv.ParseFloat(it.val, 64)
+ 		if err != nil {
++			// Distinguish float values. Normally, it'd be a bug if the lexer
++			// provides an invalid float, but it's possible that the float is
++			// out of range of valid values (which the lexer cannot determine).
++			// So mark the former as a bug but the latter as a legitimate user
++			// error.
++			//
++			// This is also true for integers.
+ 			if e, ok := err.(*strconv.NumError); ok &&
+ 				e.Err == strconv.ErrRange {
+ 
+@@ -209,7 +218,8 @@ func (p *parser) value(it item) (interface{}, tomlType) {
+ }
+ 
+ // establishContext sets the current context of the parser,
+-// where the context is the hash currently in scope.
++// where the context is either a hash or an array of hashes. Which one is
++// set depends on the value of the `array` parameter.
+ //
+ // Establishing the context also makes sure that the key isn't a duplicate, and
+ // will create implicit hashes automatically.
+@@ -248,10 +258,15 @@ func (p *parser) establishContext(key Key, array bool) {
+ 
+ 	p.context = keyContext
+ 	if array {
++		// If this is the first element for this array, then allocate a new
++		// list of tables for it.
+ 		k := key[len(key)-1]
+ 		if _, ok := hashContext[k]; !ok {
+ 			hashContext[k] = make([]map[string]interface{}, 0, 5)
+ 		}
++
++		// Add a new table. But make sure the key hasn't already been used
++		// for something else.
+ 		if hash, ok := hashContext[k].([]map[string]interface{}); ok {
+ 			hashContext[k] = append(hash, make(map[string]interface{}))
+ 		} else {
+@@ -280,6 +295,8 @@ func (p *parser) setValue(key string, value interface{}) {
+ 		}
+ 		switch t := tmpHash.(type) {
+ 		case []map[string]interface{}:
++			// The context is a table of hashes. Pick the most recent table
++			// defined as the current hash.
+ 			hash = t[len(t)-1]
+ 		case map[string]interface{}:
+ 			hash = t
+@@ -291,9 +308,17 @@ func (p *parser) setValue(key string, value interface{}) {
+ 	keyContext = append(keyContext, key)
+ 
+ 	if _, ok := hash[key]; ok {
+-		// We need to do some fancy footwork here. If `hash[key]` was implcitly
+-		// created AND `value` is a hash, then let this go through and stop
+-		// tagging this table as implicit.
++		// Typically, if the given key has already been set, then we have
++		// to raise an error since duplicate keys are disallowed. However,
++		// it's possible that a key was previously defined implicitly. In this
++		// case, it is allowed to be redefined concretely. (See the
++		// `tests/valid/implicit-and-explicit-after.toml` test in `toml-test`.)
++		//
++		// But we have to make sure to stop marking it as an implicit. (So that
++		// another redefinition provokes an error.)
++		//
++		// Note that since it has already been defined (as a hash), we don't
++		// want to overwrite it. So our business is done.
+ 		if p.isImplicit(keyContext) {
+ 			p.removeImplicit(keyContext)
+ 			return
+@@ -308,6 +333,9 @@ func (p *parser) setValue(key string, value interface{}) {
+ 
+ // setType sets the type of a particular value at a given key.
+ // It should be called immediately AFTER setValue.
++//
++// Note that if `key` is empty, then the type given will be applied to the
++// current context (which is either a table or an array of tables).
+ func (p *parser) setType(key string, typ tomlType) {
+ 	keyContext := make(Key, 0, len(p.context)+1)
+ 	for _, k := range p.context {
+@@ -377,9 +405,10 @@ func (p *parser) asciiEscapeToUnicode(s string) string {
+ 			"lexer claims it's OK: %s", s, err)
+ 	}
+ 
+-	// I honestly don't understand how this works. I can't seem to find
+-	// a way to make this fail. I figured this would fail on invalid UTF-8
+-	// characters like U+DCFF, but it doesn't.
++	// BUG(burntsushi)
++	// I honestly don't understand how this works. I can't seem
++	// to find a way to make this fail. I figured this would fail on invalid
++	// UTF-8 characters like U+DCFF, but it doesn't.
+ 	r := string(rune(hex))
+ 	if !utf8.ValidString(r) {
+ 		p.panic("Escaped character '\\u%s' is not valid UTF-8.", s)
+diff --git a/third_party/github.com/BurntSushi/toml/toml-test-encoder/COPYING b/third_party/github.com/BurntSushi/toml/toml-test-encoder/COPYING
+new file mode 100644
+index 0000000..5a8e332
+--- /dev/null
++++ b/third_party/github.com/BurntSushi/toml/toml-test-encoder/COPYING
+@@ -0,0 +1,14 @@
++            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
++                    Version 2, December 2004
++
++ Copyright (C) 2004 Sam Hocevar <sam@hocevar.net>
++
++ Everyone is permitted to copy and distribute verbatim or modified
++ copies of this license document, and changing it is allowed as long
++ as the name is changed.
++
++            DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE
++   TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION
++
++  0. You just DO WHAT THE FUCK YOU WANT TO.
++
+diff --git a/third_party/github.com/BurntSushi/toml/toml-test-encoder/README.md b/third_party/github.com/BurntSushi/toml/toml-test-encoder/README.md
+new file mode 100644
+index 0000000..45a603f
+--- /dev/null
++++ b/third_party/github.com/BurntSushi/toml/toml-test-encoder/README.md
+@@ -0,0 +1,14 @@
++# Implements the TOML test suite interface for TOML encoders
++
++This is an implementation of the interface expected by
++[toml-test](https://github.com/BurntSushi/toml-test) for the
++[TOML encoder](https://github.com/BurntSushi/toml).
++In particular, it maps JSON data on `stdin` to a TOML format on `stdout`.
++
++
++Compatible with TOML version
++[v0.2.0](https://github.com/mojombo/toml/blob/master/versions/toml-v0.2.0.md)
++
++Compatible with `toml-test` version
++[v0.2.0](https://github.com/BurntSushi/toml-test/tree/v0.2.0)
++
+diff --git a/third_party/github.com/BurntSushi/toml/toml-test-encoder/main.go b/third_party/github.com/BurntSushi/toml/toml-test-encoder/main.go
+new file mode 100644
+index 0000000..03864f8
+--- /dev/null
++++ b/third_party/github.com/BurntSushi/toml/toml-test-encoder/main.go
+@@ -0,0 +1,129 @@
++package main
++
++import (
++	"encoding/json"
++	"flag"
++	"log"
++	"os"
++	"path"
++	"strconv"
++	"time"
++
++	"github.com/BurntSushi/toml"
++)
++
++func init() {
++	log.SetFlags(0)
++
++	flag.Usage = usage
++	flag.Parse()
++}
++
++func usage() {
++	log.Printf("Usage: %s < json-file\n", path.Base(os.Args[0]))
++	flag.PrintDefaults()
++
++	os.Exit(1)
++}
++
++func main() {
++	if flag.NArg() != 0 {
++		flag.Usage()
++	}
++
++	var tmp interface{}
++	if err := json.NewDecoder(os.Stdin).Decode(&tmp); err != nil {
++		log.Fatalf("Error decoding JSON: %s", err)
++	}
++
++	tomlData := translate(tmp)
++	if err := toml.NewEncoder(os.Stdout).Encode(tomlData); err != nil {
++		log.Fatalf("Error encoding TOML: %s", err)
++	}
++}
++
++func translate(typedJson interface{}) interface{} {
++	switch v := typedJson.(type) {
++	case map[string]interface{}:
++		if len(v) == 2 && in("type", v) && in("value", v) {
++			return untag(v)
++		}
++		m := make(map[string]interface{}, len(v))
++		for k, v2 := range v {
++			m[k] = translate(v2)
++		}
++		return m
++	case []interface{}:
++		tabArray := make([]map[string]interface{}, len(v))
++		for i := range v {
++			if m, ok := translate(v[i]).(map[string]interface{}); ok {
++				tabArray[i] = m
++			} else {
++				log.Fatalf("JSON arrays may only contain objects. This "+
++					"corresponds to only tables being allowed in "+
++					"TOML table arrays.")
++			}
++		}
++		return tabArray
++	}
++	log.Fatalf("Unrecognized JSON format '%T'.", typedJson)
++	panic("unreachable")
++}
++
++func untag(typed map[string]interface{}) interface{} {
++	t := typed["type"].(string)
++	v := typed["value"]
++	switch t {
++	case "string":
++		return v.(string)
++	case "integer":
++		v := v.(string)
++		n, err := strconv.Atoi(v)
++		if err != nil {
++			log.Fatalf("Could not parse '%s' as integer: %s", v, err)
++		}
++		return n
++	case "float":
++		v := v.(string)
++		f, err := strconv.ParseFloat(v, 64)
++		if err != nil {
++			log.Fatalf("Could not parse '%s' as float64: %s", v, err)
++		}
++		return f
++	case "datetime":
++		v := v.(string)
++		t, err := time.Parse("2006-01-02T15:04:05Z", v)
++		if err != nil {
++			log.Fatalf("Could not parse '%s' as a datetime: %s", v, err)
++		}
++		return t
++	case "bool":
++		v := v.(string)
++		switch v {
++		case "true":
++			return true
++		case "false":
++			return false
++		}
++		log.Fatalf("Could not parse '%s' as a boolean.", v)
++	case "array":
++		v := v.([]interface{})
++		array := make([]interface{}, len(v))
++		for i := range v {
++			if m, ok := v[i].(map[string]interface{}); ok {
++				array[i] = untag(m)
++			} else {
++				log.Fatalf("Arrays may only contain other arrays or "+
++					"primitive values, but found a '%T'.", m)
++			}
++		}
++		return array
++	}
++	log.Fatalf("Unrecognized tag type '%s'.", t)
++	panic("unreachable")
++}
++
++func in(key string, m map[string]interface{}) bool {
++	_, ok := m[key]
++	return ok
++}
+diff --git a/third_party/github.com/BurntSushi/toml/toml-test-go/main.go b/third_party/github.com/BurntSushi/toml/toml-test-go/main.go
+index 79a3c21..eb0f95b 100644
+--- a/third_party/github.com/BurntSushi/toml/toml-test-go/main.go
++++ b/third_party/github.com/BurntSushi/toml/toml-test-go/main.go
+@@ -43,7 +43,6 @@ func main() {
+ }
+ 
+ func translate(tomlData interface{}) interface{} {
+-
+ 	switch orig := tomlData.(type) {
+ 	case map[string]interface{}:
+ 		typed := make(map[string]interface{}, len(orig))
+diff --git a/third_party/github.com/BurntSushi/toml/type_check.go b/third_party/github.com/BurntSushi/toml/type_check.go
+new file mode 100644
+index 0000000..22f188d
+--- /dev/null
++++ b/third_party/github.com/BurntSushi/toml/type_check.go
+@@ -0,0 +1,78 @@
++package toml
++
++// tomlType represents any Go type that corresponds to a TOML type.
++// While the first draft of the TOML spec has a simplistic type system that
++// probably doesn't need this level of sophistication, we seem to be militating
++// toward adding real composite types.
++type tomlType interface {
++	typeString() string
++}
++
++// typeEqual accepts any two types and returns true if they are equal.
++func typeEqual(t1, t2 tomlType) bool {
++	return t1.typeString() == t2.typeString()
++}
++
++type tomlBaseType string
++
++func (btype tomlBaseType) typeString() string {
++	return string(btype)
++}
++
++func (btype tomlBaseType) String() string {
++	return btype.typeString()
++}
++
++var (
++	tomlInteger   tomlBaseType = "Integer"
++	tomlFloat     tomlBaseType = "Float"
++	tomlDatetime  tomlBaseType = "Datetime"
++	tomlString    tomlBaseType = "String"
++	tomlBool      tomlBaseType = "Bool"
++	tomlArray     tomlBaseType = "Array"
++	tomlHash      tomlBaseType = "Hash"
++	tomlArrayHash tomlBaseType = "ArrayHash"
++)
++
++// typeOfPrimitive returns a tomlType of any primitive value in TOML.
++// Primitive values are: Integer, Float, Datetime, String and Bool.
++//
++// Passing a lexer item other than the following will cause a BUG message
++// to occur: itemString, itemBool, itemInteger, itemFloat, itemDatetime.
++func (p *parser) typeOfPrimitive(lexItem item) tomlType {
++	switch lexItem.typ {
++	case itemInteger:
++		return tomlInteger
++	case itemFloat:
++		return tomlFloat
++	case itemDatetime:
++		return tomlDatetime
++	case itemString:
++		return tomlString
++	case itemBool:
++		return tomlBool
++	}
++	p.bug("Cannot infer primitive type of lex item '%s'.", lexItem)
++	panic("unreachable")
++}
++
++// typeOfArray returns a tomlType for an array given a list of types of its
++// values.
++//
++// In the current spec, if an array is homogeneous, then its type is always
++// "Array". If the array is not homogeneous, an error is generated.
++func (p *parser) typeOfArray(types []tomlType) tomlType {
++	// Empty arrays are cool.
++	if len(types) == 0 {
++		return tomlArray
++	}
++
++	theType := types[0]
++	for _, t := range types[1:] {
++		if !typeEqual(theType, t) {
++			p.panic("Array contains values of type '%s' and '%s', but arrays "+
++				"must be homogeneous.", theType, t)
++		}
++	}
++	return tomlArray
++}
+diff --git a/third_party/github.com/BurntSushi/toml/type_fields.go b/third_party/github.com/BurntSushi/toml/type_fields.go
+index a380d80..138fc00 100644
+--- a/third_party/github.com/BurntSushi/toml/type_fields.go
++++ b/third_party/github.com/BurntSushi/toml/type_fields.go
+@@ -14,10 +14,10 @@ import (
+ 
+ // A field represents a single field found in a struct.
+ type field struct {
+-	name  string
+-	tag   bool
+-	index []int
+-	typ   reflect.Type
++	name  string       // the name of the field (`toml` tag included)
++	tag   bool         // whether field has a `toml` tag
++	index []int        // represents the depth of an anonymous field
++	typ   reflect.Type // the type of the field
+ }
+ 
+ // byName sorts field by name, breaking ties with depth,

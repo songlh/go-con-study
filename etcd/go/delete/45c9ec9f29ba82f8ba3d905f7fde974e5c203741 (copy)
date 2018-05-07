@@ -1,0 +1,222 @@
+commit 45c9ec9f29ba82f8ba3d905f7fde974e5c203741
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Tue Sep 3 21:27:46 2013 -0400
+
+    basic get
+
+diff --git a/file_system/event.go b/file_system/event.go
+index a45d8fe..56fc285 100644
+--- a/file_system/event.go
++++ b/file_system/event.go
+@@ -7,6 +7,7 @@ import (
+ )
+ 
+ const (
++	Get         = "get"
+ 	Set         = "set"
+ 	Delete      = "delete"
+ 	TestAndSet  = "testAndSet"
+@@ -14,18 +15,27 @@ const (
+ )
+ 
+ type Event struct {
+-	Action     string     `json:"action"`
+-	Key        string     `json:"key"`
+-	Dir        bool       `json:"dir,omitempty"`
+-	PrevValue  string     `json:"prevValue,omitempty"`
+-	Value      string     `json:"value,omitempty"`
+-	Expiration *time.Time `json:"expiration,omitempty"`
+-	TTL        int64      `json:"ttl,omitempty"` // Time to live in second
++	Action     string         `json:"action"`
++	Key        string         `json:"key, omitempty"`
++	Dir        bool           `json:"dir,omitempty"`
++	PrevValue  string         `json:"prevValue,omitempty"`
++	Value      string         `json:"value,omitempty"`
++	Pairs      []KeyValuePair `json:"kvs,omitempty"`
++	Expiration *time.Time     `json:"expiration,omitempty"`
++	TTL        int64          `json:"ttl,omitempty"` // Time to live in second
+ 	// The command index of the raft machine when the command is executed
+ 	Index uint64 `json:"index"`
+ 	Term  uint64 `json:"term"`
+ }
+ 
++// When user list a directory, we add all the node into key-value pair slice
++type KeyValuePair struct {
++	Key   string         `json:"key, omitempty"`
++	Value string         `json:"value,omitempty"`
++	Dir   bool           `json:"dir,omitempty"`
++	Pairs []KeyValuePair `json:"kvs,omitempty"`
++}
++
+ func newEvent(action string, key string, index uint64, term uint64) *Event {
+ 	return &Event{
+ 		Action: action,
+diff --git a/file_system/file_system.go b/file_system/file_system.go
+index 4ccc1e2..086f9ae 100644
+--- a/file_system/file_system.go
++++ b/file_system/file_system.go
+@@ -25,29 +25,42 @@ func New() *FileSystem {
+ 
+ }
+ 
+-func (fs *FileSystem) InternalGet(path string, index uint64, term uint64) (*Node, error) {
+-	fmt.Println("GET: ", path)
+-	path = filepath.Clean("/" + path)
++func (fs *FileSystem) Get(path string, recusive bool, index uint64, term uint64) (*Event, error) {
++	// TODO: add recursive get
++	n, err := fs.InternalGet(path, index, term)
+ 
+-	// update file system known index and term
+-	fs.Index, fs.Term = index, term
++	if err != nil {
++		return nil, err
++	}
+ 
+-	walkFunc := func(parent *Node, dirName string) (*Node, error) {
+-		child, ok := parent.Children[dirName]
+-		if ok {
+-			return child, nil
+-		}
++	e := newEvent(Get, path, index, term)
+ 
+-		return nil, etcdErr.NewError(100, "get")
+-	}
++	if n.IsDir() { // node is dir
++		e.Pairs = make([]KeyValuePair, len(n.Children))
+ 
+-	f, err := fs.walk(path, walkFunc)
++		i := 0
+ 
+-	if err != nil {
+-		return nil, err
++		for _, subN := range n.Children {
++
++			if subN.IsDir() {
++				e.Pairs[i] = KeyValuePair{
++					Key: subN.Path,
++					Dir: true,
++				}
++			} else {
++				e.Pairs[i] = KeyValuePair{
++					Key:   subN.Path,
++					Value: subN.Value,
++				}
++			}
++			i++
++		}
++
++	} else { // node is file
++		e.Value = n.Value
+ 	}
+ 
+-	return f, nil
++	return e, nil
+ }
+ 
+ func (fs *FileSystem) Set(path string, value string, expireTime time.Time, index uint64, term uint64) error {
+@@ -66,17 +79,35 @@ func (fs *FileSystem) Set(path string, value string, expireTime time.Time, index
+ 	}
+ 
+ 	f := newFile(name, value, fs.Index, fs.Term, d, "", expireTime)
++	e := newEvent(Set, path, fs.Index, fs.Term)
++	e.Value = f.Value
+ 
+-	err = d.Add(f)
++	// remove previous file if exist
++	oldFile, err := d.GetFile(name)
+ 
+ 	if err == nil {
+-		if expireTime != Permanent {
+-			go f.Expire()
++		if oldFile != nil {
++			oldFile.Remove(false)
++			e.PrevValue = oldFile.Value
+ 		}
++	} else {
++		return err
+ 	}
+ 
+-	return err
++	err = d.Add(f)
+ 
++	if err != nil {
++		return err
++	}
++
++	// Node with TTL
++	if expireTime != Permanent {
++		go f.Expire()
++		e.Expiration = &f.ExpireTime
++		e.TTL = int64(expireTime.Sub(time.Now()) / time.Second)
++	}
++
++	return nil
+ }
+ 
+ func (fs *FileSystem) TestAndSet() {
+@@ -119,6 +150,32 @@ func (fs *FileSystem) walk(path string, walkFunc func(prev *Node, component stri
+ 	return curr, nil
+ }
+ 
++// InternalGet function get the node of the given path.
++func (fs *FileSystem) InternalGet(path string, index uint64, term uint64) (*Node, error) {
++	fmt.Println("GET: ", path)
++	path = filepath.Clean("/" + path)
++
++	// update file system known index and term
++	fs.Index, fs.Term = index, term
++
++	walkFunc := func(parent *Node, dirName string) (*Node, error) {
++		child, ok := parent.Children[dirName]
++		if ok {
++			return child, nil
++		}
++
++		return nil, etcdErr.NewError(100, "get")
++	}
++
++	f, err := fs.walk(path, walkFunc)
++
++	if err != nil {
++		return nil, err
++	}
++
++	return f, nil
++}
++
+ // checkDir function will check whether the component is a directory under parent node.
+ // If it is a directory, this function will return the pointer to that node.
+ // If it does not exist, this function will create a new directory and return the pointer to that node.
+diff --git a/file_system/node.go b/file_system/node.go
+index 00eb494..b695ba7 100644
+--- a/file_system/node.go
++++ b/file_system/node.go
+@@ -141,6 +141,28 @@ func (n *Node) List() ([]*Node, error) {
+ 	return nodes, nil
+ }
+ 
++func (n *Node) GetFile(name string) (*Node, error) {
++	n.mu.Lock()
++	n.mu.Unlock()
++
++	if !n.IsDir() {
++		return nil, etcdErr.NewError(104, n.Path)
++	}
++
++	f, ok := n.Children[name]
++
++	if ok {
++		if !f.IsDir() {
++			return f, nil
++		} else {
++			return nil, etcdErr.NewError(102, f.Path)
++		}
++	}
++
++	return nil, nil
++
++}
++
+ // Add function adds a node to the receiver node.
+ // If the receiver is not a directory, a "Not A Directory" error will be returned.
+ // If there is a existing node with the same name under the directory, a "Already Exist"

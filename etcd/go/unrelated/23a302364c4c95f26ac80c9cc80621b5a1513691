@@ -1,0 +1,391 @@
+commit 23a302364c4c95f26ac80c9cc80621b5a1513691
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Fri Sep 29 05:30:07 2017 -0700
+
+    Makefile: initial commit
+    
+    Initial commit to run DNS/SRV tests.
+    
+    Signed-off-by: Gyu-Ho Lee <gyuhox@gmail.com>
+
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..2013d5c
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,116 @@
++# run makefile from repo root
++
++.PHONY: build
++build:
++	GO_BUILD_FLAGS="-v" ./build
++	./bin/etcd --version
++	ETCDCTL_API=3 ./bin/etcdctl version
++
++# run all tests
++test-all:
++	RELEASE_TEST=y INTEGRATION=y PASSES='build unit release integration_e2e functional' ./test 2>&1 | tee test.log
++
++# clean up failed tests, logs, dependencies
++clean:
++	rm -f ./*.log
++	rm -f ./bin/Dockerfile-release
++	rm -rf ./gopath
++	rm -rf ./release
++	rm -f ./integration/127.0.0.1:* ./integration/localhost:*
++	rm -f ./clientv3/integration/127.0.0.1:* ./clientv3/integration/localhost:*
++	rm -f ./clientv3/ordering/127.0.0.1:* ./clientv3/ordering/localhost:*
++
++# keep in-sync with 'Dockerfile-test', 'e2e/docker-dns/Dockerfile'
++_GO_VERSION = go1.9.1
++ifdef GO_VERSION
++	_GO_VERSION = $(GO_VERSION)
++endif
++
++# build base container image for testing on Linux
++docker-test-build:
++	docker build --tag gcr.io/etcd-development/etcd-test:$(_GO_VERSION) --file ./Dockerfile-test .
++
++# e.g.
++# gcloud docker -- login -u _json_key -p "$(cat /etc/gcp-key-etcd.json)" https://gcr.io
++docker-test-push:
++	gcloud docker -- push gcr.io/etcd-development/etcd-test:$(_GO_VERSION)
++
++docker-test-pull:
++	docker pull gcr.io/etcd-development/etcd-test:$(_GO_VERSION)
++
++# compile etcd and etcdctl with Linux
++docker-test-compile:
++	docker run \
++	  --rm \
++	  --volume=`pwd`/:/etcd \
++	  gcr.io/etcd-development/etcd-test:$(_GO_VERSION) \
++	  /bin/bash -c "cd /etcd && GO_BUILD_FLAGS=-v ./build && ./bin/etcd --version"
++
++# run tests inside container
++docker-test:
++	docker run \
++	  --rm \
++	  --volume=`pwd`:/go/src/github.com/coreos/etcd \
++	  gcr.io/etcd-development/etcd-test:$(_GO_VERSION) \
++	  /bin/bash -c "RELEASE_TEST=y INTEGRATION=y PASSES='build unit release integration_e2e functional' ./test 2>&1 | tee docker-test.log"
++
++docker-test-386:
++	docker run \
++	  --rm \
++	  --volume=`pwd`:/go/src/github.com/coreos/etcd \
++	  gcr.io/etcd-development/etcd-test:$(_GO_VERSION) \
++	  /bin/bash -c "GOARCH=386 PASSES='build unit integration_e2e' ./test 2>&1 | tee docker-test.log"
++
++# build release container image with Linux
++_ETCD_VERSION ?= $(shell git rev-parse --short HEAD || echo "GitNotFound")
++ifdef ETCD_VERSION
++	_ETCD_VERSION = $(ETCD_VERSION)
++endif
++docker-release-master-build: docker-test-compile
++	cp ./Dockerfile-release ./bin/Dockerfile-release
++	docker build \
++	  --tag gcr.io/etcd-development/etcd:$(_ETCD_VERSION) \
++	  --file ./bin/Dockerfile-release \
++	  ./bin
++	rm -f ./bin/Dockerfile-release
++
++	docker run \
++	  --rm \
++	  gcr.io/etcd-development/etcd:$(_ETCD_VERSION) \
++	  /bin/sh -c "/usr/local/bin/etcd --version && ETCDCTL_API=3 /usr/local/bin/etcdctl version"
++
++docker-release-master-push:
++	gcloud docker -- push gcr.io/etcd-development/etcd:$(_ETCD_VERSION)
++
++# build base container image for DNS testing
++docker-dns-test-build:
++	docker build \
++	  --tag gcr.io/etcd-development/etcd-dns-test:$(_GO_VERSION) \
++	  --file ./e2e/docker-dns/Dockerfile \
++	  ./e2e/docker-dns
++
++	docker run \
++	  --rm \
++	  --dns 127.0.0.1 \
++	  gcr.io/etcd-development/etcd-dns-test:$(_GO_VERSION) \
++	  /bin/bash -c "/etc/init.d/bind9 start && cat /dev/null >/etc/hosts && dig etcd.local"
++
++docker-dns-test-push:
++	gcloud docker -- push gcr.io/etcd-development/etcd-dns-test:$(_GO_VERSION)
++
++docker-dns-test-pull:
++	docker pull gcr.io/etcd-development/etcd-dns-test:$(_GO_VERSION)
++
++# run DNS tests inside container
++docker-dns-test-run:
++	docker run \
++	  --rm \
++	  --tty \
++	  --dns 127.0.0.1 \
++	  --volume=`pwd`/bin:/etcd \
++	  --volume=`pwd`/integration/fixtures:/certs \
++	  gcr.io/etcd-development/etcd-dns-test:$(_GO_VERSION) \
++	  /bin/bash -c "cd /etcd && /run.sh && rm -rf m*.etcd"
++
++# TODO: add DNS SRV tests
++# TODO: add DNS integration tests
+diff --git a/e2e/docker-dns/Dockerfile b/e2e/docker-dns/Dockerfile
+new file mode 100644
+index 0000000..9daf2b8
+--- /dev/null
++++ b/e2e/docker-dns/Dockerfile
+@@ -0,0 +1,18 @@
++FROM golang:1.9.1-stretch
++LABEL Description="Image for etcd DNS testing"
++
++RUN apt update -y \
++  && apt install -y \
++  bind9 \
++  dnsutils
++
++RUN mkdir /var/bind
++RUN chown bind /var/bind
++ADD Procfile.tls /Procfile.tls
++ADD run.sh /run.sh
++
++ADD named.conf etcd.zone rdns.zone /etc/bind/
++ADD resolv.conf /etc/resolv.conf
++
++RUN go get github.com/mattn/goreman
++CMD ["/run.sh"]
+\ No newline at end of file
+diff --git a/e2e/docker-dns/Procfile.tls b/e2e/docker-dns/Procfile.tls
+new file mode 100644
+index 0000000..d8b7902
+--- /dev/null
++++ b/e2e/docker-dns/Procfile.tls
+@@ -0,0 +1,6 @@
++# Use goreman to run `go get github.com/mattn/goreman`
++etcd1: ./etcd --name infra1 --listen-client-urls https://127.0.0.1:2379 --advertise-client-urls https://m1.etcd.local:2379 --listen-peer-urls https://127.0.0.1:12380 --initial-advertise-peer-urls=https://m1.etcd.local:12380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt  --peer-key-file=/certs/server-wildcard.key.insecure --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
++
++etcd2: ./etcd --name infra2 --listen-client-urls https://127.0.0.1:22379 --advertise-client-urls https://m2.etcd.local:22379 --listen-peer-urls https://127.0.0.1:22380 --initial-advertise-peer-urls=https://m2.etcd.local:22380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt -peer-key-file=/certs/server-wildcard.key.insecure  --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
++
++etcd3: ./etcd --name infra3 --listen-client-urls https://127.0.0.1:32379 --advertise-client-urls https://m3.etcd.local:32379 --listen-peer-urls https://127.0.0.1:32380 --initial-advertise-peer-urls=https://m3.etcd.local:32380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt  --peer-key-file=/certs/server-wildcard.key.insecure --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
+diff --git a/e2e/docker-dns/etcd.zone b/e2e/docker-dns/etcd.zone
+new file mode 100644
+index 0000000..03c15fe
+--- /dev/null
++++ b/e2e/docker-dns/etcd.zone
+@@ -0,0 +1,14 @@
++$TTL    86400
++@   IN  SOA  etcdns.local. root.etcdns.local. (
++             100500     ; Serial
++             604800     ; Refresh
++              86400     ; Retry
++            2419200     ; Expire
++              86400 )   ; Negative Cache TTL
++    IN  NS  ns.etcdns.local.
++    IN  A   127.0.0.1
++
++ns IN A 127.0.0.1
++m1 IN A 127.0.0.1
++m2 IN A 127.0.0.1
++m3 IN A 127.0.0.1
+diff --git a/e2e/docker-dns/named.conf b/e2e/docker-dns/named.conf
+new file mode 100644
+index 0000000..8354930
+--- /dev/null
++++ b/e2e/docker-dns/named.conf
+@@ -0,0 +1,23 @@
++options {
++        directory "/var/bind";
++        listen-on { 127.0.0.1; };
++        listen-on-v6 { none; };
++        allow-transfer {
++                none;
++        };
++        // If you have problems and are behind a firewall:
++        query-source address * port 53;
++        pid-file "/var/run/named/named.pid";
++        allow-recursion { none; };
++        recursion no;
++};
++
++zone "etcd.local" IN {
++      type master;
++      file "/etc/bind/etcd.zone";
++};
++
++zone "0.0.127.in-addr.arpa" {
++      type master;
++      file "/etc/bind/rdns.zone";
++};
+diff --git a/e2e/docker-dns/rdns.zone b/e2e/docker-dns/rdns.zone
+new file mode 100644
+index 0000000..fb71b30
+--- /dev/null
++++ b/e2e/docker-dns/rdns.zone
+@@ -0,0 +1,13 @@
++$TTL    86400
++@   IN  SOA  etcdns.local. root.etcdns.local. (
++             100500     ; Serial
++             604800     ; Refresh
++              86400     ; Retry
++            2419200     ; Expire
++              86400 )   ; Negative Cache TTL
++    IN  NS  ns.etcdns.local.
++    IN  A   127.0.0.1
++
++1 IN PTR m1.etcd.local.
++1 IN PTR m2.etcd.local.
++1 IN PTR m3.etcd.local.
+diff --git a/e2e/docker-dns/resolv.conf b/e2e/docker-dns/resolv.conf
+new file mode 100644
+index 0000000..bbc8559
+--- /dev/null
++++ b/e2e/docker-dns/resolv.conf
+@@ -0,0 +1 @@
++nameserver 127.0.0.1
+diff --git a/e2e/docker-dns/run.sh b/e2e/docker-dns/run.sh
+new file mode 100755
+index 0000000..e020bcb
+--- /dev/null
++++ b/e2e/docker-dns/run.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++
++/etc/init.d/bind9 start
++# get rid of hosts so go lookup won't resolve 127.0.0.1 to localhost
++cat /dev/null >/etc/hosts
++goreman -f /Procfile.tls start &
++sleep 5s
++ETCDCTL_API=3 ./etcdctl --cacert=/certs/ca.crt --endpoints=https://m1.etcd.local:2379 put abc def
+diff --git a/e2e/docker/Dockerfile b/e2e/docker/Dockerfile
+deleted file mode 100644
+index 195bdd9..0000000
+--- a/e2e/docker/Dockerfile
++++ /dev/null
+@@ -1,12 +0,0 @@
+-FROM golang:1.9-stretch
+-LABEL Description="Image for etcd DNS testing"
+-RUN apt update -y
+-RUN go get github.com/mattn/goreman
+-RUN apt install -y bind9
+-RUN mkdir /var/bind
+-RUN chown bind /var/bind
+-ADD Procfile.tls /Procfile.tls
+-ADD run.sh /run.sh
+-ADD named.conf etcd.zone rdns.zone /etc/bind/
+-ADD resolv.conf /etc/resolv.conf
+-CMD ["/run.sh"]
+\ No newline at end of file
+diff --git a/e2e/docker/Makefile b/e2e/docker/Makefile
+deleted file mode 100644
+index 7ec14d4..0000000
+--- a/e2e/docker/Makefile
++++ /dev/null
+@@ -1,7 +0,0 @@
+-# run makefile from repo root
+-
+-docker-dns-build:
+-	docker build -t etcd-dns e2e/docker/
+-
+-docker-dns-test: docker-dns-build
+-	docker run --dns 127.0.0.1 --rm -v `pwd`/bin/:/etcd -v `pwd`/integration/fixtures:/certs -w /etcd -t etcd-dns
+diff --git a/e2e/docker/Procfile.tls b/e2e/docker/Procfile.tls
+deleted file mode 100644
+index d8b7902..0000000
+--- a/e2e/docker/Procfile.tls
++++ /dev/null
+@@ -1,6 +0,0 @@
+-# Use goreman to run `go get github.com/mattn/goreman`
+-etcd1: ./etcd --name infra1 --listen-client-urls https://127.0.0.1:2379 --advertise-client-urls https://m1.etcd.local:2379 --listen-peer-urls https://127.0.0.1:12380 --initial-advertise-peer-urls=https://m1.etcd.local:12380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt  --peer-key-file=/certs/server-wildcard.key.insecure --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
+-
+-etcd2: ./etcd --name infra2 --listen-client-urls https://127.0.0.1:22379 --advertise-client-urls https://m2.etcd.local:22379 --listen-peer-urls https://127.0.0.1:22380 --initial-advertise-peer-urls=https://m2.etcd.local:22380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt -peer-key-file=/certs/server-wildcard.key.insecure  --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
+-
+-etcd3: ./etcd --name infra3 --listen-client-urls https://127.0.0.1:32379 --advertise-client-urls https://m3.etcd.local:32379 --listen-peer-urls https://127.0.0.1:32380 --initial-advertise-peer-urls=https://m3.etcd.local:32380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt  --peer-key-file=/certs/server-wildcard.key.insecure --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
+diff --git a/e2e/docker/etcd.zone b/e2e/docker/etcd.zone
+deleted file mode 100644
+index 03c15fe..0000000
+--- a/e2e/docker/etcd.zone
++++ /dev/null
+@@ -1,14 +0,0 @@
+-$TTL    86400
+-@   IN  SOA  etcdns.local. root.etcdns.local. (
+-             100500     ; Serial
+-             604800     ; Refresh
+-              86400     ; Retry
+-            2419200     ; Expire
+-              86400 )   ; Negative Cache TTL
+-    IN  NS  ns.etcdns.local.
+-    IN  A   127.0.0.1
+-
+-ns IN A 127.0.0.1
+-m1 IN A 127.0.0.1
+-m2 IN A 127.0.0.1
+-m3 IN A 127.0.0.1
+diff --git a/e2e/docker/named.conf b/e2e/docker/named.conf
+deleted file mode 100644
+index 8354930..0000000
+--- a/e2e/docker/named.conf
++++ /dev/null
+@@ -1,23 +0,0 @@
+-options {
+-        directory "/var/bind";
+-        listen-on { 127.0.0.1; };
+-        listen-on-v6 { none; };
+-        allow-transfer {
+-                none;
+-        };
+-        // If you have problems and are behind a firewall:
+-        query-source address * port 53;
+-        pid-file "/var/run/named/named.pid";
+-        allow-recursion { none; };
+-        recursion no;
+-};
+-
+-zone "etcd.local" IN {
+-      type master;
+-      file "/etc/bind/etcd.zone";
+-};
+-
+-zone "0.0.127.in-addr.arpa" {
+-      type master;
+-      file "/etc/bind/rdns.zone";
+-};
+diff --git a/e2e/docker/rdns.zone b/e2e/docker/rdns.zone
+deleted file mode 100644
+index fb71b30..0000000
+--- a/e2e/docker/rdns.zone
++++ /dev/null
+@@ -1,13 +0,0 @@
+-$TTL    86400
+-@   IN  SOA  etcdns.local. root.etcdns.local. (
+-             100500     ; Serial
+-             604800     ; Refresh
+-              86400     ; Retry
+-            2419200     ; Expire
+-              86400 )   ; Negative Cache TTL
+-    IN  NS  ns.etcdns.local.
+-    IN  A   127.0.0.1
+-
+-1 IN PTR m1.etcd.local.
+-1 IN PTR m2.etcd.local.
+-1 IN PTR m3.etcd.local.
+diff --git a/e2e/docker/resolv.conf b/e2e/docker/resolv.conf
+deleted file mode 100644
+index bbc8559..0000000
+--- a/e2e/docker/resolv.conf
++++ /dev/null
+@@ -1 +0,0 @@
+-nameserver 127.0.0.1
+diff --git a/e2e/docker/run.sh b/e2e/docker/run.sh
+deleted file mode 100755
+index e020bcb..0000000
+--- a/e2e/docker/run.sh
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#!/bin/sh
+-
+-/etc/init.d/bind9 start
+-# get rid of hosts so go lookup won't resolve 127.0.0.1 to localhost
+-cat /dev/null >/etc/hosts
+-goreman -f /Procfile.tls start &
+-sleep 5s
+-ETCDCTL_API=3 ./etcdctl --cacert=/certs/ca.crt --endpoints=https://m1.etcd.local:2379 put abc def

@@ -1,0 +1,246 @@
+commit e1fe7350a2667079b34c2643fd74da11f70354e9
+Author: Jonathan Boulle <jonathanboulle@gmail.com>
+Date:   Sat Dec 19 18:25:26 2015 +0100
+
+    tests: update + enable check for leaked goroutines
+    
+    Go 1.4 landed a new testing.M type [1][1] which allows for start-up and
+    shutdown hooks when running tests. The standard library now uses this
+    for checking for leaked goroutines in net/http [2][2].
+    
+    This patch essentially re-ports the updated code from the net/http test
+    (we were using an older version of it) - in detail:
+    - updates the test to use `TestMain` instead of relying on
+      `TestGoroutinesRunning` to be implicitly run after all other tests
+    - adds a few new goroutines to the list of exceptions (the test itself,
+      as well as the golang/glog package and pkg/log.MergeLogger, both of
+      which spin off goroutines to handle log flushing/merging respectively)
+    - removes a couple of TODOs in the test for extra goroutines that's run
+      after individual tests (one of these re-enables the http package's
+      `.readLoop` and the other was an out-of-date TODO)
+    - re-enables the test
+    
+    [1]: https://golang.org/pkg/testing/#M
+    [2]: https://github.com/golang/go/blob/release-branch.go1.4/src/net/http/main_test.go#L18
+
+diff --git a/integration/main_test.go b/integration/main_test.go
+new file mode 100644
+index 0000000..8c8cbfa
+--- /dev/null
++++ b/integration/main_test.go
+@@ -0,0 +1,108 @@
++// Copyright 2013 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package integration
++
++import (
++	"fmt"
++	"net/http"
++	"os"
++	"runtime"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++func interestingGoroutines() (gs []string) {
++	buf := make([]byte, 2<<20)
++	buf = buf[:runtime.Stack(buf, true)]
++	for _, g := range strings.Split(string(buf), "\n\n") {
++		sl := strings.SplitN(g, "\n", 2)
++		if len(sl) != 2 {
++			continue
++		}
++		stack := strings.TrimSpace(sl[1])
++		if stack == "" ||
++			strings.Contains(stack, "created by testing.RunTests") ||
++			strings.Contains(stack, "testing.Main(") ||
++			strings.Contains(stack, "runtime.goexit") ||
++			strings.Contains(stack, "github.com/coreos/etcd/integration.interestingGoroutines") ||
++			strings.Contains(stack, "github.com/coreos/etcd/pkg/logutil.(*MergeLogger).outputLoop") ||
++			strings.Contains(stack, "github.com/golang/glog.(*loggingT).flushDaemon") ||
++			strings.Contains(stack, "created by runtime.gc") ||
++			strings.Contains(stack, "runtime.MHeap_Scavenger") {
++			continue
++		}
++		gs = append(gs, stack)
++	}
++	sort.Strings(gs)
++	return
++}
++
++// Verify the other tests didn't leave any goroutines running.
++func TestMain(m *testing.M) {
++	v := m.Run()
++	if v == 0 && goroutineLeaked() {
++		os.Exit(1)
++	}
++	os.Exit(v)
++}
++
++func goroutineLeaked() bool {
++	if testing.Short() {
++		// not counting goroutines for leakage in -short mode
++		return false
++	}
++	gs := interestingGoroutines()
++
++	n := 0
++	stackCount := make(map[string]int)
++	for _, g := range gs {
++		stackCount[g]++
++		n++
++	}
++
++	if n == 0 {
++		return false
++	}
++	fmt.Fprintf(os.Stderr, "Too many goroutines running after integration test(s).\n")
++	for stack, count := range stackCount {
++		fmt.Fprintf(os.Stderr, "%d instances of:\n%s\n", count, stack)
++	}
++	return true
++}
++
++func afterTest(t *testing.T) {
++	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
++	if testing.Short() {
++		return
++	}
++	var bad string
++	badSubstring := map[string]string{
++		").readLoop(":                                  "a Transport",
++		").writeLoop(":                                 "a Transport",
++		"created by net/http/httptest.(*Server).Start": "an httptest.Server",
++		"timeoutHandler":                               "a TimeoutHandler",
++		"net.(*netFD).connect(":                        "a timing out dial",
++		").noteClientGone(":                            "a closenotifier sender",
++	}
++	var stacks string
++	for i := 0; i < 6; i++ {
++		bad = ""
++		stacks = strings.Join(interestingGoroutines(), "\n\n")
++		for substr, what := range badSubstring {
++			if strings.Contains(stacks, substr) {
++				bad = what
++			}
++		}
++		if bad == "" {
++			return
++		}
++		// Bad stuff found, but goroutines might just still be
++		// shutting down, so give it some time.
++		time.Sleep(50 * time.Millisecond)
++	}
++	t.Errorf("Test appears to have leaked %s:\n%s", bad, stacks)
++}
+diff --git a/integration/z_last_test.go b/integration/z_last_test.go
+deleted file mode 100644
+index 54d9549..0000000
+--- a/integration/z_last_test.go
++++ /dev/null
+@@ -1,101 +0,0 @@
+-// Copyright 2013 The Go Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-package integration
+-
+-import (
+-	"net/http"
+-	"runtime"
+-	"sort"
+-	"strings"
+-	"testing"
+-	"time"
+-)
+-
+-func interestingGoroutines() (gs []string) {
+-	buf := make([]byte, 2<<20)
+-	buf = buf[:runtime.Stack(buf, true)]
+-	for _, g := range strings.Split(string(buf), "\n\n") {
+-		sl := strings.SplitN(g, "\n", 2)
+-		if len(sl) != 2 {
+-			continue
+-		}
+-		stack := strings.TrimSpace(sl[1])
+-		if stack == "" ||
+-			strings.Contains(stack, "created by testing.RunTests") ||
+-			strings.Contains(stack, "testing.Main(") ||
+-			strings.Contains(stack, "runtime.goexit") ||
+-			strings.Contains(stack, "created by runtime.gc") ||
+-			strings.Contains(stack, "runtime.MHeap_Scavenger") {
+-			continue
+-		}
+-		gs = append(gs, stack)
+-	}
+-	sort.Strings(gs)
+-	return
+-}
+-
+-// Verify the other tests didn't leave any goroutines running.
+-// This is in a file named z_last_test.go so it sorts at the end.
+-func TestGoroutinesRunning(t *testing.T) {
+-	t.Skip("TODO: etcdserver.Sender may still dial closed remote endpoint and need some time to timeout.")
+-	if testing.Short() {
+-		t.Skip("not counting goroutines for leakage in -short mode")
+-	}
+-	gs := interestingGoroutines()
+-
+-	n := 0
+-	stackCount := make(map[string]int)
+-	for _, g := range gs {
+-		stackCount[g]++
+-		n++
+-	}
+-
+-	t.Logf("num goroutines = %d", n)
+-	if n > 0 {
+-		t.Error("Too many goroutines.")
+-		for stack, count := range stackCount {
+-			t.Logf("%d instances of:\n%s", count, stack)
+-		}
+-	}
+-}
+-
+-func afterTest(t *testing.T) {
+-	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+-	if testing.Short() {
+-		return
+-	}
+-	var bad string
+-	badSubstring := map[string]string{
+-		// TODO: there might exist a bug in http package, which will leave
+-		// readLoop without writeLoop after close all idle connections.
+-		// comment this line until we have time to dig into it.
+-		// ").readLoop(":                                  "a Transport",
+-		").writeLoop(":                                 "a Transport",
+-		"created by net/http/httptest.(*Server).Start": "an httptest.Server",
+-		"timeoutHandler":                               "a TimeoutHandler",
+-		// TODO: dial goroutines leaks even if the request is cancelled.
+-		// It needs to wait dial timeout to recycle the goroutine.
+-		// comment this line until we have time to dig into it.
+-		"net.(*netFD).connect(": "a timing out dial",
+-		").noteClientGone(":     "a closenotifier sender",
+-	}
+-	var stacks string
+-	for i := 0; i < 6; i++ {
+-		bad = ""
+-		stacks = strings.Join(interestingGoroutines(), "\n\n")
+-		for substr, what := range badSubstring {
+-			if strings.Contains(stacks, substr) {
+-				bad = what
+-			}
+-		}
+-		if bad == "" {
+-			return
+-		}
+-		// Bad stuff found, but goroutines might just still be
+-		// shutting down, so give it some time.
+-		time.Sleep(50 * time.Millisecond)
+-	}
+-	t.Errorf("Test appears to have leaked %s:\n%s", bad, stacks)
+-}

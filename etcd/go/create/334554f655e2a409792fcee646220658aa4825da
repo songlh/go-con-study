@@ -1,0 +1,57 @@
+commit 334554f655e2a409792fcee646220658aa4825da
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Fri Jul 14 13:26:58 2017 -0700
+
+    embed: wait up to request timeout for pending RPCs when closing
+    
+    Both grpc.Server.Stop and grpc.Server.GracefulStop close the listeners
+    first, to stop accepting the new connections. GracefulStop blocks until
+    all clients close their open transports(connections). Unary RPCs
+    only take a few seconds to finish. Stream RPCs, like watch, might never
+    close the connections from client side, thus making gRPC server wait
+    forever.
+    
+    This patch still calls GracefulStop, but waits up to 10s before manually
+    closing the open transports.
+    
+    Address https://github.com/coreos/etcd/issues/8224.
+    
+    Signed-off-by: Gyu-Ho Lee <gyuhox@gmail.com>
+
+diff --git a/embed/etcd.go b/embed/etcd.go
+index 5b7a17c..c5c0d2d 100644
+--- a/embed/etcd.go
++++ b/embed/etcd.go
+@@ -192,11 +192,29 @@ func (e *Etcd) Config() Config {
+ func (e *Etcd) Close() {
+ 	e.closeOnce.Do(func() { close(e.stopc) })
+ 
+-	// (gRPC server) stops accepting new connections,
+-	// RPCs, and blocks until all pending RPCs are finished
++	timeout := 2 * time.Second
++	if e.Server != nil {
++		timeout = e.Server.Cfg.ReqTimeout()
++	}
+ 	for _, sctx := range e.sctxs {
+ 		for gs := range sctx.grpcServerC {
+-			gs.GracefulStop()
++			ch := make(chan struct{})
++			go func() {
++				defer close(ch)
++				// close listeners to stop accepting new connections,
++				// will block on any existing transports
++				gs.GracefulStop()
++			}()
++			// wait until all pending RPCs are finished
++			select {
++			case <-ch:
++			case <-time.After(timeout):
++				// took too long, manually close open transports
++				// e.g. watch streams
++				gs.Stop()
++				// concurrent GracefulStop should be interrupted
++				<-ch
++			}
+ 		}
+ 	}
+ 

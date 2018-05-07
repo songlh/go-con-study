@@ -1,0 +1,139 @@
+commit e9d5f753230923cb685cd592d136939eca66c62a
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Fri Jul 21 16:24:17 2017 -0700
+
+    e2e/docker: docker image for testing wildcard DNS
+
+diff --git a/e2e/docker/Dockerfile b/e2e/docker/Dockerfile
+new file mode 100644
+index 0000000..c94e161
+--- /dev/null
++++ b/e2e/docker/Dockerfile
+@@ -0,0 +1,12 @@
++FROM golang:1.8.3-stretch
++LABEL Description="Image for etcd DNS testing"
++RUN apt update -y
++RUN go get github.com/mattn/goreman
++RUN apt install -y bind9
++RUN mkdir /var/bind
++RUN chown bind /var/bind
++ADD Procfile.tls /Procfile.tls
++ADD run.sh /run.sh
++ADD named.conf etcd.zone rdns.zone /etc/bind/
++ADD resolv.conf /etc/resolv.conf
++CMD ["/run.sh"]
+\ No newline at end of file
+diff --git a/e2e/docker/Makefile b/e2e/docker/Makefile
+new file mode 100644
+index 0000000..7ec14d4
+--- /dev/null
++++ b/e2e/docker/Makefile
+@@ -0,0 +1,7 @@
++# run makefile from repo root
++
++docker-dns-build:
++	docker build -t etcd-dns e2e/docker/
++
++docker-dns-test: docker-dns-build
++	docker run --dns 127.0.0.1 --rm -v `pwd`/bin/:/etcd -v `pwd`/integration/fixtures:/certs -w /etcd -t etcd-dns
+diff --git a/e2e/docker/Procfile.tls b/e2e/docker/Procfile.tls
+new file mode 100644
+index 0000000..d8b7902
+--- /dev/null
++++ b/e2e/docker/Procfile.tls
+@@ -0,0 +1,6 @@
++# Use goreman to run `go get github.com/mattn/goreman`
++etcd1: ./etcd --name infra1 --listen-client-urls https://127.0.0.1:2379 --advertise-client-urls https://m1.etcd.local:2379 --listen-peer-urls https://127.0.0.1:12380 --initial-advertise-peer-urls=https://m1.etcd.local:12380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt  --peer-key-file=/certs/server-wildcard.key.insecure --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
++
++etcd2: ./etcd --name infra2 --listen-client-urls https://127.0.0.1:22379 --advertise-client-urls https://m2.etcd.local:22379 --listen-peer-urls https://127.0.0.1:22380 --initial-advertise-peer-urls=https://m2.etcd.local:22380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt -peer-key-file=/certs/server-wildcard.key.insecure  --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
++
++etcd3: ./etcd --name infra3 --listen-client-urls https://127.0.0.1:32379 --advertise-client-urls https://m3.etcd.local:32379 --listen-peer-urls https://127.0.0.1:32380 --initial-advertise-peer-urls=https://m3.etcd.local:32380 --initial-cluster-token etcd-cluster-1 --initial-cluster=infra1=https://m1.etcd.local:12380,infra2=https://m2.etcd.local:22380,infra3=https://m3.etcd.local:32380 --initial-cluster-state new --enable-pprof --peer-cert-file=/certs/server-wildcard.crt  --peer-key-file=/certs/server-wildcard.key.insecure --peer-client-cert-auth --cert-file=/certs/server-wildcard.crt --key-file=/certs/server-wildcard.key.insecure --peer-trusted-ca-file=/certs/ca.crt   --trusted-ca-file=/certs/ca.crt
+diff --git a/e2e/docker/etcd.zone b/e2e/docker/etcd.zone
+new file mode 100644
+index 0000000..03c15fe
+--- /dev/null
++++ b/e2e/docker/etcd.zone
+@@ -0,0 +1,14 @@
++$TTL    86400
++@   IN  SOA  etcdns.local. root.etcdns.local. (
++             100500     ; Serial
++             604800     ; Refresh
++              86400     ; Retry
++            2419200     ; Expire
++              86400 )   ; Negative Cache TTL
++    IN  NS  ns.etcdns.local.
++    IN  A   127.0.0.1
++
++ns IN A 127.0.0.1
++m1 IN A 127.0.0.1
++m2 IN A 127.0.0.1
++m3 IN A 127.0.0.1
+diff --git a/e2e/docker/named.conf b/e2e/docker/named.conf
+new file mode 100644
+index 0000000..8354930
+--- /dev/null
++++ b/e2e/docker/named.conf
+@@ -0,0 +1,23 @@
++options {
++        directory "/var/bind";
++        listen-on { 127.0.0.1; };
++        listen-on-v6 { none; };
++        allow-transfer {
++                none;
++        };
++        // If you have problems and are behind a firewall:
++        query-source address * port 53;
++        pid-file "/var/run/named/named.pid";
++        allow-recursion { none; };
++        recursion no;
++};
++
++zone "etcd.local" IN {
++      type master;
++      file "/etc/bind/etcd.zone";
++};
++
++zone "0.0.127.in-addr.arpa" {
++      type master;
++      file "/etc/bind/rdns.zone";
++};
+diff --git a/e2e/docker/rdns.zone b/e2e/docker/rdns.zone
+new file mode 100644
+index 0000000..fb71b30
+--- /dev/null
++++ b/e2e/docker/rdns.zone
+@@ -0,0 +1,13 @@
++$TTL    86400
++@   IN  SOA  etcdns.local. root.etcdns.local. (
++             100500     ; Serial
++             604800     ; Refresh
++              86400     ; Retry
++            2419200     ; Expire
++              86400 )   ; Negative Cache TTL
++    IN  NS  ns.etcdns.local.
++    IN  A   127.0.0.1
++
++1 IN PTR m1.etcd.local.
++1 IN PTR m2.etcd.local.
++1 IN PTR m3.etcd.local.
+diff --git a/e2e/docker/resolv.conf b/e2e/docker/resolv.conf
+new file mode 100644
+index 0000000..bbc8559
+--- /dev/null
++++ b/e2e/docker/resolv.conf
+@@ -0,0 +1 @@
++nameserver 127.0.0.1
+diff --git a/e2e/docker/run.sh b/e2e/docker/run.sh
+new file mode 100755
+index 0000000..e020bcb
+--- /dev/null
++++ b/e2e/docker/run.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++
++/etc/init.d/bind9 start
++# get rid of hosts so go lookup won't resolve 127.0.0.1 to localhost
++cat /dev/null >/etc/hosts
++goreman -f /Procfile.tls start &
++sleep 5s
++ETCDCTL_API=3 ./etcdctl --cacert=/certs/ca.crt --endpoints=https://m1.etcd.local:2379 put abc def

@@ -1,0 +1,1629 @@
+commit 46b9844ca559bac46f34ecdedbd25b19330ca718
+Author: Gyuho Lee <gyuhox@gmail.com>
+Date:   Thu Jan 25 14:57:00 2018 -0800
+
+    *: move "alarm,compactor" to "internal/*"
+    
+    Signed-off-by: Gyuho Lee <gyuhox@gmail.com>
+
+diff --git a/CHANGELOG-3.4.md b/CHANGELOG-3.4.md
+index 1f09b1b..24dfabf 100644
+--- a/CHANGELOG-3.4.md
++++ b/CHANGELOG-3.4.md
+@@ -22,8 +22,10 @@
+   - Remove recursive symlinks in `cmd` directory.
+   - Now `go get/install/build` on `etcd` packages (e.g. `clientv3`, `tools/benchmark`) enforce builds with etcd `vendor` directory.
+ - Reorganize [internal packages](https://github.com/coreos/etcd/issues/9220).
+-  - Rename `"github.com/coreos/etcd/snap"` to [`"github.com/coreos/etcd/internal/raftsnap"`](https://github.com/coreos/etcd/pull/9211).
+-  - Rename `"github.com/coreos/etcd/discovery"` to [`"github.com/coreos/etcd/internal/discovery"`](https://github.com/coreos/etcd/pull/9233).
++  - Move `"github.com/coreos/etcd/alarm"` to [`"github.com/coreos/etcd/internal/alarm"`](https://github.com/coreos/etcd/pull/9234).
++  - Move `"github.com/coreos/etcd/compactor"` to [`"github.com/coreos/etcd/internal/compactor"`](https://github.com/coreos/etcd/pull/9234).
++  - Move `"github.com/coreos/etcd/discovery"` to [`"github.com/coreos/etcd/internal/discovery"`](https://github.com/coreos/etcd/pull/9233).
++  - Move `"github.com/coreos/etcd/snap"` to [`"github.com/coreos/etcd/internal/raftsnap"`](https://github.com/coreos/etcd/pull/9211).
+ 
+ ### Added(API)
+ 
+diff --git a/alarm/alarms.go b/alarm/alarms.go
+deleted file mode 100644
+index 4f0ebe9..0000000
+--- a/alarm/alarms.go
++++ /dev/null
+@@ -1,152 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-// Package alarm manages health status alarms in etcd.
+-package alarm
+-
+-import (
+-	"sync"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"github.com/coreos/etcd/mvcc/backend"
+-	"github.com/coreos/etcd/pkg/types"
+-	"github.com/coreos/pkg/capnslog"
+-)
+-
+-var (
+-	alarmBucketName = []byte("alarm")
+-	plog            = capnslog.NewPackageLogger("github.com/coreos/etcd", "alarm")
+-)
+-
+-type BackendGetter interface {
+-	Backend() backend.Backend
+-}
+-
+-type alarmSet map[types.ID]*pb.AlarmMember
+-
+-// AlarmStore persists alarms to the backend.
+-type AlarmStore struct {
+-	mu    sync.Mutex
+-	types map[pb.AlarmType]alarmSet
+-
+-	bg BackendGetter
+-}
+-
+-func NewAlarmStore(bg BackendGetter) (*AlarmStore, error) {
+-	ret := &AlarmStore{types: make(map[pb.AlarmType]alarmSet), bg: bg}
+-	err := ret.restore()
+-	return ret, err
+-}
+-
+-func (a *AlarmStore) Activate(id types.ID, at pb.AlarmType) *pb.AlarmMember {
+-	a.mu.Lock()
+-	defer a.mu.Unlock()
+-
+-	newAlarm := &pb.AlarmMember{MemberID: uint64(id), Alarm: at}
+-	if m := a.addToMap(newAlarm); m != newAlarm {
+-		return m
+-	}
+-
+-	v, err := newAlarm.Marshal()
+-	if err != nil {
+-		plog.Panicf("failed to marshal alarm member")
+-	}
+-
+-	b := a.bg.Backend()
+-	b.BatchTx().Lock()
+-	b.BatchTx().UnsafePut(alarmBucketName, v, nil)
+-	b.BatchTx().Unlock()
+-
+-	return newAlarm
+-}
+-
+-func (a *AlarmStore) Deactivate(id types.ID, at pb.AlarmType) *pb.AlarmMember {
+-	a.mu.Lock()
+-	defer a.mu.Unlock()
+-
+-	t := a.types[at]
+-	if t == nil {
+-		t = make(alarmSet)
+-		a.types[at] = t
+-	}
+-	m := t[id]
+-	if m == nil {
+-		return nil
+-	}
+-
+-	delete(t, id)
+-
+-	v, err := m.Marshal()
+-	if err != nil {
+-		plog.Panicf("failed to marshal alarm member")
+-	}
+-
+-	b := a.bg.Backend()
+-	b.BatchTx().Lock()
+-	b.BatchTx().UnsafeDelete(alarmBucketName, v)
+-	b.BatchTx().Unlock()
+-
+-	return m
+-}
+-
+-func (a *AlarmStore) Get(at pb.AlarmType) (ret []*pb.AlarmMember) {
+-	a.mu.Lock()
+-	defer a.mu.Unlock()
+-	if at == pb.AlarmType_NONE {
+-		for _, t := range a.types {
+-			for _, m := range t {
+-				ret = append(ret, m)
+-			}
+-		}
+-		return ret
+-	}
+-	for _, m := range a.types[at] {
+-		ret = append(ret, m)
+-	}
+-	return ret
+-}
+-
+-func (a *AlarmStore) restore() error {
+-	b := a.bg.Backend()
+-	tx := b.BatchTx()
+-
+-	tx.Lock()
+-	tx.UnsafeCreateBucket(alarmBucketName)
+-	err := tx.UnsafeForEach(alarmBucketName, func(k, v []byte) error {
+-		var m pb.AlarmMember
+-		if err := m.Unmarshal(k); err != nil {
+-			return err
+-		}
+-		a.addToMap(&m)
+-		return nil
+-	})
+-	tx.Unlock()
+-
+-	b.ForceCommit()
+-	return err
+-}
+-
+-func (a *AlarmStore) addToMap(newAlarm *pb.AlarmMember) *pb.AlarmMember {
+-	t := a.types[newAlarm.Alarm]
+-	if t == nil {
+-		t = make(alarmSet)
+-		a.types[newAlarm.Alarm] = t
+-	}
+-	m := t[types.ID(newAlarm.MemberID)]
+-	if m != nil {
+-		return m
+-	}
+-	t[types.ID(newAlarm.MemberID)] = newAlarm
+-	return newAlarm
+-}
+diff --git a/compactor/compactor.go b/compactor/compactor.go
+deleted file mode 100644
+index c057225..0000000
+--- a/compactor/compactor.go
++++ /dev/null
+@@ -1,68 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package compactor
+-
+-import (
+-	"context"
+-	"fmt"
+-	"time"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-
+-	"github.com/coreos/pkg/capnslog"
+-)
+-
+-var (
+-	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "compactor")
+-)
+-
+-const (
+-	checkCompactionInterval = 5 * time.Minute
+-
+-	ModePeriodic = "periodic"
+-	ModeRevision = "revision"
+-)
+-
+-// Compactor purges old log from the storage periodically.
+-type Compactor interface {
+-	// Run starts the main loop of the compactor in background.
+-	// Use Stop() to halt the loop and release the resource.
+-	Run()
+-	// Stop halts the main loop of the compactor.
+-	Stop()
+-	// Pause temporally suspend the compactor not to run compaction. Resume() to unpose.
+-	Pause()
+-	// Resume restarts the compactor suspended by Pause().
+-	Resume()
+-}
+-
+-type Compactable interface {
+-	Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error)
+-}
+-
+-type RevGetter interface {
+-	Rev() int64
+-}
+-
+-func New(mode string, retention time.Duration, rg RevGetter, c Compactable) (Compactor, error) {
+-	switch mode {
+-	case ModePeriodic:
+-		return NewPeriodic(retention, rg, c), nil
+-	case ModeRevision:
+-		return NewRevision(int64(retention), rg, c), nil
+-	default:
+-		return nil, fmt.Errorf("unsupported compaction mode %s", mode)
+-	}
+-}
+diff --git a/compactor/compactor_test.go b/compactor/compactor_test.go
+deleted file mode 100644
+index c3db1c1..0000000
+--- a/compactor/compactor_test.go
++++ /dev/null
+@@ -1,47 +0,0 @@
+-// Copyright 2015 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package compactor
+-
+-import (
+-	"context"
+-	"sync/atomic"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"github.com/coreos/etcd/pkg/testutil"
+-)
+-
+-type fakeCompactable struct {
+-	testutil.Recorder
+-}
+-
+-func (fc *fakeCompactable) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {
+-	fc.Record(testutil.Action{Name: "c", Params: []interface{}{r}})
+-	return &pb.CompactionResponse{}, nil
+-}
+-
+-type fakeRevGetter struct {
+-	testutil.Recorder
+-	rev int64
+-}
+-
+-func (fr *fakeRevGetter) Rev() int64 {
+-	fr.Record(testutil.Action{Name: "g"})
+-	rev := atomic.AddInt64(&fr.rev, 1)
+-	return rev
+-}
+-
+-func (fr *fakeRevGetter) SetRev(rev int64) {
+-	atomic.StoreInt64(&fr.rev, rev)
+-}
+diff --git a/compactor/doc.go b/compactor/doc.go
+deleted file mode 100644
+index cb15834..0000000
+--- a/compactor/doc.go
++++ /dev/null
+@@ -1,16 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-// Package compactor implements automated policies for compacting etcd's mvcc storage.
+-package compactor
+diff --git a/compactor/periodic.go b/compactor/periodic.go
+deleted file mode 100644
+index 447352e..0000000
+--- a/compactor/periodic.go
++++ /dev/null
+@@ -1,122 +0,0 @@
+-// Copyright 2017 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package compactor
+-
+-import (
+-	"context"
+-	"sync"
+-	"time"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"github.com/coreos/etcd/mvcc"
+-
+-	"github.com/jonboulle/clockwork"
+-)
+-
+-// Periodic compacts the log by purging revisions older than
+-// the configured retention time.
+-type Periodic struct {
+-	clock  clockwork.Clock
+-	period time.Duration
+-
+-	rg RevGetter
+-	c  Compactable
+-
+-	revs   []int64
+-	ctx    context.Context
+-	cancel context.CancelFunc
+-
+-	// mu protects paused
+-	mu     sync.RWMutex
+-	paused bool
+-}
+-
+-// NewPeriodic creates a new instance of Periodic compactor that purges
+-// the log older than h Duration.
+-func NewPeriodic(h time.Duration, rg RevGetter, c Compactable) *Periodic {
+-	return &Periodic{
+-		clock:  clockwork.NewRealClock(),
+-		period: h,
+-		rg:     rg,
+-		c:      c,
+-	}
+-}
+-
+-// periodDivisor divides Periodic.period in into checkCompactInterval duration
+-const periodDivisor = 10
+-
+-func (t *Periodic) Run() {
+-	t.ctx, t.cancel = context.WithCancel(context.Background())
+-	t.revs = make([]int64, 0)
+-	clock := t.clock
+-	checkCompactInterval := t.period / time.Duration(periodDivisor)
+-	go func() {
+-		last := clock.Now()
+-		for {
+-			t.revs = append(t.revs, t.rg.Rev())
+-			select {
+-			case <-t.ctx.Done():
+-				return
+-			case <-clock.After(checkCompactInterval):
+-				t.mu.Lock()
+-				p := t.paused
+-				t.mu.Unlock()
+-				if p {
+-					continue
+-				}
+-			}
+-			if clock.Now().Sub(last) < t.period {
+-				continue
+-			}
+-			rev, remaining := t.getRev()
+-			if rev < 0 {
+-				continue
+-			}
+-			plog.Noticef("Starting auto-compaction at revision %d (retention: %v)", rev, t.period)
+-			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
+-			if err == nil || err == mvcc.ErrCompacted {
+-				t.revs = remaining
+-				plog.Noticef("Finished auto-compaction at revision %d", rev)
+-			} else {
+-				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
+-				plog.Noticef("Retry after %v", checkCompactInterval)
+-			}
+-		}
+-	}()
+-}
+-
+-func (t *Periodic) Stop() {
+-	t.cancel()
+-}
+-
+-func (t *Periodic) Pause() {
+-	t.mu.Lock()
+-	defer t.mu.Unlock()
+-	t.paused = true
+-}
+-
+-func (t *Periodic) Resume() {
+-	t.mu.Lock()
+-	defer t.mu.Unlock()
+-	t.paused = false
+-}
+-
+-func (t *Periodic) getRev() (int64, []int64) {
+-	i := len(t.revs) - periodDivisor
+-	if i < 0 {
+-		return -1, t.revs
+-	}
+-	return t.revs[i], t.revs[i+1:]
+-}
+diff --git a/compactor/periodic_test.go b/compactor/periodic_test.go
+deleted file mode 100644
+index 19abd4f..0000000
+--- a/compactor/periodic_test.go
++++ /dev/null
+@@ -1,116 +0,0 @@
+-// Copyright 2015 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package compactor
+-
+-import (
+-	"reflect"
+-	"testing"
+-	"time"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"github.com/coreos/etcd/pkg/testutil"
+-	"github.com/jonboulle/clockwork"
+-)
+-
+-func TestPeriodic(t *testing.T) {
+-	retentionHours := 2
+-	retentionDuration := time.Duration(retentionHours) * time.Hour
+-
+-	fc := clockwork.NewFakeClock()
+-	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
+-	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+-	tb := &Periodic{
+-		clock:  fc,
+-		period: retentionDuration,
+-		rg:     rg,
+-		c:      compactable,
+-	}
+-
+-	tb.Run()
+-	defer tb.Stop()
+-	checkCompactInterval := retentionDuration / time.Duration(periodDivisor)
+-	n := periodDivisor
+-	// simulate 5 hours worth of intervals.
+-	for i := 0; i < n/retentionHours*5; i++ {
+-		rg.Wait(1)
+-		fc.Advance(checkCompactInterval)
+-		// compaction doesn't happen til 2 hours elapses.
+-		if i < n {
+-			continue
+-		}
+-		// after 2 hours, compaction happens at every checkCompactInterval.
+-		a, err := compactable.Wait(1)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		expectedRevision := int64(i + 1 - n)
+-		if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
+-			t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+-		}
+-	}
+-
+-	// unblock the rev getter, so we can stop the compactor routine.
+-	_, err := rg.Wait(1)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-}
+-
+-func TestPeriodicPause(t *testing.T) {
+-	fc := clockwork.NewFakeClock()
+-	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+-	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
+-	retentionDuration := time.Hour
+-	tb := &Periodic{
+-		clock:  fc,
+-		period: retentionDuration,
+-		rg:     rg,
+-		c:      compactable,
+-	}
+-
+-	tb.Run()
+-	tb.Pause()
+-
+-	// tb will collect 3 hours of revisions but not compact since paused
+-	checkCompactInterval := retentionDuration / time.Duration(periodDivisor)
+-	n := periodDivisor
+-	for i := 0; i < 3*n; i++ {
+-		rg.Wait(1)
+-		fc.Advance(checkCompactInterval)
+-	}
+-	// tb ends up waiting for the clock
+-
+-	select {
+-	case a := <-compactable.Chan():
+-		t.Fatalf("unexpected action %v", a)
+-	case <-time.After(10 * time.Millisecond):
+-	}
+-
+-	// tb resumes to being blocked on the clock
+-	tb.Resume()
+-
+-	// unblock clock, will kick off a compaction at hour 3:06
+-	rg.Wait(1)
+-	fc.Advance(checkCompactInterval)
+-	a, err := compactable.Wait(1)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	// compact the revision from hour 2:06
+-	wreq := &pb.CompactionRequest{Revision: int64(1 + 2*n + 1)}
+-	if !reflect.DeepEqual(a[0].Params[0], wreq) {
+-		t.Errorf("compact request = %v, want %v", a[0].Params[0], wreq.Revision)
+-	}
+-}
+diff --git a/compactor/revision.go b/compactor/revision.go
+deleted file mode 100644
+index 4a87614..0000000
+--- a/compactor/revision.go
++++ /dev/null
+@@ -1,106 +0,0 @@
+-// Copyright 2017 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package compactor
+-
+-import (
+-	"context"
+-	"sync"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"github.com/coreos/etcd/mvcc"
+-
+-	"github.com/jonboulle/clockwork"
+-)
+-
+-// Revision compacts the log by purging revisions older than
+-// the configured reivison number. Compaction happens every 5 minutes.
+-type Revision struct {
+-	clock     clockwork.Clock
+-	retention int64
+-
+-	rg RevGetter
+-	c  Compactable
+-
+-	ctx    context.Context
+-	cancel context.CancelFunc
+-
+-	mu     sync.Mutex
+-	paused bool
+-}
+-
+-// NewRevision creates a new instance of Revisonal compactor that purges
+-// the log older than retention revisions from the current revision.
+-func NewRevision(retention int64, rg RevGetter, c Compactable) *Revision {
+-	return &Revision{
+-		clock:     clockwork.NewRealClock(),
+-		retention: retention,
+-		rg:        rg,
+-		c:         c,
+-	}
+-}
+-
+-func (t *Revision) Run() {
+-	t.ctx, t.cancel = context.WithCancel(context.Background())
+-	clock := t.clock
+-	previous := int64(0)
+-
+-	go func() {
+-		for {
+-			select {
+-			case <-t.ctx.Done():
+-				return
+-			case <-clock.After(checkCompactionInterval):
+-				t.mu.Lock()
+-				p := t.paused
+-				t.mu.Unlock()
+-				if p {
+-					continue
+-				}
+-			}
+-
+-			rev := t.rg.Rev() - t.retention
+-
+-			if rev <= 0 || rev == previous {
+-				continue
+-			}
+-
+-			plog.Noticef("Starting auto-compaction at revision %d (retention: %d revisions)", rev, t.retention)
+-			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
+-			if err == nil || err == mvcc.ErrCompacted {
+-				previous = rev
+-				plog.Noticef("Finished auto-compaction at revision %d", rev)
+-			} else {
+-				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
+-				plog.Noticef("Retry after %v", checkCompactionInterval)
+-			}
+-		}
+-	}()
+-}
+-
+-func (t *Revision) Stop() {
+-	t.cancel()
+-}
+-
+-func (t *Revision) Pause() {
+-	t.mu.Lock()
+-	defer t.mu.Unlock()
+-	t.paused = true
+-}
+-
+-func (t *Revision) Resume() {
+-	t.mu.Lock()
+-	defer t.mu.Unlock()
+-	t.paused = false
+-}
+diff --git a/compactor/revision_test.go b/compactor/revision_test.go
+deleted file mode 100644
+index 3c52f94..0000000
+--- a/compactor/revision_test.go
++++ /dev/null
+@@ -1,116 +0,0 @@
+-// Copyright 2017 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package compactor
+-
+-import (
+-	"reflect"
+-	"testing"
+-	"time"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"github.com/coreos/etcd/pkg/testutil"
+-	"github.com/jonboulle/clockwork"
+-)
+-
+-func TestRevision(t *testing.T) {
+-	fc := clockwork.NewFakeClock()
+-	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
+-	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+-	tb := &Revision{
+-		clock:     fc,
+-		retention: 10,
+-		rg:        rg,
+-		c:         compactable,
+-	}
+-
+-	tb.Run()
+-	defer tb.Stop()
+-
+-	fc.Advance(checkCompactionInterval)
+-	rg.Wait(1)
+-	// nothing happens
+-
+-	rg.SetRev(99) // will be 100
+-	expectedRevision := int64(90)
+-	fc.Advance(checkCompactionInterval)
+-	rg.Wait(1)
+-	a, err := compactable.Wait(1)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
+-		t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+-	}
+-
+-	// skip the same revision
+-	rg.SetRev(99) // will be 100
+-	rg.Wait(1)
+-	// nothing happens
+-
+-	rg.SetRev(199) // will be 200
+-	expectedRevision = int64(190)
+-	fc.Advance(checkCompactionInterval)
+-	rg.Wait(1)
+-	a, err = compactable.Wait(1)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
+-		t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
+-	}
+-}
+-
+-func TestRevisionPause(t *testing.T) {
+-	fc := clockwork.NewFakeClock()
+-	compactable := &fakeCompactable{testutil.NewRecorderStream()}
+-	rg := &fakeRevGetter{testutil.NewRecorderStream(), 99} // will be 100
+-	tb := &Revision{
+-		clock:     fc,
+-		retention: 10,
+-		rg:        rg,
+-		c:         compactable,
+-	}
+-
+-	tb.Run()
+-	tb.Pause()
+-
+-	// tb will collect 3 hours of revisions but not compact since paused
+-	n := int(time.Hour / checkCompactionInterval)
+-	for i := 0; i < 3*n; i++ {
+-		fc.Advance(checkCompactionInterval)
+-	}
+-	// tb ends up waiting for the clock
+-
+-	select {
+-	case a := <-compactable.Chan():
+-		t.Fatalf("unexpected action %v", a)
+-	case <-time.After(10 * time.Millisecond):
+-	}
+-
+-	// tb resumes to being blocked on the clock
+-	tb.Resume()
+-
+-	// unblock clock, will kick off a compaction at hour 3:05
+-	fc.Advance(checkCompactionInterval)
+-	rg.Wait(1)
+-	a, err := compactable.Wait(1)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	wreq := &pb.CompactionRequest{Revision: int64(90)}
+-	if !reflect.DeepEqual(a[0].Params[0], wreq) {
+-		t.Errorf("compact request = %v, want %v", a[0].Params[0], wreq.Revision)
+-	}
+-}
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 4bf6ede..981e688 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -29,15 +29,15 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
+-	"github.com/coreos/etcd/alarm"
+ 	"github.com/coreos/etcd/auth"
+-	"github.com/coreos/etcd/compactor"
+ 	"github.com/coreos/etcd/discovery"
+ 	"github.com/coreos/etcd/etcdserver/api"
+ 	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+ 	"github.com/coreos/etcd/etcdserver/membership"
+ 	"github.com/coreos/etcd/etcdserver/stats"
++	"github.com/coreos/etcd/internal/alarm"
++	"github.com/coreos/etcd/internal/compactor"
+ 	"github.com/coreos/etcd/internal/raftsnap"
+ 	"github.com/coreos/etcd/lease"
+ 	"github.com/coreos/etcd/lease/leasehttp"
+diff --git a/internal/alarm/alarms.go b/internal/alarm/alarms.go
+new file mode 100644
+index 0000000..4f0ebe9
+--- /dev/null
++++ b/internal/alarm/alarms.go
+@@ -0,0 +1,152 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package alarm manages health status alarms in etcd.
++package alarm
++
++import (
++	"sync"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/mvcc/backend"
++	"github.com/coreos/etcd/pkg/types"
++	"github.com/coreos/pkg/capnslog"
++)
++
++var (
++	alarmBucketName = []byte("alarm")
++	plog            = capnslog.NewPackageLogger("github.com/coreos/etcd", "alarm")
++)
++
++type BackendGetter interface {
++	Backend() backend.Backend
++}
++
++type alarmSet map[types.ID]*pb.AlarmMember
++
++// AlarmStore persists alarms to the backend.
++type AlarmStore struct {
++	mu    sync.Mutex
++	types map[pb.AlarmType]alarmSet
++
++	bg BackendGetter
++}
++
++func NewAlarmStore(bg BackendGetter) (*AlarmStore, error) {
++	ret := &AlarmStore{types: make(map[pb.AlarmType]alarmSet), bg: bg}
++	err := ret.restore()
++	return ret, err
++}
++
++func (a *AlarmStore) Activate(id types.ID, at pb.AlarmType) *pb.AlarmMember {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++
++	newAlarm := &pb.AlarmMember{MemberID: uint64(id), Alarm: at}
++	if m := a.addToMap(newAlarm); m != newAlarm {
++		return m
++	}
++
++	v, err := newAlarm.Marshal()
++	if err != nil {
++		plog.Panicf("failed to marshal alarm member")
++	}
++
++	b := a.bg.Backend()
++	b.BatchTx().Lock()
++	b.BatchTx().UnsafePut(alarmBucketName, v, nil)
++	b.BatchTx().Unlock()
++
++	return newAlarm
++}
++
++func (a *AlarmStore) Deactivate(id types.ID, at pb.AlarmType) *pb.AlarmMember {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++
++	t := a.types[at]
++	if t == nil {
++		t = make(alarmSet)
++		a.types[at] = t
++	}
++	m := t[id]
++	if m == nil {
++		return nil
++	}
++
++	delete(t, id)
++
++	v, err := m.Marshal()
++	if err != nil {
++		plog.Panicf("failed to marshal alarm member")
++	}
++
++	b := a.bg.Backend()
++	b.BatchTx().Lock()
++	b.BatchTx().UnsafeDelete(alarmBucketName, v)
++	b.BatchTx().Unlock()
++
++	return m
++}
++
++func (a *AlarmStore) Get(at pb.AlarmType) (ret []*pb.AlarmMember) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if at == pb.AlarmType_NONE {
++		for _, t := range a.types {
++			for _, m := range t {
++				ret = append(ret, m)
++			}
++		}
++		return ret
++	}
++	for _, m := range a.types[at] {
++		ret = append(ret, m)
++	}
++	return ret
++}
++
++func (a *AlarmStore) restore() error {
++	b := a.bg.Backend()
++	tx := b.BatchTx()
++
++	tx.Lock()
++	tx.UnsafeCreateBucket(alarmBucketName)
++	err := tx.UnsafeForEach(alarmBucketName, func(k, v []byte) error {
++		var m pb.AlarmMember
++		if err := m.Unmarshal(k); err != nil {
++			return err
++		}
++		a.addToMap(&m)
++		return nil
++	})
++	tx.Unlock()
++
++	b.ForceCommit()
++	return err
++}
++
++func (a *AlarmStore) addToMap(newAlarm *pb.AlarmMember) *pb.AlarmMember {
++	t := a.types[newAlarm.Alarm]
++	if t == nil {
++		t = make(alarmSet)
++		a.types[newAlarm.Alarm] = t
++	}
++	m := t[types.ID(newAlarm.MemberID)]
++	if m != nil {
++		return m
++	}
++	t[types.ID(newAlarm.MemberID)] = newAlarm
++	return newAlarm
++}
+diff --git a/internal/compactor/compactor.go b/internal/compactor/compactor.go
+new file mode 100644
+index 0000000..c057225
+--- /dev/null
++++ b/internal/compactor/compactor.go
+@@ -0,0 +1,68 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package compactor
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++
++	"github.com/coreos/pkg/capnslog"
++)
++
++var (
++	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "compactor")
++)
++
++const (
++	checkCompactionInterval = 5 * time.Minute
++
++	ModePeriodic = "periodic"
++	ModeRevision = "revision"
++)
++
++// Compactor purges old log from the storage periodically.
++type Compactor interface {
++	// Run starts the main loop of the compactor in background.
++	// Use Stop() to halt the loop and release the resource.
++	Run()
++	// Stop halts the main loop of the compactor.
++	Stop()
++	// Pause temporally suspend the compactor not to run compaction. Resume() to unpose.
++	Pause()
++	// Resume restarts the compactor suspended by Pause().
++	Resume()
++}
++
++type Compactable interface {
++	Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error)
++}
++
++type RevGetter interface {
++	Rev() int64
++}
++
++func New(mode string, retention time.Duration, rg RevGetter, c Compactable) (Compactor, error) {
++	switch mode {
++	case ModePeriodic:
++		return NewPeriodic(retention, rg, c), nil
++	case ModeRevision:
++		return NewRevision(int64(retention), rg, c), nil
++	default:
++		return nil, fmt.Errorf("unsupported compaction mode %s", mode)
++	}
++}
+diff --git a/internal/compactor/compactor_test.go b/internal/compactor/compactor_test.go
+new file mode 100644
+index 0000000..c3db1c1
+--- /dev/null
++++ b/internal/compactor/compactor_test.go
+@@ -0,0 +1,47 @@
++// Copyright 2015 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package compactor
++
++import (
++	"context"
++	"sync/atomic"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/pkg/testutil"
++)
++
++type fakeCompactable struct {
++	testutil.Recorder
++}
++
++func (fc *fakeCompactable) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {
++	fc.Record(testutil.Action{Name: "c", Params: []interface{}{r}})
++	return &pb.CompactionResponse{}, nil
++}
++
++type fakeRevGetter struct {
++	testutil.Recorder
++	rev int64
++}
++
++func (fr *fakeRevGetter) Rev() int64 {
++	fr.Record(testutil.Action{Name: "g"})
++	rev := atomic.AddInt64(&fr.rev, 1)
++	return rev
++}
++
++func (fr *fakeRevGetter) SetRev(rev int64) {
++	atomic.StoreInt64(&fr.rev, rev)
++}
+diff --git a/internal/compactor/doc.go b/internal/compactor/doc.go
+new file mode 100644
+index 0000000..cb15834
+--- /dev/null
++++ b/internal/compactor/doc.go
+@@ -0,0 +1,16 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package compactor implements automated policies for compacting etcd's mvcc storage.
++package compactor
+diff --git a/internal/compactor/periodic.go b/internal/compactor/periodic.go
+new file mode 100644
+index 0000000..447352e
+--- /dev/null
++++ b/internal/compactor/periodic.go
+@@ -0,0 +1,122 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package compactor
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/mvcc"
++
++	"github.com/jonboulle/clockwork"
++)
++
++// Periodic compacts the log by purging revisions older than
++// the configured retention time.
++type Periodic struct {
++	clock  clockwork.Clock
++	period time.Duration
++
++	rg RevGetter
++	c  Compactable
++
++	revs   []int64
++	ctx    context.Context
++	cancel context.CancelFunc
++
++	// mu protects paused
++	mu     sync.RWMutex
++	paused bool
++}
++
++// NewPeriodic creates a new instance of Periodic compactor that purges
++// the log older than h Duration.
++func NewPeriodic(h time.Duration, rg RevGetter, c Compactable) *Periodic {
++	return &Periodic{
++		clock:  clockwork.NewRealClock(),
++		period: h,
++		rg:     rg,
++		c:      c,
++	}
++}
++
++// periodDivisor divides Periodic.period in into checkCompactInterval duration
++const periodDivisor = 10
++
++func (t *Periodic) Run() {
++	t.ctx, t.cancel = context.WithCancel(context.Background())
++	t.revs = make([]int64, 0)
++	clock := t.clock
++	checkCompactInterval := t.period / time.Duration(periodDivisor)
++	go func() {
++		last := clock.Now()
++		for {
++			t.revs = append(t.revs, t.rg.Rev())
++			select {
++			case <-t.ctx.Done():
++				return
++			case <-clock.After(checkCompactInterval):
++				t.mu.Lock()
++				p := t.paused
++				t.mu.Unlock()
++				if p {
++					continue
++				}
++			}
++			if clock.Now().Sub(last) < t.period {
++				continue
++			}
++			rev, remaining := t.getRev()
++			if rev < 0 {
++				continue
++			}
++			plog.Noticef("Starting auto-compaction at revision %d (retention: %v)", rev, t.period)
++			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
++			if err == nil || err == mvcc.ErrCompacted {
++				t.revs = remaining
++				plog.Noticef("Finished auto-compaction at revision %d", rev)
++			} else {
++				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
++				plog.Noticef("Retry after %v", checkCompactInterval)
++			}
++		}
++	}()
++}
++
++func (t *Periodic) Stop() {
++	t.cancel()
++}
++
++func (t *Periodic) Pause() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.paused = true
++}
++
++func (t *Periodic) Resume() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.paused = false
++}
++
++func (t *Periodic) getRev() (int64, []int64) {
++	i := len(t.revs) - periodDivisor
++	if i < 0 {
++		return -1, t.revs
++	}
++	return t.revs[i], t.revs[i+1:]
++}
+diff --git a/internal/compactor/periodic_test.go b/internal/compactor/periodic_test.go
+new file mode 100644
+index 0000000..19abd4f
+--- /dev/null
++++ b/internal/compactor/periodic_test.go
+@@ -0,0 +1,116 @@
++// Copyright 2015 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package compactor
++
++import (
++	"reflect"
++	"testing"
++	"time"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/pkg/testutil"
++	"github.com/jonboulle/clockwork"
++)
++
++func TestPeriodic(t *testing.T) {
++	retentionHours := 2
++	retentionDuration := time.Duration(retentionHours) * time.Hour
++
++	fc := clockwork.NewFakeClock()
++	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
++	compactable := &fakeCompactable{testutil.NewRecorderStream()}
++	tb := &Periodic{
++		clock:  fc,
++		period: retentionDuration,
++		rg:     rg,
++		c:      compactable,
++	}
++
++	tb.Run()
++	defer tb.Stop()
++	checkCompactInterval := retentionDuration / time.Duration(periodDivisor)
++	n := periodDivisor
++	// simulate 5 hours worth of intervals.
++	for i := 0; i < n/retentionHours*5; i++ {
++		rg.Wait(1)
++		fc.Advance(checkCompactInterval)
++		// compaction doesn't happen til 2 hours elapses.
++		if i < n {
++			continue
++		}
++		// after 2 hours, compaction happens at every checkCompactInterval.
++		a, err := compactable.Wait(1)
++		if err != nil {
++			t.Fatal(err)
++		}
++		expectedRevision := int64(i + 1 - n)
++		if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
++			t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
++		}
++	}
++
++	// unblock the rev getter, so we can stop the compactor routine.
++	_, err := rg.Wait(1)
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPeriodicPause(t *testing.T) {
++	fc := clockwork.NewFakeClock()
++	compactable := &fakeCompactable{testutil.NewRecorderStream()}
++	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
++	retentionDuration := time.Hour
++	tb := &Periodic{
++		clock:  fc,
++		period: retentionDuration,
++		rg:     rg,
++		c:      compactable,
++	}
++
++	tb.Run()
++	tb.Pause()
++
++	// tb will collect 3 hours of revisions but not compact since paused
++	checkCompactInterval := retentionDuration / time.Duration(periodDivisor)
++	n := periodDivisor
++	for i := 0; i < 3*n; i++ {
++		rg.Wait(1)
++		fc.Advance(checkCompactInterval)
++	}
++	// tb ends up waiting for the clock
++
++	select {
++	case a := <-compactable.Chan():
++		t.Fatalf("unexpected action %v", a)
++	case <-time.After(10 * time.Millisecond):
++	}
++
++	// tb resumes to being blocked on the clock
++	tb.Resume()
++
++	// unblock clock, will kick off a compaction at hour 3:06
++	rg.Wait(1)
++	fc.Advance(checkCompactInterval)
++	a, err := compactable.Wait(1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// compact the revision from hour 2:06
++	wreq := &pb.CompactionRequest{Revision: int64(1 + 2*n + 1)}
++	if !reflect.DeepEqual(a[0].Params[0], wreq) {
++		t.Errorf("compact request = %v, want %v", a[0].Params[0], wreq.Revision)
++	}
++}
+diff --git a/internal/compactor/revision.go b/internal/compactor/revision.go
+new file mode 100644
+index 0000000..4a87614
+--- /dev/null
++++ b/internal/compactor/revision.go
+@@ -0,0 +1,106 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package compactor
++
++import (
++	"context"
++	"sync"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/mvcc"
++
++	"github.com/jonboulle/clockwork"
++)
++
++// Revision compacts the log by purging revisions older than
++// the configured reivison number. Compaction happens every 5 minutes.
++type Revision struct {
++	clock     clockwork.Clock
++	retention int64
++
++	rg RevGetter
++	c  Compactable
++
++	ctx    context.Context
++	cancel context.CancelFunc
++
++	mu     sync.Mutex
++	paused bool
++}
++
++// NewRevision creates a new instance of Revisonal compactor that purges
++// the log older than retention revisions from the current revision.
++func NewRevision(retention int64, rg RevGetter, c Compactable) *Revision {
++	return &Revision{
++		clock:     clockwork.NewRealClock(),
++		retention: retention,
++		rg:        rg,
++		c:         c,
++	}
++}
++
++func (t *Revision) Run() {
++	t.ctx, t.cancel = context.WithCancel(context.Background())
++	clock := t.clock
++	previous := int64(0)
++
++	go func() {
++		for {
++			select {
++			case <-t.ctx.Done():
++				return
++			case <-clock.After(checkCompactionInterval):
++				t.mu.Lock()
++				p := t.paused
++				t.mu.Unlock()
++				if p {
++					continue
++				}
++			}
++
++			rev := t.rg.Rev() - t.retention
++
++			if rev <= 0 || rev == previous {
++				continue
++			}
++
++			plog.Noticef("Starting auto-compaction at revision %d (retention: %d revisions)", rev, t.retention)
++			_, err := t.c.Compact(t.ctx, &pb.CompactionRequest{Revision: rev})
++			if err == nil || err == mvcc.ErrCompacted {
++				previous = rev
++				plog.Noticef("Finished auto-compaction at revision %d", rev)
++			} else {
++				plog.Noticef("Failed auto-compaction at revision %d (%v)", rev, err)
++				plog.Noticef("Retry after %v", checkCompactionInterval)
++			}
++		}
++	}()
++}
++
++func (t *Revision) Stop() {
++	t.cancel()
++}
++
++func (t *Revision) Pause() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.paused = true
++}
++
++func (t *Revision) Resume() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.paused = false
++}
+diff --git a/internal/compactor/revision_test.go b/internal/compactor/revision_test.go
+new file mode 100644
+index 0000000..3c52f94
+--- /dev/null
++++ b/internal/compactor/revision_test.go
+@@ -0,0 +1,116 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package compactor
++
++import (
++	"reflect"
++	"testing"
++	"time"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/pkg/testutil"
++	"github.com/jonboulle/clockwork"
++)
++
++func TestRevision(t *testing.T) {
++	fc := clockwork.NewFakeClock()
++	rg := &fakeRevGetter{testutil.NewRecorderStream(), 0}
++	compactable := &fakeCompactable{testutil.NewRecorderStream()}
++	tb := &Revision{
++		clock:     fc,
++		retention: 10,
++		rg:        rg,
++		c:         compactable,
++	}
++
++	tb.Run()
++	defer tb.Stop()
++
++	fc.Advance(checkCompactionInterval)
++	rg.Wait(1)
++	// nothing happens
++
++	rg.SetRev(99) // will be 100
++	expectedRevision := int64(90)
++	fc.Advance(checkCompactionInterval)
++	rg.Wait(1)
++	a, err := compactable.Wait(1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
++		t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
++	}
++
++	// skip the same revision
++	rg.SetRev(99) // will be 100
++	rg.Wait(1)
++	// nothing happens
++
++	rg.SetRev(199) // will be 200
++	expectedRevision = int64(190)
++	fc.Advance(checkCompactionInterval)
++	rg.Wait(1)
++	a, err = compactable.Wait(1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision}) {
++		t.Errorf("compact request = %v, want %v", a[0].Params[0], &pb.CompactionRequest{Revision: expectedRevision})
++	}
++}
++
++func TestRevisionPause(t *testing.T) {
++	fc := clockwork.NewFakeClock()
++	compactable := &fakeCompactable{testutil.NewRecorderStream()}
++	rg := &fakeRevGetter{testutil.NewRecorderStream(), 99} // will be 100
++	tb := &Revision{
++		clock:     fc,
++		retention: 10,
++		rg:        rg,
++		c:         compactable,
++	}
++
++	tb.Run()
++	tb.Pause()
++
++	// tb will collect 3 hours of revisions but not compact since paused
++	n := int(time.Hour / checkCompactionInterval)
++	for i := 0; i < 3*n; i++ {
++		fc.Advance(checkCompactionInterval)
++	}
++	// tb ends up waiting for the clock
++
++	select {
++	case a := <-compactable.Chan():
++		t.Fatalf("unexpected action %v", a)
++	case <-time.After(10 * time.Millisecond):
++	}
++
++	// tb resumes to being blocked on the clock
++	tb.Resume()
++
++	// unblock clock, will kick off a compaction at hour 3:05
++	fc.Advance(checkCompactionInterval)
++	rg.Wait(1)
++	a, err := compactable.Wait(1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	wreq := &pb.CompactionRequest{Revision: int64(90)}
++	if !reflect.DeepEqual(a[0].Params[0], wreq) {
++		t.Errorf("compact request = %v, want %v", a[0].Params[0], wreq.Revision)
++	}
++}

@@ -1,0 +1,485 @@
+commit 48e36bbb842df34658ed9945582ad35c17cd8cce
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Mon Aug 10 13:28:12 2015 -0700
+
+    Godep: update capnslog dependency
+
+diff --git a/Godeps/Godeps.json b/Godeps/Godeps.json
+index 12528c7..b9a6917 100644
+--- a/Godeps/Godeps.json
++++ b/Godeps/Godeps.json
+@@ -42,13 +42,18 @@
+ 			"Rev": "cea488b4e6855fee89b6c22a811e3c5baca861b6"
+ 		},
+ 		{
++			"ImportPath": "github.com/coreos/go-systemd/journal",
++			"Comment": "v3-6-gcea488b",
++			"Rev": "cea488b4e6855fee89b6c22a811e3c5baca861b6"
++		},
++		{
+ 			"ImportPath": "github.com/coreos/go-systemd/util",
+ 			"Comment": "v3-6-gcea488b",
+ 			"Rev": "cea488b4e6855fee89b6c22a811e3c5baca861b6"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/coreos/pkg/capnslog",
+-			"Rev": "99f6e6b8f8ea30b0f82769c1411691c44a66d015"
++			"Rev": "6b7d4a60e79f6aa57a27591288f28e1dcd47a3bc"
+ 		},
+ 		{
+ 			"ImportPath": "github.com/gogo/protobuf/proto",
+diff --git a/Godeps/_workspace/src/github.com/coreos/go-systemd/journal/send.go b/Godeps/_workspace/src/github.com/coreos/go-systemd/journal/send.go
+new file mode 100644
+index 0000000..1620ae9
+--- /dev/null
++++ b/Godeps/_workspace/src/github.com/coreos/go-systemd/journal/send.go
+@@ -0,0 +1,166 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package journal provides write bindings to the systemd journal
++package journal
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"net"
++	"os"
++	"strconv"
++	"strings"
++	"syscall"
++)
++
++// Priority of a journal message
++type Priority int
++
++const (
++	PriEmerg Priority = iota
++	PriAlert
++	PriCrit
++	PriErr
++	PriWarning
++	PriNotice
++	PriInfo
++	PriDebug
++)
++
++var conn net.Conn
++
++func init() {
++	var err error
++	conn, err = net.Dial("unixgram", "/run/systemd/journal/socket")
++	if err != nil {
++		conn = nil
++	}
++}
++
++// Enabled returns true iff the systemd journal is available for logging
++func Enabled() bool {
++	return conn != nil
++}
++
++// Send a message to the systemd journal. vars is a map of journald fields to
++// values.  Fields must be composed of uppercase letters, numbers, and
++// underscores, but must not start with an underscore. Within these
++// restrictions, any arbitrary field name may be used.  Some names have special
++// significance: see the journalctl documentation
++// (http://www.freedesktop.org/software/systemd/man/systemd.journal-fields.html)
++// for more details.  vars may be nil.
++func Send(message string, priority Priority, vars map[string]string) error {
++	if conn == nil {
++		return journalError("could not connect to journald socket")
++	}
++
++	data := new(bytes.Buffer)
++	appendVariable(data, "PRIORITY", strconv.Itoa(int(priority)))
++	appendVariable(data, "MESSAGE", message)
++	for k, v := range vars {
++		appendVariable(data, k, v)
++	}
++
++	_, err := io.Copy(conn, data)
++	if err != nil && isSocketSpaceError(err) {
++		file, err := tempFd()
++		if err != nil {
++			return journalError(err.Error())
++		}
++		_, err = io.Copy(file, data)
++		if err != nil {
++			return journalError(err.Error())
++		}
++
++		rights := syscall.UnixRights(int(file.Fd()))
++
++		/* this connection should always be a UnixConn, but better safe than sorry */
++		unixConn, ok := conn.(*net.UnixConn)
++		if !ok {
++			return journalError("can't send file through non-Unix connection")
++		}
++		unixConn.WriteMsgUnix([]byte{}, rights, nil)
++	} else if err != nil {
++		return journalError(err.Error())
++	}
++	return nil
++}
++
++func appendVariable(w io.Writer, name, value string) {
++	if !validVarName(name) {
++		journalError("variable name contains invalid character, ignoring")
++	}
++	if strings.ContainsRune(value, '\n') {
++		/* When the value contains a newline, we write:
++		 * - the variable name, followed by a newline
++		 * - the size (in 64bit little endian format)
++		 * - the data, followed by a newline
++		 */
++		fmt.Fprintln(w, name)
++		binary.Write(w, binary.LittleEndian, uint64(len(value)))
++		fmt.Fprintln(w, value)
++	} else {
++		/* just write the variable and value all on one line */
++		fmt.Fprintf(w, "%s=%s\n", name, value)
++	}
++}
++
++func validVarName(name string) bool {
++	/* The variable name must be in uppercase and consist only of characters,
++	 * numbers and underscores, and may not begin with an underscore. (from the docs)
++	 */
++
++	valid := name[0] != '_'
++	for _, c := range name {
++		valid = valid && ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9') || c == '_'
++	}
++	return valid
++}
++
++func isSocketSpaceError(err error) bool {
++	opErr, ok := err.(*net.OpError)
++	if !ok {
++		return false
++	}
++
++	sysErr, ok := opErr.Err.(syscall.Errno)
++	if !ok {
++		return false
++	}
++
++	return sysErr == syscall.EMSGSIZE || sysErr == syscall.ENOBUFS
++}
++
++func tempFd() (*os.File, error) {
++	file, err := ioutil.TempFile("/dev/shm/", "journal.XXXXX")
++	if err != nil {
++		return nil, err
++	}
++	syscall.Unlink(file.Name())
++	if err != nil {
++		return nil, err
++	}
++	return file, nil
++}
++
++func journalError(s string) error {
++	s = "journal error: " + s
++	fmt.Fprintln(os.Stderr, s)
++	return errors.New(s)
++}
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/example/hello_dolly.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/example/hello_dolly.go
+index e1260f0..450288d 100644
+--- a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/example/hello_dolly.go
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/example/hello_dolly.go
+@@ -17,7 +17,6 @@ package main
+ import (
+ 	"flag"
+ 	oldlog "log"
+-	"os"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/coreos/pkg/capnslog"
+ )
+@@ -32,7 +31,6 @@ func init() {
+ 
+ func main() {
+ 	rl := capnslog.MustRepoLogger("github.com/coreos/pkg/capnslog/cmd")
+-	capnslog.SetFormatter(capnslog.NewStringFormatter(os.Stderr))
+ 
+ 	// We can parse the log level configs from the command line
+ 	flag.Parse()
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/formatters.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/formatters.go
+index edbb351..99ec6f8 100644
+--- a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/formatters.go
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/formatters.go
+@@ -18,6 +18,7 @@ import (
+ 	"bufio"
+ 	"fmt"
+ 	"io"
++	"runtime"
+ 	"strings"
+ 	"time"
+ )
+@@ -38,26 +39,68 @@ type StringFormatter struct {
+ }
+ 
+ func (s *StringFormatter) Format(pkg string, l LogLevel, i int, entries ...interface{}) {
+-	now := time.Now()
+-	y, m, d := now.Date()
+-	h, min, sec := now.Clock()
+-	s.w.WriteString(fmt.Sprintf("%d/%02d/%d %02d:%02d:%02d ", y, m, d, h, min, sec))
+-	s.writeEntries(pkg, l, i, entries...)
++	now := time.Now().UTC()
++	s.w.WriteString(now.Format(time.RFC3339))
++	s.w.WriteByte(' ')
++	writeEntries(s.w, pkg, l, i, entries...)
++	s.Flush()
+ }
+ 
+-func (s *StringFormatter) writeEntries(pkg string, _ LogLevel, _ int, entries ...interface{}) {
++func writeEntries(w *bufio.Writer, pkg string, _ LogLevel, _ int, entries ...interface{}) {
+ 	if pkg != "" {
+-		s.w.WriteString(pkg + ": ")
++		w.WriteString(pkg + ": ")
+ 	}
+ 	str := fmt.Sprint(entries...)
+ 	endsInNL := strings.HasSuffix(str, "\n")
+-	s.w.WriteString(str)
++	w.WriteString(str)
+ 	if !endsInNL {
+-		s.w.WriteString("\n")
++		w.WriteString("\n")
+ 	}
+-	s.Flush()
+ }
+ 
+ func (s *StringFormatter) Flush() {
+ 	s.w.Flush()
+ }
++
++func NewPrettyFormatter(w io.Writer, debug bool) Formatter {
++	return &PrettyFormatter{
++		w:     bufio.NewWriter(w),
++		debug: debug,
++	}
++}
++
++type PrettyFormatter struct {
++	w     *bufio.Writer
++	debug bool
++}
++
++func (c *PrettyFormatter) Format(pkg string, l LogLevel, depth int, entries ...interface{}) {
++	now := time.Now()
++	ts := now.Format("2006-01-02 15:04:05")
++	c.w.WriteString(ts)
++	ms := now.Nanosecond() / 1000
++	c.w.WriteString(fmt.Sprintf(".%06d", ms))
++	if c.debug {
++		_, file, line, ok := runtime.Caller(depth) // It's always the same number of frames to the user's call.
++		if !ok {
++			file = "???"
++			line = 1
++		} else {
++			slash := strings.LastIndex(file, "/")
++			if slash >= 0 {
++				file = file[slash+1:]
++			}
++		}
++		if line < 0 {
++			line = 0 // not a real line number
++		}
++		c.w.WriteString(fmt.Sprintf(" [%s:%d]", file, line))
++	}
++	c.w.WriteString(fmt.Sprint(" ", l.Char(), " | "))
++	writeEntries(c.w, pkg, l, depth, entries...)
++	c.Flush()
++}
++
++func (c *PrettyFormatter) Flush() {
++	c.w.Flush()
++}
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/glog_formatter.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/glog_formatter.go
+index cae0749..426603e 100644
+--- a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/glog_formatter.go
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/glog_formatter.go
+@@ -44,7 +44,7 @@ func (g GlogFormatter) Format(pkg string, level LogLevel, depth int, entries ...
+ 
+ func GlogHeader(level LogLevel, depth int) []byte {
+ 	// Lmmdd hh:mm:ss.uuuuuu threadid file:line]
+-	now := time.Now()
++	now := time.Now().UTC()
+ 	_, file, line, ok := runtime.Caller(depth) // It's always the same number of frames to the user's call.
+ 	if !ok {
+ 		file = "???"
+@@ -73,6 +73,7 @@ func GlogHeader(level LogLevel, depth int) []byte {
+ 	twoDigits(buf, second)
+ 	buf.WriteByte('.')
+ 	buf.WriteString(strconv.Itoa(now.Nanosecond() / 1000))
++	buf.WriteByte('Z')
+ 	buf.WriteByte(' ')
+ 	buf.WriteString(strconv.Itoa(pid))
+ 	buf.WriteByte(' ')
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/init.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/init.go
+new file mode 100644
+index 0000000..64fce96
+--- /dev/null
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/init.go
+@@ -0,0 +1,47 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package capnslog
++
++import (
++	"io"
++	"os"
++	"syscall"
++)
++
++// Here's where the opinionation comes in. We need some sensible defaults,
++// especially after taking over the log package. Your project (whatever it may
++// be) may see things differently. That's okay; there should be no defaults in
++// the main package that cannot be controlled or overridden programatically,
++// otherwise it's a bug. Doing so is creating your own init_log.go file much
++// like this one.
++
++func init() {
++	initHijack()
++
++	// Go `log` pacakge uses os.Stderr.
++	SetFormatter(NewDefaultFormatter(os.Stderr))
++	SetGlobalLogLevel(INFO)
++}
++
++func NewDefaultFormatter(out io.Writer) Formatter {
++	if syscall.Getppid() == 1 {
++		// We're running under init, which may be systemd.
++		f, err := NewJournaldFormatter()
++		if err == nil {
++			return f
++		}
++	}
++	return NewPrettyFormatter(out, false)
++}
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/journald_formatter.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/journald_formatter.go
+new file mode 100644
+index 0000000..4011212
+--- /dev/null
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/journald_formatter.go
+@@ -0,0 +1,66 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++// +build !windows
++
++package capnslog
++
++import (
++	"errors"
++	"fmt"
++	"os"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/coreos/go-systemd/journal"
++)
++
++func NewJournaldFormatter() (Formatter, error) {
++	if !journal.Enabled() {
++		return nil, errors.New("No systemd detected")
++	}
++	return &journaldFormatter{}, nil
++}
++
++type journaldFormatter struct{}
++
++func (j *journaldFormatter) Format(pkg string, l LogLevel, _ int, entries ...interface{}) {
++	var pri journal.Priority
++	switch l {
++	case CRITICAL:
++		pri = journal.PriCrit
++	case ERROR:
++		pri = journal.PriErr
++	case WARNING:
++		pri = journal.PriWarning
++	case NOTICE:
++		pri = journal.PriNotice
++	case INFO:
++		pri = journal.PriInfo
++	case DEBUG:
++		pri = journal.PriDebug
++	case TRACE:
++		pri = journal.PriDebug
++	default:
++		panic("Unhandled loglevel")
++	}
++	msg := fmt.Sprint(entries...)
++	tags := map[string]string{
++		"PACKAGE": pkg,
++	}
++	err := journal.Send(msg, pri, tags)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++	}
++}
++
++func (j *journaldFormatter) Flush() {}
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/log_hijack.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/log_hijack.go
+index 1a7f3dc..970086b 100644
+--- a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/log_hijack.go
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/log_hijack.go
+@@ -18,7 +18,7 @@ import (
+ 	"log"
+ )
+ 
+-func init() {
++func initHijack() {
+ 	pkg := NewPackageLogger("log", "")
+ 	w := packageWriter{pkg}
+ 	log.SetFlags(0)
+diff --git a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/pkg_logger.go b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/pkg_logger.go
+index 0aa79d9..32d2f16 100644
+--- a/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/pkg_logger.go
++++ b/Godeps/_workspace/src/github.com/coreos/pkg/capnslog/pkg_logger.go
+@@ -24,7 +24,7 @@ type PackageLogger struct {
+ 	level LogLevel
+ }
+ 
+-const calldepth = 3
++const calldepth = 2
+ 
+ func (p *PackageLogger) internalLog(depth int, inLevel LogLevel, entries ...interface{}) {
+ 	if inLevel != CRITICAL && p.level < inLevel {

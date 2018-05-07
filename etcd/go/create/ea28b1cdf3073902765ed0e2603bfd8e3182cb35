@@ -1,0 +1,146 @@
+commit ea28b1cdf3073902765ed0e2603bfd8e3182cb35
+Author: Brandon Philips <brandon@ifup.co>
+Date:   Sun Aug 18 19:43:24 2013 -0700
+
+    bump(code.google.com/p/go.net): bc411e2ac33f
+
+diff --git a/third_party/code.google.com/p/go.net/netutil/listen.go b/third_party/code.google.com/p/go.net/netutil/listen.go
+new file mode 100644
+index 0000000..b23c6e9
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/netutil/listen.go
+@@ -0,0 +1,50 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Package netutil provides network utility functions, complementing the more
++// common ones in the net package.
++package netutil
++
++import (
++	"net"
++	"sync"
++)
++
++// LimitListener returns a Listener that accepts at most n simultaneous
++// connections from the provided Listener.
++func LimitListener(l net.Listener, n int) net.Listener {
++	ch := make(chan struct{}, n)
++	for i := 0; i < n; i++ {
++		ch <- struct{}{}
++	}
++	return &limitListener{l, ch}
++}
++
++type limitListener struct {
++	net.Listener
++	ch chan struct{}
++}
++
++func (l *limitListener) Accept() (net.Conn, error) {
++	<-l.ch
++	c, err := l.Listener.Accept()
++	if err != nil {
++		return nil, err
++	}
++	return &limitListenerConn{Conn: c, ch: l.ch}, nil
++}
++
++type limitListenerConn struct {
++	net.Conn
++	ch    chan<- struct{}
++	close sync.Once
++}
++
++func (l *limitListenerConn) Close() error {
++	err := l.Conn.Close()
++	l.close.Do(func() {
++		l.ch <- struct{}{}
++	})
++	return err
++}
+diff --git a/third_party/code.google.com/p/go.net/netutil/listen_test.go b/third_party/code.google.com/p/go.net/netutil/listen_test.go
+new file mode 100644
+index 0000000..240eca1
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/netutil/listen_test.go
+@@ -0,0 +1,65 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package netutil
++
++import (
++	"fmt"
++	"io"
++	"io/ioutil"
++	"net"
++	"net/http"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestLimitListener(t *testing.T) {
++	const (
++		max = 5
++		num = 200
++	)
++
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("Listen: %v", err)
++	}
++	defer l.Close()
++	l = LimitListener(l, max)
++
++	var open int32
++	go http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if n := atomic.AddInt32(&open, 1); n > max {
++			t.Errorf("%d open connections, want <= %d", n, max)
++		}
++		defer atomic.AddInt32(&open, -1)
++		time.Sleep(10 * time.Millisecond)
++		fmt.Fprint(w, "some body")
++	}))
++
++	var wg sync.WaitGroup
++	var failed int32
++	for i := 0; i < num; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			r, err := http.Get("http://" + l.Addr().String())
++			if err != nil {
++				t.Logf("Get: %v", err)
++				atomic.AddInt32(&failed, 1)
++				return
++			}
++			defer r.Body.Close()
++			io.Copy(ioutil.Discard, r.Body)
++		}()
++	}
++	wg.Wait()
++
++	// We expect some Gets to fail as the kernel's accept queue is filled,
++	// but most should succeed.
++	if failed >= num/2 {
++		t.Errorf("too many Gets failed")
++	}
++}
+diff --git a/third_party/code.google.com/p/go.net/proxy/proxy.go b/third_party/code.google.com/p/go.net/proxy/proxy.go
+index b6cfd45..8ccb0c5 100644
+--- a/third_party/code.google.com/p/go.net/proxy/proxy.go
++++ b/third_party/code.google.com/p/go.net/proxy/proxy.go
+@@ -24,7 +24,7 @@ type Auth struct {
+ 	User, Password string
+ }
+ 
+-// DefaultDialer returns the dialer specified by the proxy related variables in
++// FromEnvironment returns the dialer specified by the proxy related variables in
+ // the environment.
+ func FromEnvironment() Dialer {
+ 	allProxy := os.Getenv("all_proxy")

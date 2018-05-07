@@ -1,0 +1,76 @@
+commit 0814966ca2efee86a32a29be34751434b5944ffa
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Mon Jun 8 22:48:10 2015 -0700
+
+    etcdserver: stop raft loop when receiving stop signal
+    
+    When it waits for apply to be done, it should stop the loop if it
+    receives stop signal.
+    
+    This helps to print out panic information. Before this PR, if the panic
+    happens when server loop is applying entries, server loop will wait for
+    raft loop to stop forever.
+
+diff --git a/etcdserver/raft.go b/etcdserver/raft.go
+index 040810a..1d52316 100644
+--- a/etcdserver/raft.go
++++ b/etcdserver/raft.go
+@@ -161,7 +161,11 @@ func (r *raftNode) run() {
+ 
+ 			r.s.send(rd.Messages)
+ 
+-			<-apply.done
++			select {
++			case <-apply.done:
++			case <-r.stopped:
++				return
++			}
+ 			r.Advance()
+ 		case <-syncC:
+ 			r.s.sync(defaultSyncTimeout)
+diff --git a/etcdserver/raft_test.go b/etcdserver/raft_test.go
+index 0e49aef..d102771 100644
+--- a/etcdserver/raft_test.go
++++ b/etcdserver/raft_test.go
+@@ -18,9 +18,11 @@ import (
+ 	"encoding/json"
+ 	"reflect"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/coreos/etcd/pkg/pbutil"
+ 	"github.com/coreos/etcd/pkg/types"
++	"github.com/coreos/etcd/raft"
+ 	"github.com/coreos/etcd/raft/raftpb"
+ )
+ 
+@@ -141,3 +143,29 @@ func TestCreateConfigChangeEnts(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestStopRaftWhenWaitingForApplyDone(t *testing.T) {
++	n := newReadyNode()
++	r := raftNode{
++		Node:        n,
++		applyc:      make(chan apply),
++		storage:     &storageRecorder{},
++		raftStorage: raft.NewMemoryStorage(),
++		transport:   &nopTransporter{},
++	}
++	r.s = &EtcdServer{r: r}
++	go r.run()
++	n.readyc <- raft.Ready{}
++	select {
++	case <-r.applyc:
++	case <-time.After(time.Second):
++		t.Fatalf("failed to receive apply struct")
++	}
++
++	r.stopped <- struct{}{}
++	select {
++	case <-r.done:
++	case <-time.After(time.Second):
++		t.Fatalf("failed to stop raft loop")
++	}
++}

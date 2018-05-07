@@ -1,0 +1,385 @@
+commit ae9b251d9978e22ea51b3a0605f39f72f8d1f366
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Tue Apr 12 15:57:24 2016 -0700
+
+    etcdctl: move endpoint-heath and status into endpoint command
+
+diff --git a/clientv3/maintenance.go b/clientv3/maintenance.go
+index 75c0df7..063426c 100644
+--- a/clientv3/maintenance.go
++++ b/clientv3/maintenance.go
+@@ -46,7 +46,7 @@ type Maintenance interface {
+ 	// times with different endpoints.
+ 	Defragment(ctx context.Context, endpoint string) (*DefragmentResponse, error)
+ 
+-	// Status gets the status of the member.
++	// Status gets the status of the endpoint.
+ 	Status(ctx context.Context, endpoint string) (*StatusResponse, error)
+ 
+ 	// Snapshot provides a reader for a snapshot of a backend.
+diff --git a/e2e/ctl_v3_test.go b/e2e/ctl_v3_test.go
+index 5ac18ae..db5ef1d 100644
+--- a/e2e/ctl_v3_test.go
++++ b/e2e/ctl_v3_test.go
+@@ -532,7 +532,7 @@ func ctlV3Version(cx ctlCtx) error {
+ }
+ 
+ func ctlV3EpHealth(cx ctlCtx) error {
+-	cmdArgs := append(ctlV3PrefixArgs(cx.epc, cx.dialTimeout), "endpoint-health")
++	cmdArgs := append(ctlV3PrefixArgs(cx.epc, cx.dialTimeout), "endpoint health")
+ 	lines := make([]string, cx.epc.cfg.clusterSize)
+ 	for i := range lines {
+ 		lines[i] = "is healthy"
+diff --git a/etcdctl/ctlv3/command/ep_command.go b/etcdctl/ctlv3/command/ep_command.go
+new file mode 100644
+index 0000000..27ac820
+--- /dev/null
++++ b/etcdctl/ctlv3/command/ep_command.go
+@@ -0,0 +1,133 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"fmt"
++	"os"
++	"sync"
++	"time"
++
++	v3 "github.com/coreos/etcd/clientv3"
++	"github.com/coreos/etcd/pkg/flags"
++	"github.com/spf13/cobra"
++)
++
++// NewEndpointCommand returns the cobra command for "endpoint".
++func NewEndpointCommand() *cobra.Command {
++	ec := &cobra.Command{
++		Use:   "endpoint",
++		Short: "endpoint is used to check endpoints.",
++	}
++
++	ec.AddCommand(newEpHealthCommand())
++	ec.AddCommand(newEpStatusCommand())
++
++	return ec
++}
++
++func newEpHealthCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "health",
++		Short: "health checks the healthiness of endpoints specified in `--endpoints` flag",
++		Run:   epHealthCommandFunc,
++	}
++	return cmd
++}
++
++func newEpStatusCommand() *cobra.Command {
++	return &cobra.Command{
++		Use:   "status",
++		Short: "status prints out the status of endpoints specified in `--endpoints` flag",
++		Run:   epStatusCommandFunc,
++	}
++}
++
++// epHealthCommandFunc executes the "endpoint-health" command.
++func epHealthCommandFunc(cmd *cobra.Command, args []string) {
++	flags.SetPflagsFromEnv("ETCDCTL", cmd.InheritedFlags())
++	endpoints, err := cmd.Flags().GetStringSlice("endpoints")
++	if err != nil {
++		ExitWithError(ExitError, err)
++	}
++
++	sec := secureCfgFromCmd(cmd)
++	dt := dialTimeoutFromCmd(cmd)
++	cfgs := []*v3.Config{}
++	for _, ep := range endpoints {
++		cfg, err := newClientCfg([]string{ep}, dt, sec)
++		if err != nil {
++			ExitWithError(ExitBadArgs, err)
++		}
++		cfgs = append(cfgs, cfg)
++	}
++
++	var wg sync.WaitGroup
++
++	for _, cfg := range cfgs {
++		wg.Add(1)
++		go func(cfg *v3.Config) {
++			defer wg.Done()
++			ep := cfg.Endpoints[0]
++			cli, err := v3.New(*cfg)
++			if err != nil {
++				fmt.Printf("%s is unhealthy: failed to connect: %v\n", ep, err)
++				return
++			}
++			st := time.Now()
++			// get a random key. As long as we can get the response without an error, the
++			// endpoint is health.
++			ctx, cancel := commandCtx(cmd)
++			_, err = cli.Get(ctx, "health")
++			cancel()
++			if err != nil {
++				fmt.Printf("%s is unhealthy: failed to commit proposal: %v\n", ep, err)
++			} else {
++				fmt.Printf("%s is healthy: successfully committed proposal: took = %v\n", ep, time.Since(st))
++			}
++		}(cfg)
++	}
++
++	wg.Wait()
++}
++
++type epStatus struct {
++	ep   string
++	resp *v3.StatusResponse
++}
++
++func epStatusCommandFunc(cmd *cobra.Command, args []string) {
++	c := mustClientFromCmd(cmd)
++
++	statusList := []epStatus{}
++	var err error
++	for _, ep := range c.Endpoints() {
++		ctx, cancel := commandCtx(cmd)
++		resp, serr := c.Status(ctx, ep)
++		cancel()
++		if serr != nil {
++			err = serr
++			fmt.Fprintf(os.Stderr, "Failed to get the status of endpoint %s (%v)\n", ep, serr)
++			continue
++		}
++		statusList = append(statusList, epStatus{ep: ep, resp: resp})
++	}
++
++	display.EndpointStatus(statusList)
++
++	if err != nil {
++		os.Exit(ExitError)
++	}
++}
+diff --git a/etcdctl/ctlv3/command/ep_health_command.go b/etcdctl/ctlv3/command/ep_health_command.go
+deleted file mode 100644
+index 64a57be..0000000
+--- a/etcdctl/ctlv3/command/ep_health_command.go
++++ /dev/null
+@@ -1,83 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package command
+-
+-import (
+-	"fmt"
+-	"sync"
+-	"time"
+-
+-	"github.com/coreos/etcd/clientv3"
+-	"github.com/coreos/etcd/pkg/flags"
+-	"github.com/spf13/cobra"
+-)
+-
+-// NewEpHealthCommand returns the cobra command for "endpoint-health".
+-func NewEpHealthCommand() *cobra.Command {
+-	cmd := &cobra.Command{
+-		Use:   "endpoint-health",
+-		Short: "endpoint-health checks the healthiness of endpoints specified in `--endpoints` flag",
+-		Run:   epHealthCommandFunc,
+-	}
+-	return cmd
+-}
+-
+-// epHealthCommandFunc executes the "endpoint-health" command.
+-func epHealthCommandFunc(cmd *cobra.Command, args []string) {
+-	flags.SetPflagsFromEnv("ETCDCTL", cmd.InheritedFlags())
+-	endpoints, err := cmd.Flags().GetStringSlice("endpoints")
+-	if err != nil {
+-		ExitWithError(ExitError, err)
+-	}
+-
+-	sec := secureCfgFromCmd(cmd)
+-	dt := dialTimeoutFromCmd(cmd)
+-	cfgs := []*clientv3.Config{}
+-	for _, ep := range endpoints {
+-		cfg, err := newClientCfg([]string{ep}, dt, sec)
+-		if err != nil {
+-			ExitWithError(ExitBadArgs, err)
+-		}
+-		cfgs = append(cfgs, cfg)
+-	}
+-
+-	var wg sync.WaitGroup
+-
+-	for _, cfg := range cfgs {
+-		wg.Add(1)
+-		go func(cfg *clientv3.Config) {
+-			defer wg.Done()
+-			ep := cfg.Endpoints[0]
+-			cli, err := clientv3.New(*cfg)
+-			if err != nil {
+-				fmt.Printf("%s is unhealthy: failed to connect: %v\n", ep, err)
+-				return
+-			}
+-			st := time.Now()
+-			// get a random key. As long as we can get the response without an error, the
+-			// endpoint is health.
+-			ctx, cancel := commandCtx(cmd)
+-			_, err = cli.Get(ctx, "health")
+-			cancel()
+-			if err != nil {
+-				fmt.Printf("%s is unhealthy: failed to commit proposal: %v\n", ep, err)
+-			} else {
+-				fmt.Printf("%s is healthy: successfully committed proposal: took = %v\n", ep, time.Since(st))
+-			}
+-		}(cfg)
+-	}
+-
+-	wg.Wait()
+-}
+diff --git a/etcdctl/ctlv3/command/printer.go b/etcdctl/ctlv3/command/printer.go
+index 59ccaad..7c6c8a4 100644
+--- a/etcdctl/ctlv3/command/printer.go
++++ b/etcdctl/ctlv3/command/printer.go
+@@ -37,7 +37,7 @@ type printer interface {
+ 
+ 	MemberList(v3.MemberListResponse)
+ 
+-	MemberStatus([]statusInfo)
++	EndpointStatus([]epStatus)
+ 
+ 	Alarm(v3.AlarmResponse)
+ 	DBStatus(dbstatus)
+@@ -129,7 +129,7 @@ func (s *simplePrinter) MemberList(resp v3.MemberListResponse) {
+ 	table.Render()
+ }
+ 
+-func (s *simplePrinter) MemberStatus(statusList []statusInfo) {
++func (s *simplePrinter) EndpointStatus(statusList []epStatus) {
+ 	table := tablewriter.NewWriter(os.Stdout)
+ 	table.SetHeader([]string{"endpoint", "ID", "version", "db size", "is leader", "raft term", "raft index"})
+ 
+@@ -175,7 +175,7 @@ func (p *jsonPrinter) Txn(r v3.TxnResponse)               { printJSON(r) }
+ func (p *jsonPrinter) Watch(r v3.WatchResponse)           { printJSON(r) }
+ func (p *jsonPrinter) Alarm(r v3.AlarmResponse)           { printJSON(r) }
+ func (p *jsonPrinter) MemberList(r v3.MemberListResponse) { printJSON(r) }
+-func (p *jsonPrinter) MemberStatus(r []statusInfo)        { printJSON(r) }
++func (p *jsonPrinter) EndpointStatus(r []epStatus)        { printJSON(r) }
+ func (p *jsonPrinter) DBStatus(r dbstatus)                { printJSON(r) }
+ 
+ func printJSON(v interface{}) {
+@@ -223,7 +223,7 @@ func (pb *pbPrinter) MemberList(r v3.MemberListResponse) {
+ 	ExitWithError(ExitBadFeature, errors.New("only support simple or json as output format"))
+ }
+ 
+-func (pb *pbPrinter) MemberStatus(r []statusInfo) {
++func (pb *pbPrinter) EndpointStatus(statusList []epStatus) {
+ 	ExitWithError(ExitBadFeature, errors.New("only support simple or json as output format"))
+ }
+ 
+diff --git a/etcdctl/ctlv3/command/status_command.go b/etcdctl/ctlv3/command/status_command.go
+deleted file mode 100644
+index c35fcb4..0000000
+--- a/etcdctl/ctlv3/command/status_command.go
++++ /dev/null
+@@ -1,61 +0,0 @@
+-// Copyright 2016 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package command
+-
+-import (
+-	"fmt"
+-	"os"
+-
+-	v3 "github.com/coreos/etcd/clientv3"
+-	"github.com/spf13/cobra"
+-)
+-
+-// NewStatusCommand returns the cobra command for "Status".
+-func NewStatusCommand() *cobra.Command {
+-	return &cobra.Command{
+-		Use:   "status",
+-		Short: "status prints out the statuses of the members with given endpoints.",
+-		Run:   statusCommandFunc,
+-	}
+-}
+-
+-type statusInfo struct {
+-	ep   string
+-	resp *v3.StatusResponse
+-}
+-
+-func statusCommandFunc(cmd *cobra.Command, args []string) {
+-	c := mustClientFromCmd(cmd)
+-
+-	statusList := []statusInfo{}
+-	var err error
+-	for _, ep := range c.Endpoints() {
+-		ctx, cancel := commandCtx(cmd)
+-		resp, serr := c.Status(ctx, ep)
+-		cancel()
+-		if serr != nil {
+-			err = serr
+-			fmt.Fprintf(os.Stderr, "Failed to get the status of endpoint %s (%v)", ep, serr)
+-			continue
+-		}
+-		statusList = append(statusList, statusInfo{ep: ep, resp: resp})
+-	}
+-
+-	display.MemberStatus(statusList)
+-
+-	if err != nil {
+-		os.Exit(ExitError)
+-	}
+-}
+diff --git a/etcdctl/ctlv3/ctl.go b/etcdctl/ctlv3/ctl.go
+index 05a9b87..017cbc5 100644
+--- a/etcdctl/ctlv3/ctl.go
++++ b/etcdctl/ctlv3/ctl.go
+@@ -66,12 +66,11 @@ func init() {
+ 		command.NewCompactionCommand(),
+ 		command.NewAlarmCommand(),
+ 		command.NewDefragCommand(),
+-		command.NewStatusCommand(),
++		command.NewEndpointCommand(),
+ 		command.NewWatchCommand(),
+ 		command.NewVersionCommand(),
+ 		command.NewLeaseCommand(),
+ 		command.NewMemberCommand(),
+-		command.NewEpHealthCommand(),
+ 		command.NewSnapshotCommand(),
+ 		command.NewMakeMirrorCommand(),
+ 		command.NewLockCommand(),

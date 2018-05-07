@@ -1,0 +1,151 @@
+commit 084c407a8dcc068a1b339f6c809958a08c15b865
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Tue Oct 11 16:03:29 2016 -0700
+
+    clientv3: drop Config.Logger field
+    
+    Fix https://github.com/coreos/etcd/issues/6603.
+    
+    Instead adds 'SetLogger' to set global logger interface
+    to avoid unnecessary logger updates.
+
+diff --git a/clientv3/client.go b/clientv3/client.go
+index df4ab34..148adde 100644
+--- a/clientv3/client.go
++++ b/clientv3/client.go
+@@ -18,8 +18,6 @@ import (
+ 	"crypto/tls"
+ 	"errors"
+ 	"fmt"
+-	"io/ioutil"
+-	"log"
+ 	"net"
+ 	"net/url"
+ 	"strings"
+@@ -317,12 +315,6 @@ func newClient(cfg *Config) (*Client, error) {
+ 	client.Watcher = NewWatcher(client)
+ 	client.Auth = NewAuth(client)
+ 	client.Maintenance = NewMaintenance(client)
+-	if cfg.Logger != nil {
+-		logger.Set(cfg.Logger)
+-	} else {
+-		// disable client side grpc by default
+-		logger.Set(log.New(ioutil.Discard, "", 0))
+-	}
+ 
+ 	go client.autoSync()
+ 	return client, nil
+diff --git a/clientv3/config.go b/clientv3/config.go
+index 4f92d7d..d1d5f40 100644
+--- a/clientv3/config.go
++++ b/clientv3/config.go
+@@ -38,9 +38,6 @@ type Config struct {
+ 	// TLS holds the client secure credentials, if any.
+ 	TLS *tls.Config
+ 
+-	// Logger is the logger used by client library.
+-	Logger Logger
+-
+ 	// Username is a username for authentication
+ 	Username string
+ 
+diff --git a/clientv3/example_test.go b/clientv3/example_test.go
+index 6318202..2c119cb 100644
+--- a/clientv3/example_test.go
++++ b/clientv3/example_test.go
+@@ -20,6 +20,7 @@ import (
+ 
+ 	"github.com/coreos/etcd/clientv3"
+ 	"github.com/coreos/etcd/pkg/transport"
++	"github.com/coreos/pkg/capnslog"
+ 	"golang.org/x/net/context"
+ )
+ 
+@@ -30,6 +31,9 @@ var (
+ )
+ 
+ func Example() {
++	var plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "clientv3")
++	clientv3.SetLogger(plog)
++
+ 	cli, err := clientv3.New(clientv3.Config{
+ 		Endpoints:   endpoints,
+ 		DialTimeout: dialTimeout,
+diff --git a/clientv3/logger.go b/clientv3/logger.go
+index 6e57c4e..519db45 100644
+--- a/clientv3/logger.go
++++ b/clientv3/logger.go
+@@ -15,13 +15,15 @@
+ package clientv3
+ 
+ import (
++	"io/ioutil"
+ 	"log"
+-	"os"
+ 	"sync"
+ 
+ 	"google.golang.org/grpc/grpclog"
+ )
+ 
++// Logger is the logger used by client library.
++// It implements grpclog.Logger interface.
+ type Logger grpclog.Logger
+ 
+ var (
+@@ -34,20 +36,36 @@ type settableLogger struct {
+ }
+ 
+ func init() {
+-	// use go's standard logger by default like grpc
++	// disable client side logs by default
+ 	logger.mu.Lock()
+-	logger.l = log.New(os.Stderr, "", log.LstdFlags)
++	logger.l = log.New(ioutil.Discard, "", 0)
++
++	// logger has to override the grpclog at initialization so that
++	// any changes to the grpclog go through logger with locking
++	// instead of through SetLogger
++	//
++	// now updates only happen through settableLogger.set
+ 	grpclog.SetLogger(&logger)
+ 	logger.mu.Unlock()
+ }
+ 
+-func (s *settableLogger) Set(l Logger) {
++// SetLogger sets client-side Logger. By default, logs are disabled.
++func SetLogger(l Logger) {
++	logger.set(l)
++}
++
++// GetLogger returns the current logger.
++func GetLogger() Logger {
++	return logger.get()
++}
++
++func (s *settableLogger) set(l Logger) {
+ 	s.mu.Lock()
+ 	logger.l = l
+ 	s.mu.Unlock()
+ }
+ 
+-func (s *settableLogger) Get() Logger {
++func (s *settableLogger) get() Logger {
+ 	s.mu.RLock()
+ 	l := logger.l
+ 	s.mu.RUnlock()
+@@ -56,9 +74,9 @@ func (s *settableLogger) Get() Logger {
+ 
+ // implement the grpclog.Logger interface
+ 
+-func (s *settableLogger) Fatal(args ...interface{})                 { s.Get().Fatal(args...) }
+-func (s *settableLogger) Fatalf(format string, args ...interface{}) { s.Get().Fatalf(format, args...) }
+-func (s *settableLogger) Fatalln(args ...interface{})               { s.Get().Fatalln(args...) }
+-func (s *settableLogger) Print(args ...interface{})                 { s.Get().Print(args...) }
+-func (s *settableLogger) Printf(format string, args ...interface{}) { s.Get().Printf(format, args...) }
+-func (s *settableLogger) Println(args ...interface{})               { s.Get().Println(args...) }
++func (s *settableLogger) Fatal(args ...interface{})                 { s.get().Fatal(args...) }
++func (s *settableLogger) Fatalf(format string, args ...interface{}) { s.get().Fatalf(format, args...) }
++func (s *settableLogger) Fatalln(args ...interface{})               { s.get().Fatalln(args...) }
++func (s *settableLogger) Print(args ...interface{})                 { s.get().Print(args...) }
++func (s *settableLogger) Printf(format string, args ...interface{}) { s.get().Printf(format, args...) }
++func (s *settableLogger) Println(args ...interface{})               { s.get().Println(args...) }

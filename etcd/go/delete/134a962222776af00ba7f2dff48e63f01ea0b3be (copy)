@@ -1,0 +1,6540 @@
+commit 134a962222776af00ba7f2dff48e63f01ea0b3be
+Author: Blake Mizerany <blake.mizerany@gmail.com>
+Date:   Sun Aug 24 20:09:06 2014 -0700
+
+    raft: move raft2 to raft
+
+diff --git a/raft/cluster_test.go b/raft/cluster_test.go
+deleted file mode 100644
+index 829580c..0000000
+--- a/raft/cluster_test.go
++++ /dev/null
+@@ -1,190 +0,0 @@
+-package raft
+-
+-import (
+-	"reflect"
+-	"testing"
+-)
+-
+-// TestBuildCluster ensures cluster with various size could be built.
+-func TestBuildCluster(t *testing.T) {
+-	tests := []struct {
+-		size int
+-		ids  []int64
+-	}{
+-		{1, nil},
+-		{3, nil},
+-		{5, nil},
+-		{7, nil},
+-		{9, nil},
+-		{13, nil},
+-		{51, nil},
+-		{1, []int64{1}},
+-		{3, []int64{1, 3, 5}},
+-		{5, []int64{1, 4, 7, 10, 13}},
+-	}
+-
+-	for i, tt := range tests {
+-		_, nodes := buildCluster(tt.size, tt.ids)
+-
+-		base := ltoa(nodes[0].sm.raftLog)
+-		for j, n := range nodes {
+-			// ensure same log
+-			l := ltoa(n.sm.raftLog)
+-			if g := diffu(base, l); g != "" {
+-				t.Errorf("#%d.%d: log diff:\n%s", i, j, g)
+-			}
+-
+-			// ensure same leader
+-			var w int64
+-			if tt.ids != nil {
+-				w = tt.ids[0]
+-			}
+-			if g := n.sm.lead.Get(); g != w {
+-				t.Errorf("#%d.%d: lead = %d, want %d", i, j, g, w)
+-			}
+-
+-			// ensure same peer map
+-			p := map[int64]struct{}{}
+-			for k := range n.sm.ins {
+-				p[k] = struct{}{}
+-			}
+-			wp := map[int64]struct{}{}
+-			for k := 0; k < tt.size; k++ {
+-				if tt.ids != nil {
+-					wp[tt.ids[k]] = struct{}{}
+-				} else {
+-					wp[int64(k)] = struct{}{}
+-				}
+-			}
+-			if !reflect.DeepEqual(p, wp) {
+-				t.Errorf("#%d.%d: peers = %+v, want %+v", i, j, p, wp)
+-			}
+-		}
+-	}
+-}
+-
+-func TestInitCluster(t *testing.T) {
+-	node := New(1, defaultHeartbeat, defaultElection)
+-	dictate(node)
+-	node.Next()
+-
+-	if node.ClusterId() != 0xBEEF {
+-		t.Errorf("clusterId = %x, want %x", node.ClusterId(), 0xBEEF)
+-	}
+-
+-	func() {
+-		defer func() {
+-			e := recover()
+-			if e != "cannot init a started cluster" {
+-				t.Errorf("err = %v, want cannot init a started cluster", e)
+-			}
+-		}()
+-		node.InitCluster(0xFBEE)
+-		node.Next()
+-	}()
+-}
+-
+-func TestMessageFromDifferentCluster(t *testing.T) {
+-	tests := []struct {
+-		clusterId int64
+-		wType     messageType
+-	}{
+-		{0xBEEF, msgVoteResp},
+-		{0xFBEE, msgDenied},
+-	}
+-
+-	for i, tt := range tests {
+-		node := New(1, defaultHeartbeat, defaultElection)
+-		dictate(node)
+-		node.Next()
+-
+-		node.Step(Message{From: 1, ClusterId: tt.clusterId, Type: msgVote, Term: 2, LogTerm: 2, Index: 2})
+-		msgs := node.Msgs()
+-		if len(msgs) != 1 {
+-			t.Errorf("#%d: len(msgs) = %d, want 1", i, len(msgs))
+-		}
+-		if msgs[0].Type != tt.wType {
+-			t.Errorf("#%d: msg.Type = %v, want %d", i, msgs[0].Type, tt.wType)
+-		}
+-	}
+-}
+-
+-// TestBasicCluster ensures all nodes can send proposal to the cluster.
+-// And all the proposals will get committed.
+-func TestBasicCluster(t *testing.T) {
+-	tests := []struct {
+-		size  int
+-		round int
+-	}{
+-		{1, 3},
+-		{3, 3},
+-		{5, 3},
+-		{7, 3},
+-		{13, 1},
+-	}
+-
+-	for i, tt := range tests {
+-		nt, nodes := buildCluster(tt.size, nil)
+-
+-		for j := 0; j < tt.round; j++ {
+-			for _, n := range nodes {
+-				data := []byte{byte(n.Id())}
+-				nt.send(Message{From: n.Id(), To: n.Id(), ClusterId: n.ClusterId(), Type: msgProp, Entries: []Entry{{Data: data}}})
+-
+-				base := nodes[0].Next()
+-				if len(base) != 1 {
+-					t.Fatalf("#%d: len(ents) = %d, want 1", i, len(base))
+-				}
+-				if !reflect.DeepEqual(base[0].Data, data) {
+-					t.Errorf("#%d: data = %s, want %s", i, base[0].Data, data)
+-				}
+-				for k := 1; k < tt.size; k++ {
+-					g := nodes[k].Next()
+-					if !reflect.DeepEqual(g, base) {
+-						t.Errorf("#%d.%d: ent = %v, want %v", i, k, g, base)
+-					}
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-// This function is full of heck now. It will go away when we finish our
+-// network Interface, and ticker infrastructure.
+-func buildCluster(size int, ids []int64) (nt *network, nodes []*Node) {
+-	if ids == nil {
+-		ids = make([]int64, size)
+-		for i := 0; i < size; i++ {
+-			ids[i] = int64(i)
+-		}
+-	}
+-
+-	nodes = make([]*Node, size)
+-	nis := make([]Interface, size)
+-	for i := range nodes {
+-		nodes[i] = New(ids[i], defaultHeartbeat, defaultElection)
+-		nis[i] = nodes[i]
+-	}
+-	nt = newNetwork(nis...)
+-
+-	lead := dictate(nodes[0])
+-	lead.Next()
+-	for i := 1; i < size; i++ {
+-		lead.Add(ids[i], "", nil)
+-		nt.send(lead.Msgs()...)
+-		for j := 0; j < i; j++ {
+-			nodes[j].Next()
+-		}
+-	}
+-
+-	for i := 0; i < 10*defaultHeartbeat; i++ {
+-		nodes[0].Tick()
+-	}
+-	msgs := nodes[0].Msgs()
+-	nt.send(msgs...)
+-
+-	for _, n := range nodes {
+-		n.Next()
+-	}
+-	return
+-}
+diff --git a/raft/diff_test.go b/raft/diff_test.go
+new file mode 100644
+index 0000000..96c5d68
+--- /dev/null
++++ b/raft/diff_test.go
+@@ -0,0 +1,51 @@
++package raft
++
++import (
++	"fmt"
++	"io"
++	"io/ioutil"
++	"os"
++	"os/exec"
++	"strings"
++)
++
++func diffu(a, b string) string {
++	if a == b {
++		return ""
++	}
++	aname, bname := mustTemp("base", a), mustTemp("other", b)
++	defer os.Remove(aname)
++	defer os.Remove(bname)
++	cmd := exec.Command("diff", "-u", aname, bname)
++	buf, err := cmd.CombinedOutput()
++	if err != nil {
++		if _, ok := err.(*exec.ExitError); ok {
++			// do nothing
++			return string(buf)
++		}
++		panic(err)
++	}
++	return string(buf)
++}
++
++func mustTemp(pre, body string) string {
++	f, err := ioutil.TempFile("", pre)
++	if err != nil {
++		panic(err)
++	}
++	_, err = io.Copy(f, strings.NewReader(body))
++	if err != nil {
++		panic(err)
++	}
++	f.Close()
++	return f.Name()
++}
++
++func ltoa(l *raftLog) string {
++	s := fmt.Sprintf("committed: %d\n", l.committed)
++	s += fmt.Sprintf("applied:  %d\n", l.applied)
++	for i, e := range l.ents {
++		s += fmt.Sprintf("#%d: %+v\n", i, e)
++	}
++	return s
++}
+diff --git a/raft/entry.pb.go b/raft/entry.pb.go
+new file mode 100644
+index 0000000..0d6ff69
+--- /dev/null
++++ b/raft/entry.pb.go
+@@ -0,0 +1,243 @@
++// Code generated by protoc-gen-gogo.
++// source: entry.proto
++// DO NOT EDIT!
++
++/*
++	Package raft is a generated protocol buffer package.
++
++	It is generated from these files:
++		entry.proto
++
++	It has these top-level messages:
++		Entry
++*/
++package raft
++
++import proto "code.google.com/p/gogoprotobuf/proto"
++import json "encoding/json"
++import math "math"
++
++// discarding unused import gogoproto "code.google.com/p/gogoprotobuf/gogoproto/gogo.pb"
++
++import io "io"
++import code_google_com_p_gogoprotobuf_proto "code.google.com/p/gogoprotobuf/proto"
++
++// Reference proto, json, and math imports to suppress error if they are not otherwise used.
++var _ = proto.Marshal
++var _ = &json.SyntaxError{}
++var _ = math.Inf
++
++type Entry struct {
++	Type             int64  `protobuf:"varint,1,req,name=type" json:"type"`
++	Term             int64  `protobuf:"varint,2,req,name=term" json:"term"`
++	Index            int64  `protobuf:"varint,3,req,name=index" json:"index"`
++	Data             []byte `protobuf:"bytes,4,opt,name=data" json:"data,omitempty"`
++	XXX_unrecognized []byte `json:"-"`
++}
++
++func (m *Entry) Reset()         { *m = Entry{} }
++func (m *Entry) String() string { return proto.CompactTextString(m) }
++func (*Entry) ProtoMessage()    {}
++
++func init() {
++}
++func (m *Entry) Unmarshal(data []byte) error {
++	l := len(data)
++	index := 0
++	for index < l {
++		var wire uint64
++		for shift := uint(0); ; shift += 7 {
++			if index >= l {
++				return io.ErrUnexpectedEOF
++			}
++			b := data[index]
++			index++
++			wire |= (uint64(b) & 0x7F) << shift
++			if b < 0x80 {
++				break
++			}
++		}
++		fieldNum := int32(wire >> 3)
++		wireType := int(wire & 0x7)
++		switch fieldNum {
++		case 1:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.Type |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 2:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.Term |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 3:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.Index |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 4:
++			if wireType != 2 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			var byteLen int
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				byteLen |= (int(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++			postIndex := index + byteLen
++			if postIndex > l {
++				return io.ErrUnexpectedEOF
++			}
++			m.Data = append(m.Data, data[index:postIndex]...)
++			index = postIndex
++		default:
++			var sizeOfWire int
++			for {
++				sizeOfWire++
++				wire >>= 7
++				if wire == 0 {
++					break
++				}
++			}
++			index -= sizeOfWire
++			skippy, err := code_google_com_p_gogoprotobuf_proto.Skip(data[index:])
++			if err != nil {
++				return err
++			}
++			if (index + skippy) > l {
++				return io.ErrUnexpectedEOF
++			}
++			m.XXX_unrecognized = append(m.XXX_unrecognized, data[index:index+skippy]...)
++			index += skippy
++		}
++	}
++	return nil
++}
++func (m *Entry) Size() (n int) {
++	var l int
++	_ = l
++	n += 1 + sovEntry(uint64(m.Type))
++	n += 1 + sovEntry(uint64(m.Term))
++	n += 1 + sovEntry(uint64(m.Index))
++	if m.Data != nil {
++		l = len(m.Data)
++		n += 1 + l + sovEntry(uint64(l))
++	}
++	if m.XXX_unrecognized != nil {
++		n += len(m.XXX_unrecognized)
++	}
++	return n
++}
++
++func sovEntry(x uint64) (n int) {
++	for {
++		n++
++		x >>= 7
++		if x == 0 {
++			break
++		}
++	}
++	return n
++}
++func sozEntry(x uint64) (n int) {
++	return sovEntry(uint64((x << 1) ^ uint64((int64(x) >> 63))))
++}
++func (m *Entry) Marshal() (data []byte, err error) {
++	size := m.Size()
++	data = make([]byte, size)
++	n, err := m.MarshalTo(data)
++	if err != nil {
++		return nil, err
++	}
++	return data[:n], nil
++}
++
++func (m *Entry) MarshalTo(data []byte) (n int, err error) {
++	var i int
++	_ = i
++	var l int
++	_ = l
++	data[i] = 0x8
++	i++
++	i = encodeVarintEntry(data, i, uint64(m.Type))
++	data[i] = 0x10
++	i++
++	i = encodeVarintEntry(data, i, uint64(m.Term))
++	data[i] = 0x18
++	i++
++	i = encodeVarintEntry(data, i, uint64(m.Index))
++	if m.Data != nil {
++		data[i] = 0x22
++		i++
++		i = encodeVarintEntry(data, i, uint64(len(m.Data)))
++		i += copy(data[i:], m.Data)
++	}
++	if m.XXX_unrecognized != nil {
++		i += copy(data[i:], m.XXX_unrecognized)
++	}
++	return i, nil
++}
++func encodeFixed64Entry(data []byte, offset int, v uint64) int {
++	data[offset] = uint8(v)
++	data[offset+1] = uint8(v >> 8)
++	data[offset+2] = uint8(v >> 16)
++	data[offset+3] = uint8(v >> 24)
++	data[offset+4] = uint8(v >> 32)
++	data[offset+5] = uint8(v >> 40)
++	data[offset+6] = uint8(v >> 48)
++	data[offset+7] = uint8(v >> 56)
++	return offset + 8
++}
++func encodeFixed32Entry(data []byte, offset int, v uint32) int {
++	data[offset] = uint8(v)
++	data[offset+1] = uint8(v >> 8)
++	data[offset+2] = uint8(v >> 16)
++	data[offset+3] = uint8(v >> 24)
++	return offset + 4
++}
++func encodeVarintEntry(data []byte, offset int, v uint64) int {
++	for v >= 1<<7 {
++		data[offset] = uint8(v&0x7f | 0x80)
++		v >>= 7
++		offset++
++	}
++	data[offset] = uint8(v)
++	return offset + 1
++}
+diff --git a/raft/entry.proto b/raft/entry.proto
+new file mode 100644
+index 0000000..b9606c3
+--- /dev/null
++++ b/raft/entry.proto
+@@ -0,0 +1,15 @@
++package raft;
++
++import "code.google.com/p/gogoprotobuf/gogoproto/gogo.proto";
++
++option (gogoproto.marshaler_all) = true;
++option (gogoproto.sizer_all) = true;
++option (gogoproto.unmarshaler_all) = true;
++option (gogoproto.goproto_getters_all) = false;
++
++message Entry {
++	required int64 type  = 1 [(gogoproto.nullable) = false];
++	required int64 term  = 2 [(gogoproto.nullable) = false];
++	required int64 index = 3 [(gogoproto.nullable) = false];
++	optional bytes data  = 4;
++}
+diff --git a/raft/example_test.go b/raft/example_test.go
+new file mode 100644
+index 0000000..513236f
+--- /dev/null
++++ b/raft/example_test.go
+@@ -0,0 +1,37 @@
++package raft
++
++import (
++	"log"
++
++	"code.google.com/p/go.net/context"
++)
++
++func applyToStore(ents []Entry)   {}
++func sendMessages(msgs []Message) {}
++func saveStateToDisk(st State)    {}
++func saveToDisk(ents []Entry)     {}
++
++func Example_Node() {
++	n := Start(context.Background(), 0, nil)
++
++	// stuff to n happens in other goroutines
++
++	// the last known state
++	var prev State
++	for {
++		// ReadState blocks until there is new state ready.
++		st, ents, cents, msgs, err := n.ReadState(context.Background())
++		if err != nil {
++			log.Fatal(err)
++		}
++
++		if !prev.Equal(st) {
++			saveStateToDisk(st)
++			prev = st
++		}
++
++		saveToDisk(ents)
++		go applyToStore(cents)
++		sendMessages(msgs)
++	}
++}
+diff --git a/raft/genproto.sh b/raft/genproto.sh
+new file mode 100644
+index 0000000..39dc53a
+--- /dev/null
++++ b/raft/genproto.sh
+@@ -0,0 +1 @@
++exec protoc --gogo_out=. -I=.:$GOPATH/src/code.google.com/p/gogoprotobuf/protobuf:$GOPATH/src *.proto
+diff --git a/raft/info.proto b/raft/info.proto
+deleted file mode 100644
+index cc01b33..0000000
+--- a/raft/info.proto
++++ /dev/null
+@@ -1,12 +0,0 @@
+-package raft;
+-
+-import "code.google.com/p/gogoprotobuf/gogoproto/gogo.proto";
+-
+-option (gogoproto.marshaler_all) = true;
+-option (gogoproto.sizer_all) = true;
+-option (gogoproto.unmarshaler_all) = true;
+-option (gogoproto.goproto_getters_all) = false;
+-
+-message Info {
+-	required int64 id   = 1 [(gogoproto.nullable) = false];
+-}
+diff --git a/raft/log.go b/raft/log.go
+new file mode 100644
+index 0000000..1fc3312
+--- /dev/null
++++ b/raft/log.go
+@@ -0,0 +1,232 @@
++package raft
++
++import "fmt"
++
++const (
++	Normal int64 = iota
++
++	ClusterInit
++	AddNode
++	RemoveNode
++)
++
++const (
++	defaultCompactThreshold = 10000
++)
++
++func (e *Entry) isConfig() bool {
++	return e.Type == AddNode || e.Type == RemoveNode
++}
++
++type raftLog struct {
++	ents             []Entry
++	unstable         int64
++	committed        int64
++	applied          int64
++	offset           int64
++	snapshot         Snapshot
++	unstableSnapshot Snapshot
++
++	// want a compact after the number of entries exceeds the threshold
++	// TODO(xiangli) size might be a better criteria
++	compactThreshold int64
++}
++
++func newLog() *raftLog {
++	return &raftLog{
++		ents:             make([]Entry, 1),
++		unstable:         1,
++		committed:        0,
++		applied:          0,
++		compactThreshold: defaultCompactThreshold,
++	}
++}
++
++func (l *raftLog) isEmpty() bool {
++	return l.offset == 0 && len(l.ents) == 1
++}
++
++func (l *raftLog) String() string {
++	return fmt.Sprintf("offset=%d committed=%d applied=%d len(ents)=%d", l.offset, l.committed, l.applied, len(l.ents))
++}
++
++func (l *raftLog) maybeAppend(index, logTerm, committed int64, ents ...Entry) bool {
++	if l.matchTerm(index, logTerm) {
++		from := index + 1
++		ci := l.findConflict(from, ents)
++		switch {
++		case ci == -1:
++		case ci <= l.committed:
++			panic("conflict with committed entry")
++		default:
++			l.append(ci-1, ents[ci-from:]...)
++		}
++		if l.committed < committed {
++			l.committed = min(committed, l.lastIndex())
++		}
++		return true
++	}
++	return false
++}
++
++func (l *raftLog) append(after int64, ents ...Entry) int64 {
++	l.ents = append(l.slice(l.offset, after+1), ents...)
++	l.unstable = min(l.unstable, after+1)
++	return l.lastIndex()
++}
++
++func (l *raftLog) findConflict(from int64, ents []Entry) int64 {
++	for i, ne := range ents {
++		if oe := l.at(from + int64(i)); oe == nil || oe.Term != ne.Term {
++			return from + int64(i)
++		}
++	}
++	return -1
++}
++
++func (l *raftLog) unstableEnts() []Entry {
++	ents := l.entries(l.unstable)
++	if ents == nil {
++		return nil
++	}
++	cpy := make([]Entry, len(ents))
++	copy(cpy, ents)
++	return cpy
++}
++
++func (l *raftLog) resetUnstable() {
++	l.unstable = l.lastIndex() + 1
++}
++
++// nextEnts returns all the available entries for execution.
++// all the returned entries will be marked as applied.
++func (l *raftLog) nextEnts() (ents []Entry) {
++	if l.committed > l.applied {
++		ents := l.slice(l.applied+1, l.committed+1)
++		if ents == nil {
++			return nil
++		}
++		cpy := make([]Entry, len(ents))
++		copy(cpy, ents)
++		return cpy
++	}
++	return nil
++}
++
++func (l *raftLog) resetNextEnts() {
++	if l.committed > l.applied {
++		l.applied = l.committed
++	}
++}
++
++func (l *raftLog) lastIndex() int64 {
++	return int64(len(l.ents)) - 1 + l.offset
++}
++
++func (l *raftLog) term(i int64) int64 {
++	if e := l.at(i); e != nil {
++		return e.Term
++	}
++	return -1
++}
++
++func (l *raftLog) entries(i int64) []Entry {
++	// never send out the first entry
++	// first entry is only used for matching
++	// prevLogTerm
++	if i == l.offset {
++		panic("cannot return the first entry in log")
++	}
++	return l.slice(i, l.lastIndex()+1)
++}
++
++func (l *raftLog) isUpToDate(i, term int64) bool {
++	e := l.at(l.lastIndex())
++	return term > e.Term || (term == e.Term && i >= l.lastIndex())
++}
++
++func (l *raftLog) matchTerm(i, term int64) bool {
++	if e := l.at(i); e != nil {
++		return e.Term == term
++	}
++	return false
++}
++
++func (l *raftLog) maybeCommit(maxIndex, term int64) bool {
++	if maxIndex > l.committed && l.term(maxIndex) == term {
++		l.committed = maxIndex
++		return true
++	}
++	return false
++}
++
++// compact compacts all log entries until i.
++// It removes the log entries before i, exclusive.
++// i must be not smaller than the index of the first entry
++// and not greater than the index of the last entry.
++// the number of entries after compaction will be returned.
++func (l *raftLog) compact(i int64) int64 {
++	if l.isOutOfBounds(i) {
++		panic(fmt.Sprintf("compact %d out of bounds [%d:%d]", i, l.offset, l.lastIndex()))
++	}
++	l.ents = l.slice(i, l.lastIndex()+1)
++	l.unstable = max(i+1, l.unstable)
++	l.offset = i
++	return int64(len(l.ents))
++}
++
++func (l *raftLog) snap(d []byte, clusterId, index, term int64, nodes []int64) {
++	l.snapshot = Snapshot{clusterId, d, nodes, index, term}
++}
++
++func (l *raftLog) shouldCompact() bool {
++	return (l.applied - l.offset) > l.compactThreshold
++}
++
++func (l *raftLog) restore(s Snapshot) {
++	l.ents = []Entry{{Term: s.Term}}
++	l.unstable = s.Index + 1
++	l.committed = s.Index
++	l.applied = s.Index
++	l.offset = s.Index
++	l.snapshot = s
++}
++
++func (l *raftLog) at(i int64) *Entry {
++	if l.isOutOfBounds(i) {
++		return nil
++	}
++	return &l.ents[i-l.offset]
++}
++
++// slice get a slice of log entries from lo through hi-1, inclusive.
++func (l *raftLog) slice(lo int64, hi int64) []Entry {
++	if lo >= hi {
++		return nil
++	}
++	if l.isOutOfBounds(lo) || l.isOutOfBounds(hi-1) {
++		return nil
++	}
++	return l.ents[lo-l.offset : hi-l.offset]
++}
++
++func (l *raftLog) isOutOfBounds(i int64) bool {
++	if i < l.offset || i > l.lastIndex() {
++		return true
++	}
++	return false
++}
++
++func min(a, b int64) int64 {
++	if a > b {
++		return b
++	}
++	return a
++}
++
++func max(a, b int64) int64 {
++	if a > b {
++		return a
++	}
++	return b
++}
+diff --git a/raft/log_test.go b/raft/log_test.go
+new file mode 100644
+index 0000000..5af620b
+--- /dev/null
++++ b/raft/log_test.go
+@@ -0,0 +1,303 @@
++package raft
++
++import (
++	"reflect"
++	"testing"
++)
++
++// TestAppend ensures:
++// 1. If an existing entry conflicts with a new one (same index
++// but different terms), delete the existing entry and all that
++// follow it
++// 2.Append any new entries not already in the log
++func TestAppend(t *testing.T) {
++	previousEnts := []Entry{{Term: 1}, {Term: 2}}
++	previousUnstable := int64(3)
++	tests := []struct {
++		after     int64
++		ents      []Entry
++		windex    int64
++		wents     []Entry
++		wunstable int64
++	}{
++		{
++			2,
++			[]Entry{},
++			2,
++			[]Entry{{Term: 1}, {Term: 2}},
++			3,
++		},
++		{
++			2,
++			[]Entry{{Term: 2}},
++			3,
++			[]Entry{{Term: 1}, {Term: 2}, {Term: 2}},
++			3,
++		},
++		// conflicts with index 1
++		{
++			0,
++			[]Entry{{Term: 2}},
++			1,
++			[]Entry{{Term: 2}},
++			1,
++		},
++		// conflicts with index 2
++		{
++			1,
++			[]Entry{{Term: 3}, {Term: 3}},
++			3,
++			[]Entry{{Term: 1}, {Term: 3}, {Term: 3}},
++			2,
++		},
++	}
++
++	for i, tt := range tests {
++		raftLog := newLog()
++		raftLog.ents = append(raftLog.ents, previousEnts...)
++		raftLog.unstable = previousUnstable
++		index := raftLog.append(tt.after, tt.ents...)
++		if index != tt.windex {
++			t.Errorf("#%d: lastIndex = %d, want %d", i, index, tt.windex)
++		}
++		if g := raftLog.entries(1); !reflect.DeepEqual(g, tt.wents) {
++			t.Errorf("#%d: logEnts = %+v, want %+v", i, g, tt.wents)
++		}
++		if g := raftLog.unstable; g != tt.wunstable {
++			t.Errorf("#%d: unstable = %d, want %d", i, g, tt.wunstable)
++		}
++	}
++}
++
++// TestCompactionSideEffects ensures that all the log related funcationality works correctly after
++// a compaction.
++func TestCompactionSideEffects(t *testing.T) {
++	var i int64
++	lastIndex := int64(1000)
++	raftLog := newLog()
++
++	for i = 0; i < lastIndex; i++ {
++		raftLog.append(int64(i), Entry{Term: int64(i + 1), Index: int64(i + 1)})
++	}
++
++	raftLog.compact(500)
++
++	if raftLog.lastIndex() != lastIndex {
++		t.Errorf("lastIndex = %d, want %d", raftLog.lastIndex(), lastIndex)
++	}
++
++	for i := raftLog.offset; i <= raftLog.lastIndex(); i++ {
++		if raftLog.term(i) != i {
++			t.Errorf("term(%d) = %d, want %d", i, raftLog.term(i), i)
++		}
++	}
++
++	for i := raftLog.offset; i <= raftLog.lastIndex(); i++ {
++		if !raftLog.matchTerm(i, i) {
++			t.Errorf("matchTerm(%d) = false, want true", i)
++		}
++	}
++
++	unstableEnts := raftLog.unstableEnts()
++	if g := len(unstableEnts); g != 500 {
++		t.Errorf("len(unstableEntries) = %d, want = %d", g, 500)
++	}
++	if unstableEnts[0].Index != 501 {
++		t.Errorf("Index = %d, want = %d", unstableEnts[0].Index, 501)
++	}
++
++	prev := raftLog.lastIndex()
++	raftLog.append(raftLog.lastIndex(), Entry{Term: raftLog.lastIndex() + 1})
++	if raftLog.lastIndex() != prev+1 {
++		t.Errorf("lastIndex = %d, want = %d", raftLog.lastIndex(), prev+1)
++	}
++
++	ents := raftLog.entries(raftLog.lastIndex())
++	if len(ents) != 1 {
++		t.Errorf("len(entries) = %d, want = %d", len(ents), 1)
++	}
++}
++
++func TestUnstableEnts(t *testing.T) {
++	previousEnts := []Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}}
++	tests := []struct {
++		unstable  int64
++		wents     []Entry
++		wunstable int64
++	}{
++		{3, nil, 3},
++		{1, previousEnts, 3},
++	}
++
++	for i, tt := range tests {
++		raftLog := newLog()
++		raftLog.ents = append(raftLog.ents, previousEnts...)
++		raftLog.unstable = tt.unstable
++		ents := raftLog.unstableEnts()
++		raftLog.resetUnstable()
++		if !reflect.DeepEqual(ents, tt.wents) {
++			t.Errorf("#%d: unstableEnts = %+v, want %+v", i, ents, tt.wents)
++		}
++		if g := raftLog.unstable; g != tt.wunstable {
++			t.Errorf("#%d: unstable = %d, want %d", i, g, tt.wunstable)
++		}
++	}
++}
++
++//TestCompaction ensures that the number of log entreis is correct after compactions.
++func TestCompaction(t *testing.T) {
++	tests := []struct {
++		app     int
++		compact []int64
++		wleft   []int
++		wallow  bool
++	}{
++		// out of upper bound
++		{1000, []int64{1001}, []int{-1}, false},
++		{1000, []int64{300, 500, 800, 900}, []int{701, 501, 201, 101}, true},
++		// out of lower bound
++		{1000, []int64{300, 299}, []int{701, -1}, false},
++	}
++
++	for i, tt := range tests {
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					if tt.wallow == true {
++						t.Errorf("%d: allow = %v, want %v", i, false, true)
++					}
++				}
++			}()
++
++			raftLog := newLog()
++			for i := 0; i < tt.app; i++ {
++				raftLog.append(int64(i), Entry{})
++			}
++
++			for j := 0; j < len(tt.compact); j++ {
++				raftLog.compact(tt.compact[j])
++				if len(raftLog.ents) != tt.wleft[j] {
++					t.Errorf("#%d.%d len = %d, want %d", i, j, len(raftLog.ents), tt.wleft[j])
++				}
++			}
++		}()
++	}
++}
++
++func TestLogRestore(t *testing.T) {
++	var i int64
++	raftLog := newLog()
++	for i = 0; i < 100; i++ {
++		raftLog.append(i, Entry{Term: i + 1})
++	}
++
++	index := int64(1000)
++	term := int64(1000)
++	raftLog.restore(Snapshot{Index: index, Term: term})
++
++	// only has the guard entry
++	if len(raftLog.ents) != 1 {
++		t.Errorf("len = %d, want 0", len(raftLog.ents))
++	}
++	if raftLog.offset != index {
++		t.Errorf("offset = %d, want %d", raftLog.offset, index)
++	}
++	if raftLog.applied != index {
++		t.Errorf("applied = %d, want %d", raftLog.applied, index)
++	}
++	if raftLog.committed != index {
++		t.Errorf("comitted = %d, want %d", raftLog.committed, index)
++	}
++	if raftLog.unstable != index+1 {
++		t.Errorf("unstable = %d, want %d", raftLog.unstable, index+1)
++	}
++	if raftLog.term(index) != term {
++		t.Errorf("term = %d, want %d", raftLog.term(index), term)
++	}
++}
++
++func TestIsOutOfBounds(t *testing.T) {
++	offset := int64(100)
++	num := int64(100)
++	l := &raftLog{offset: offset, ents: make([]Entry, num)}
++
++	tests := []struct {
++		index int64
++		w     bool
++	}{
++		{offset - 1, true},
++		{offset, false},
++		{offset + num/2, false},
++		{offset + num - 1, false},
++		{offset + num, true},
++	}
++
++	for i, tt := range tests {
++		g := l.isOutOfBounds(tt.index)
++		if g != tt.w {
++			t.Errorf("#%d: isOutOfBounds = %v, want %v", i, g, tt.w)
++		}
++	}
++}
++
++func TestAt(t *testing.T) {
++	var i int64
++	offset := int64(100)
++	num := int64(100)
++
++	l := &raftLog{offset: offset}
++	for i = 0; i < num; i++ {
++		l.ents = append(l.ents, Entry{Term: i})
++	}
++
++	tests := []struct {
++		index int64
++		w     *Entry
++	}{
++		{offset - 1, nil},
++		{offset, &Entry{Term: 0}},
++		{offset + num/2, &Entry{Term: num / 2}},
++		{offset + num - 1, &Entry{Term: num - 1}},
++		{offset + num, nil},
++	}
++
++	for i, tt := range tests {
++		g := l.at(tt.index)
++		if !reflect.DeepEqual(g, tt.w) {
++			t.Errorf("#%d: at = %v, want %v", i, g, tt.w)
++		}
++	}
++}
++
++func TestSlice(t *testing.T) {
++	var i int64
++	offset := int64(100)
++	num := int64(100)
++
++	l := &raftLog{offset: offset}
++	for i = 0; i < num; i++ {
++		l.ents = append(l.ents, Entry{Term: i})
++	}
++
++	tests := []struct {
++		from int64
++		to   int64
++		w    []Entry
++	}{
++		{offset - 1, offset + 1, nil},
++		{offset, offset + 1, []Entry{{Term: 0}}},
++		{offset + num/2, offset + num/2 + 1, []Entry{{Term: num / 2}}},
++		{offset + num - 1, offset + num, []Entry{{Term: num - 1}}},
++		{offset + num, offset + num + 1, nil},
++
++		{offset + num/2, offset + num/2, nil},
++		{offset + num/2, offset + num/2 - 1, nil},
++	}
++
++	for i, tt := range tests {
++		g := l.slice(tt.from, tt.to)
++		if !reflect.DeepEqual(g, tt.w) {
++			t.Errorf("#%d: from %d to %d = %v, want %v", i, tt.from, tt.to, g, tt.w)
++		}
++	}
++}
+diff --git a/raft/node.go b/raft/node.go
+index 1327c1c..d81021f 100644
+--- a/raft/node.go
++++ b/raft/node.go
+@@ -1,273 +1,127 @@
++// Package raft implements raft.
+ package raft
+ 
+-import (
+-	"encoding/binary"
+-	"encoding/json"
+-	"log"
+-	"math/rand"
+-	"sort"
+-	"time"
+-)
++import "code.google.com/p/go.net/context"
+ 
+-type Interface interface {
+-	Step(m Message) bool
+-	Msgs() []Message
++type stateResp struct {
++	st          State
++	ents, cents []Entry
++	msgs        []Message
+ }
+ 
+-type tick int64
++func (a State) Equal(b State) bool {
++	return a.Term == b.Term && a.Vote == b.Vote && a.LastIndex == b.LastIndex
++}
+ 
+-type Config struct {
+-	NodeId  int64
+-	Addr    string
+-	Context []byte
++func (sr stateResp) containsUpdates(prev stateResp) bool {
++	return !prev.st.Equal(sr.st) || len(sr.ents) > 0 || len(sr.cents) > 0 || len(sr.msgs) > 0
+ }
+ 
+ type Node struct {
+-	sm *stateMachine
+-
+-	elapsed      tick
+-	electionRand tick
+-	election     tick
+-	heartbeat    tick
+-
+-	// TODO: it needs garbage collection later
+-	rmNodes map[int64]struct{}
+-	removed bool
++	ctx    context.Context
++	propc  chan []byte
++	recvc  chan Message
++	statec chan stateResp
++	tickc  chan struct{}
+ }
+ 
+-func New(id int64, heartbeat, election tick) *Node {
+-	if election < heartbeat*3 {
+-		panic("election is least three times as heartbeat [election: %d, heartbeat: %d]")
+-	}
+-
+-	rand.Seed(time.Now().UnixNano())
++func Start(ctx context.Context, id int64, peers []int64) *Node {
+ 	n := &Node{
+-		heartbeat:    heartbeat,
+-		election:     election,
+-		electionRand: election + tick(rand.Int31())%election,
+-		sm:           newStateMachine(id, []int64{id}),
+-		rmNodes:      make(map[int64]struct{}),
+-	}
+-
++		ctx:    ctx,
++		propc:  make(chan []byte),
++		recvc:  make(chan Message),
++		statec: make(chan stateResp),
++		tickc:  make(chan struct{}),
++	}
++	r := newRaft(id, peers)
++	go n.run(r)
+ 	return n
+ }
+ 
+-func Recover(id int64, s *Snapshot, ents []Entry, state State, heartbeat, election tick) *Node {
+-	n := New(id, heartbeat, election)
+-	if s != nil {
+-		n.sm.restore(*s)
+-	}
+-	n.sm.loadEnts(ents)
+-	if !state.IsEmpty() {
+-		n.sm.loadState(state)
+-	}
+-	return n
+-}
+-
+-func (n *Node) Id() int64 { return n.sm.id }
+-
+-func (n *Node) ClusterId() int64 { return n.sm.clusterId }
+-
+-func (n *Node) Info() Info {
+-	return Info{Id: n.Id()}
+-}
+-
+-func (n *Node) Index() int64 { return n.sm.index.Get() }
+-
+-func (n *Node) Term() int64 { return n.sm.term.Get() }
+-
+-func (n *Node) Applied() int64 { return n.sm.raftLog.applied }
+-
+-func (n *Node) HasLeader() bool { return n.Leader() != none }
++func (n *Node) run(r *raft) {
++	propc := n.propc
++	statec := n.statec
+ 
+-func (n *Node) IsLeader() bool { return n.Leader() == n.Id() }
+-
+-func (n *Node) Leader() int64 { return n.sm.lead.Get() }
+-
+-func (n *Node) IsRemoved() bool { return n.removed }
+-
+-func (n *Node) Nodes() []int64 {
+-	nodes := make(int64Slice, 0, len(n.sm.ins))
+-	for k := range n.sm.ins {
+-		nodes = append(nodes, k)
+-	}
+-	sort.Sort(nodes)
+-	return nodes
+-}
+-
+-// Propose asynchronously proposes data be applied to the underlying state machine.
+-func (n *Node) Propose(data []byte) { n.propose(Normal, data) }
+-
+-func (n *Node) propose(t int64, data []byte) {
+-	n.Step(Message{From: n.sm.id, ClusterId: n.ClusterId(), Type: msgProp, Entries: []Entry{{Type: t, Data: data}}})
+-}
+-
+-func (n *Node) Campaign() { n.Step(Message{From: n.sm.id, ClusterId: n.ClusterId(), Type: msgHup}) }
+-
+-func (n *Node) InitCluster(clusterId int64) {
+-	d := make([]byte, 10)
+-	wn := binary.PutVarint(d, clusterId)
+-	n.propose(ClusterInit, d[:wn])
+-}
+-
+-func (n *Node) Add(id int64, addr string, context []byte) {
+-	n.UpdateConf(AddNode, &Config{NodeId: id, Addr: addr, Context: context})
+-}
+-
+-func (n *Node) Remove(id int64) {
+-	n.UpdateConf(RemoveNode, &Config{NodeId: id})
+-}
+-
+-func (n *Node) Msgs() []Message { return n.sm.Msgs() }
+-
+-func (n *Node) Step(m Message) bool {
+-	if m.Type == msgDenied {
+-		n.removed = true
+-		return false
+-	}
+-	if n.ClusterId() != none && m.ClusterId != none && m.ClusterId != n.ClusterId() {
+-		log.Printf("deny message from=%d cluster=%d", m.From, m.ClusterId)
+-		n.sm.send(Message{To: m.From, ClusterId: n.ClusterId(), Type: msgDenied})
+-		return true
+-	}
+-
+-	if _, ok := n.rmNodes[m.From]; ok {
+-		if m.From != n.sm.id {
+-			n.sm.send(Message{To: m.From, ClusterId: n.ClusterId(), Type: msgDenied})
++	var prev stateResp
++	for {
++		if r.hasLeader() {
++			propc = n.propc
++		} else {
++			// We cannot accept proposals because we don't know who
++			// to send them to, so we'll apply back-pressure and
++			// block senders.
++			propc = nil
+ 		}
+-		return true
+-	}
+ 
+-	l := len(n.sm.msgs)
+-
+-	if !n.sm.Step(m) {
+-		return false
+-	}
+-
+-	for _, m := range n.sm.msgs[l:] {
+-		switch m.Type {
+-		case msgAppResp:
+-			// We just heard from the leader of the same term.
+-			n.elapsed = 0
+-		case msgVoteResp:
+-			// We just heard from the candidate the node voted for.
+-			if m.Index >= 0 {
+-				n.elapsed = 0
+-			}
++		sr := stateResp{
++			r.State,
++			r.raftLog.unstableEnts(),
++			r.raftLog.nextEnts(),
++			r.msgs,
+ 		}
+-	}
+-	return true
+-}
+ 
+-// Next returns all the appliable entries
+-func (n *Node) Next() []Entry {
+-	ents := n.sm.nextEnts()
+-	for i := range ents {
+-		switch ents[i].Type {
+-		case Normal:
+-		case ClusterInit:
+-			cid, nr := binary.Varint(ents[i].Data)
+-			if nr <= 0 {
+-				panic("init cluster failed: cannot read clusterId")
+-			}
+-			if n.ClusterId() != -1 {
+-				panic("cannot init a started cluster")
+-			}
+-			n.sm.clusterId = cid
+-		case AddNode:
+-			c := new(Config)
+-			if err := json.Unmarshal(ents[i].Data, c); err != nil {
+-				log.Printf("raft: err=%q", err)
+-				continue
+-			}
+-			n.sm.addNode(c.NodeId)
+-			delete(n.rmNodes, c.NodeId)
+-		case RemoveNode:
+-			c := new(Config)
+-			if err := json.Unmarshal(ents[i].Data, c); err != nil {
+-				log.Printf("raft: err=%q", err)
+-				continue
+-			}
+-			n.sm.removeNode(c.NodeId)
+-			n.rmNodes[c.NodeId] = struct{}{}
+-			if c.NodeId == n.sm.id {
+-				n.removed = true
+-			}
+-		default:
+-			panic("unexpected entry type")
++		if sr.containsUpdates(prev) {
++			statec = n.statec
++		} else {
++			statec = nil
+ 		}
+-	}
+-	return ents
+-}
+-
+-// Tick triggers the node to do a tick.
+-// If the current elapsed is greater or equal than the timeout,
+-// node will send corresponding message to the statemachine.
+-func (n *Node) Tick() {
+-	if !n.sm.promotable {
+-		return
+-	}
+ 
+-	timeout, msgType := n.electionRand, msgHup
+-	if n.sm.state == stateLeader {
+-		timeout, msgType = n.heartbeat, msgBeat
+-	}
+-	if n.elapsed >= timeout {
+-		n.Step(Message{From: n.sm.id, ClusterId: n.ClusterId(), Type: msgType})
+-		n.elapsed = 0
+-		if n.sm.state != stateLeader {
+-			n.electionRand = n.election + tick(rand.Int31())%n.election
++		select {
++		case p := <-propc:
++			r.propose(p)
++		case m := <-n.recvc:
++			r.Step(m) // raft never returns an error
++		case <-n.tickc:
++			// r.tick()
++		case statec <- sr:
++			r.raftLog.resetNextEnts()
++			r.raftLog.resetUnstable()
++			r.msgs = nil
++		case <-n.ctx.Done():
++			return
+ 		}
+-	} else {
+-		n.elapsed++
+ 	}
+ }
+ 
+-// IsEmpty returns ture if the log of the node is empty.
+-func (n *Node) IsEmpty() bool {
+-	return n.sm.raftLog.isEmpty()
+-}
+-
+-func (n *Node) UpdateConf(t int64, c *Config) {
+-	data, err := json.Marshal(c)
+-	if err != nil {
+-		panic(err)
++func (n *Node) Tick() error {
++	select {
++	case n.tickc <- struct{}{}:
++		return nil
++	case <-n.ctx.Done():
++		return n.ctx.Err()
+ 	}
+-	n.propose(t, data)
+ }
+ 
+-// UnstableEnts retuens all the entries that need to be persistent.
+-// The first return value is offset, and the second one is unstable entries.
+-func (n *Node) UnstableEnts() []Entry {
+-	return n.sm.raftLog.unstableEnts()
+-}
+-
+-func (n *Node) UnstableState() State {
+-	if n.sm.unstableState.IsEmpty() {
+-		return EmptyState
++// Propose proposes data be appended to the log.
++func (n *Node) Propose(ctx context.Context, data []byte) error {
++	select {
++	case n.propc <- data:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-n.ctx.Done():
++		return n.ctx.Err()
+ 	}
+-	s := n.sm.unstableState
+-	n.sm.clearState()
+-	return s
+ }
+ 
+-func (n *Node) UnstableSnapshot() Snapshot {
+-	if n.sm.raftLog.unstableSnapshot.IsEmpty() {
+-		return emptySnapshot
++// Step advances the state machine using m.
++func (n *Node) Step(m Message) error {
++	select {
++	case n.recvc <- m:
++		return nil
++	case <-n.ctx.Done():
++		return n.ctx.Err()
+ 	}
+-	s := n.sm.raftLog.unstableSnapshot
+-	n.sm.raftLog.unstableSnapshot = emptySnapshot
+-	return s
+-}
+-
+-func (n *Node) GetSnap() Snapshot {
+-	return n.sm.raftLog.snapshot
+ }
+ 
+-func (n *Node) Compact(d []byte) {
+-	n.sm.compact(d)
+-}
+-
+-func (n *Node) EntsLen() int {
+-	return len(n.sm.raftLog.ents)
++// ReadState returns the current point-in-time state.
++func (n *Node) ReadState(ctx context.Context) (st State, ents, cents []Entry, msgs []Message, err error) {
++	select {
++	case sr := <-n.statec:
++		return sr.st, sr.ents, sr.cents, sr.msgs, nil
++	case <-ctx.Done():
++		return State{}, nil, nil, nil, ctx.Err()
++	case <-n.ctx.Done():
++		return State{}, nil, nil, nil, n.ctx.Err()
++	}
+ }
+diff --git a/raft/node_test.go b/raft/node_test.go
+index 32969f3..0a0cadc 100644
+--- a/raft/node_test.go
++++ b/raft/node_test.go
+@@ -1,224 +1,5 @@
+ package raft
+ 
+-import (
+-	"reflect"
+-	"testing"
+-)
++import "testing"
+ 
+-const (
+-	defaultHeartbeat = 1
+-	defaultElection  = 5
+-)
+-
+-func TestTickMsgHup(t *testing.T) {
+-	n := New(0, defaultHeartbeat, defaultElection)
+-	n.sm = newStateMachine(0, []int64{0, 1, 2})
+-	n.sm.promotable = true
+-
+-	for i := 0; i < defaultElection*2; i++ {
+-		n.Tick()
+-	}
+-
+-	called := false
+-	for _, m := range n.Msgs() {
+-		if m.Type == msgVote {
+-			called = true
+-		}
+-	}
+-
+-	if !called {
+-		t.Errorf("called = %v, want true", called)
+-	}
+-}
+-
+-func TestTickMsgBeat(t *testing.T) {
+-	k := 3
+-	n := dictate(New(0, defaultHeartbeat, defaultElection))
+-	n.Next()
+-	for i := 1; i < k; i++ {
+-		n.Add(int64(i), "", nil)
+-		for _, m := range n.Msgs() {
+-			if m.Type == msgApp {
+-				n.Step(Message{From: m.To, ClusterId: m.ClusterId, Type: msgAppResp, Index: m.Index + int64(len(m.Entries))})
+-			}
+-		}
+-		// ignore commit index update messages
+-		n.Msgs()
+-		n.Next()
+-	}
+-
+-	for i := 0; i < defaultHeartbeat+1; i++ {
+-		n.Tick()
+-	}
+-
+-	called := 0
+-	for _, m := range n.Msgs() {
+-		if m.Type == msgApp && len(m.Entries) == 0 {
+-			called++
+-		}
+-	}
+-
+-	// msgBeat -> k-1 append
+-	w := k - 1
+-	if called != w {
+-		t.Errorf("called = %v, want %v", called, w)
+-	}
+-}
+-
+-func TestResetElapse(t *testing.T) {
+-	tests := []struct {
+-		msg      Message
+-		welapsed tick
+-	}{
+-		{Message{From: 0, To: 1, Type: msgApp, Term: 2, Entries: []Entry{{Term: 1}}}, 0},
+-		{Message{From: 0, To: 1, Type: msgApp, Term: 1, Entries: []Entry{{Term: 1}}}, 1},
+-		{Message{From: 0, To: 1, Type: msgVote, Term: 2, Index: 1, LogTerm: 1}, 0},
+-		{Message{From: 0, To: 1, Type: msgVote, Term: 1}, 1},
+-	}
+-
+-	for i, tt := range tests {
+-		n := New(0, defaultHeartbeat, defaultElection)
+-		n.sm = newStateMachine(0, []int64{0, 1, 2})
+-		n.sm.promotable = true
+-		n.sm.raftLog.append(0, Entry{Type: Normal, Term: 1})
+-		n.sm.term = 2
+-		n.sm.raftLog.committed = 1
+-
+-		n.Tick()
+-		if n.elapsed != 1 {
+-			t.Errorf("%d: elpased = %d, want %d", i, n.elapsed, 1)
+-		}
+-
+-		n.Step(tt.msg)
+-		if n.elapsed != tt.welapsed {
+-			t.Errorf("%d: elpased = %d, want %d", i, n.elapsed, tt.welapsed)
+-		}
+-	}
+-}
+-
+-func TestStartCluster(t *testing.T) {
+-	n := dictate(New(0, defaultHeartbeat, defaultElection))
+-	n.Next()
+-
+-	if len(n.sm.ins) != 1 {
+-		t.Errorf("k = %d, want 1", len(n.sm.ins))
+-	}
+-	if n.sm.id != 0 {
+-		t.Errorf("id = %d, want 0", n.sm.id)
+-	}
+-	if n.sm.state != stateLeader {
+-		t.Errorf("state = %s, want %s", n.sm.state, stateLeader)
+-	}
+-}
+-
+-func TestAdd(t *testing.T) {
+-	n := dictate(New(0, defaultHeartbeat, defaultElection))
+-	n.Next()
+-	n.Add(1, "", nil)
+-	n.Next()
+-
+-	if len(n.sm.ins) != 2 {
+-		t.Errorf("k = %d, want 2", len(n.sm.ins))
+-	}
+-	if n.sm.id != 0 {
+-		t.Errorf("id = %d, want 0", n.sm.id)
+-	}
+-}
+-
+-func TestRemove(t *testing.T) {
+-	n := dictate(New(0, defaultHeartbeat, defaultElection))
+-	n.Next()
+-	n.Add(1, "", nil)
+-	n.Next()
+-	n.Remove(0)
+-	n.Step(Message{Type: msgAppResp, From: 1, ClusterId: n.ClusterId(), Term: 1, Index: 5})
+-	n.Next()
+-
+-	if len(n.sm.ins) != 1 {
+-		t.Errorf("k = %d, want 1", len(n.sm.ins))
+-	}
+-	if n.sm.id != 0 {
+-		t.Errorf("id = %d, want 0", n.sm.id)
+-	}
+-}
+-
+-func TestDenial(t *testing.T) {
+-	logents := []Entry{
+-		{Type: AddNode, Term: 1, Data: []byte(`{"NodeId":1}`)},
+-		{Type: AddNode, Term: 1, Data: []byte(`{"NodeId":2}`)},
+-		{Type: RemoveNode, Term: 1, Data: []byte(`{"NodeId":2}`)},
+-	}
+-
+-	tests := []struct {
+-		ent     Entry
+-		wdenied map[int64]bool
+-	}{
+-		{
+-			Entry{Type: AddNode, Term: 1, Data: []byte(`{"NodeId":2}`)},
+-			map[int64]bool{1: false, 2: false},
+-		},
+-		{
+-			Entry{Type: RemoveNode, Term: 1, Data: []byte(`{"NodeId":1}`)},
+-			map[int64]bool{1: true, 2: true},
+-		},
+-		{
+-			Entry{Type: RemoveNode, Term: 1, Data: []byte(`{"NodeId":0}`)},
+-			map[int64]bool{1: false, 2: true},
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		n := dictate(New(0, defaultHeartbeat, defaultElection))
+-		n.Next()
+-		n.Msgs()
+-		n.sm.raftLog.append(n.sm.raftLog.committed, append(logents, tt.ent)...)
+-		n.sm.raftLog.committed += int64(len(logents) + 1)
+-		n.Next()
+-
+-		for id, denied := range tt.wdenied {
+-			n.Step(Message{From: id, To: 0, ClusterId: n.ClusterId(), Type: msgApp, Term: 1})
+-			w := []Message{}
+-			if denied {
+-				w = []Message{{From: 0, To: id, ClusterId: n.ClusterId(), Term: 1, Type: msgDenied}}
+-			}
+-			if g := n.Msgs(); !reflect.DeepEqual(g, w) {
+-				t.Errorf("#%d: msgs for %d = %+v, want %+v", i, id, g, w)
+-			}
+-		}
+-	}
+-}
+-
+-func TestRecover(t *testing.T) {
+-	ents := []Entry{{Term: 1}, {Term: 2}, {Term: 3}}
+-	state := State{Term: 500, Vote: 1, Commit: 3}
+-
+-	n := Recover(0, nil, ents, state, defaultHeartbeat, defaultElection)
+-	if g := n.Next(); !reflect.DeepEqual(g, ents) {
+-		t.Errorf("ents = %+v, want %+v", g, ents)
+-	}
+-	if g := n.sm.term; g.Get() != state.Term {
+-		t.Errorf("term = %d, want %d", g, state.Term)
+-	}
+-	if g := n.sm.vote; g != state.Vote {
+-		t.Errorf("vote = %d, want %d", g, state.Vote)
+-	}
+-	if g := n.sm.raftLog.committed; g != state.Commit {
+-		t.Errorf("committed = %d, want %d", g, state.Commit)
+-	}
+-	if g := n.UnstableEnts(); g != nil {
+-		t.Errorf("unstableEnts = %+v, want nil", g)
+-	}
+-	if g := n.UnstableState(); !reflect.DeepEqual(g, state) {
+-		t.Errorf("unstableState = %+v, want %+v", g, state)
+-	}
+-	if g := n.Msgs(); len(g) != 0 {
+-		t.Errorf("#%d: len(msgs) = %d, want 0", len(g))
+-	}
+-}
+-
+-func dictate(n *Node) *Node {
+-	n.Step(Message{From: n.Id(), Type: msgHup})
+-	n.InitCluster(0xBEEF)
+-	n.Add(n.Id(), "", nil)
+-	return n
+-}
++func TestNode(t *testing.T) {}
+diff --git a/raft/raft.go b/raft/raft.go
+new file mode 100644
+index 0000000..170ca6c
+--- /dev/null
++++ b/raft/raft.go
+@@ -0,0 +1,536 @@
++package raft
++
++import (
++	"errors"
++	"fmt"
++	"sort"
++)
++
++const none = -1
++
++type messageType int64
++
++const (
++	msgHup messageType = iota
++	msgBeat
++	msgProp
++	msgApp
++	msgAppResp
++	msgVote
++	msgVoteResp
++	msgSnap
++	msgDenied
++)
++
++var mtmap = [...]string{
++	msgHup:      "msgHup",
++	msgBeat:     "msgBeat",
++	msgProp:     "msgProp",
++	msgApp:      "msgApp",
++	msgAppResp:  "msgAppResp",
++	msgVote:     "msgVote",
++	msgVoteResp: "msgVoteResp",
++	msgSnap:     "msgSnap",
++	msgDenied:   "msgDenied",
++}
++
++func (mt messageType) String() string {
++	return mtmap[int64(mt)]
++}
++
++var errNoLeader = errors.New("no leader")
++
++const (
++	stateFollower stateType = iota
++	stateCandidate
++	stateLeader
++)
++
++type stateType int64
++
++var stmap = [...]string{
++	stateFollower:  "stateFollower",
++	stateCandidate: "stateCandidate",
++	stateLeader:    "stateLeader",
++}
++
++var stepmap = [...]stepFunc{
++	stateFollower:  stepFollower,
++	stateCandidate: stepCandidate,
++	stateLeader:    stepLeader,
++}
++
++func (st stateType) String() string {
++	return stmap[int64(st)]
++}
++
++type Message struct {
++	Type     messageType
++	To       int64
++	From     int64
++	Term     int64
++	LogTerm  int64
++	Index    int64
++	Entries  []Entry
++	Commit   int64
++	Snapshot Snapshot
++}
++
++func (m Message) String() string {
++	return fmt.Sprintf("type=%v from=%x to=%x term=%d logTerm=%d i=%d ci=%d len(ents)=%d",
++		m.Type, m.From, m.To, m.Term, m.LogTerm, m.Index, m.Commit, len(m.Entries))
++}
++
++type progress struct {
++	match, next int64
++}
++
++func (pr *progress) update(n int64) {
++	pr.match = n
++	pr.next = n + 1
++}
++
++func (pr *progress) decr() {
++	if pr.next--; pr.next < 1 {
++		pr.next = 1
++	}
++}
++
++func (pr *progress) String() string {
++	return fmt.Sprintf("n=%d m=%d", pr.next, pr.match)
++}
++
++// int64Slice implements sort interface
++type int64Slice []int64
++
++func (p int64Slice) Len() int           { return len(p) }
++func (p int64Slice) Less(i, j int) bool { return p[i] < p[j] }
++func (p int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
++
++type raft struct {
++	State
++
++	id int64
++
++	// the term we are participating in at any time
++	index int64
++
++	// the log
++	raftLog *raftLog
++
++	prs map[int64]*progress
++
++	state stateType
++
++	votes map[int64]bool
++
++	msgs []Message
++
++	// the leader id
++	lead int64
++
++	// pending reconfiguration
++	configuring bool
++
++	// promotable indicates whether state machine could be promoted.
++	// New machine has to wait until it has been added to the cluster, or it
++	// may become the leader of the cluster without it.
++	promotable bool
++}
++
++func newRaft(id int64, peers []int64) *raft {
++	if id == none {
++		panic("cannot use none id")
++	}
++	r := &raft{id: id, lead: none, raftLog: newLog(), prs: make(map[int64]*progress)}
++	for _, p := range peers {
++		r.prs[p] = &progress{}
++	}
++	r.reset(0)
++	return r
++}
++
++func (r *raft) hasLeader() bool { return r.lead != none }
++
++func (r *raft) propose(data []byte) {
++	r.Step(Message{From: r.id, Type: msgProp, Entries: []Entry{{Data: data}}})
++}
++
++func (r *raft) String() string {
++	s := fmt.Sprintf(`state=%v term=%d`, r.state, r.Term)
++	switch r.state {
++	case stateFollower:
++		s += fmt.Sprintf(" vote=%v lead=%v", r.Vote, r.lead)
++	case stateCandidate:
++		s += fmt.Sprintf(` votes="%v"`, r.votes)
++	case stateLeader:
++		s += fmt.Sprintf(` prs="%v"`, r.prs)
++	}
++	return s
++}
++
++func (r *raft) poll(id int64, v bool) (granted int) {
++	if _, ok := r.votes[id]; !ok {
++		r.votes[id] = v
++	}
++	for _, vv := range r.votes {
++		if vv {
++			granted++
++		}
++	}
++	return granted
++}
++
++// send persists state to stable storage and then sends to its mailbox.
++func (r *raft) send(m Message) {
++	m.From = r.id
++	m.Term = r.Term
++	r.msgs = append(r.msgs, m)
++}
++
++// sendAppend sends RRPC, with entries to the given peer.
++func (r *raft) sendAppend(to int64) {
++	pr := r.prs[to]
++	m := Message{}
++	m.To = to
++	m.Index = pr.next - 1
++	if r.needSnapshot(m.Index) {
++		m.Type = msgSnap
++		m.Snapshot = r.raftLog.snapshot
++	} else {
++		m.Type = msgApp
++		m.LogTerm = r.raftLog.term(pr.next - 1)
++		m.Entries = r.raftLog.entries(pr.next)
++		m.Commit = r.raftLog.committed
++	}
++	r.send(m)
++}
++
++// sendHeartbeat sends RRPC, without entries to the given peer.
++func (r *raft) sendHeartbeat(to int64) {
++	pr := r.prs[to]
++	index := max(pr.next-1, r.raftLog.lastIndex())
++	m := Message{
++		To:      to,
++		Type:    msgApp,
++		Index:   index,
++		LogTerm: r.raftLog.term(index),
++		Commit:  r.raftLog.committed,
++	}
++	r.send(m)
++}
++
++// bcastAppend sends RRPC, with entries to all peers that are not up-to-date according to r.mis.
++func (r *raft) bcastAppend() {
++	for i := range r.prs {
++		if i == r.id {
++			continue
++		}
++		r.sendAppend(i)
++	}
++}
++
++// bcastHeartbeat sends RRPC, without entries to all the peers.
++func (r *raft) bcastHeartbeat() {
++	for i := range r.prs {
++		if i == r.id {
++			continue
++		}
++		r.sendHeartbeat(i)
++	}
++}
++
++func (r *raft) maybeCommit() bool {
++	// TODO(bmizerany): optimize.. Currently naive
++	mis := make(int64Slice, 0, len(r.prs))
++	for i := range r.prs {
++		mis = append(mis, r.prs[i].match)
++	}
++	sort.Sort(sort.Reverse(mis))
++	mci := mis[r.q()-1]
++
++	return r.raftLog.maybeCommit(mci, r.Term)
++}
++
++func (r *raft) reset(term int64) {
++	r.Term = term
++	r.lead = none
++	r.Vote = none
++	r.votes = make(map[int64]bool)
++	for i := range r.prs {
++		r.prs[i] = &progress{next: r.raftLog.lastIndex() + 1}
++		if i == r.id {
++			r.prs[i].match = r.raftLog.lastIndex()
++		}
++	}
++}
++
++func (r *raft) q() int {
++	return len(r.prs)/2 + 1
++}
++
++func (r *raft) appendEntry(e Entry) {
++	e.Term = r.Term
++	e.Index = r.raftLog.lastIndex() + 1
++	r.LastIndex = r.raftLog.append(r.raftLog.lastIndex(), e)
++	r.prs[r.id].update(r.raftLog.lastIndex())
++	r.maybeCommit()
++}
++
++func (r *raft) becomeFollower(term int64, lead int64) {
++	r.reset(term)
++	r.lead = lead
++	r.state = stateFollower
++	r.configuring = false
++}
++
++func (r *raft) becomeCandidate() {
++	// TODO(xiangli) remove the panic when the raft implementation is stable
++	if r.state == stateLeader {
++		panic("invalid transition [leader -> candidate]")
++	}
++	r.reset(r.Term + 1)
++	r.Vote = r.id
++	r.state = stateCandidate
++}
++
++func (r *raft) becomeLeader() {
++	// TODO(xiangli) remove the panic when the raft implementation is stable
++	if r.state == stateFollower {
++		panic("invalid transition [follower -> leader]")
++	}
++	r.reset(r.Term)
++	r.lead = r.id
++	r.state = stateLeader
++
++	for _, e := range r.raftLog.entries(r.raftLog.committed + 1) {
++		if e.isConfig() {
++			r.configuring = true
++		}
++	}
++
++	r.appendEntry(Entry{Type: Normal, Data: nil})
++}
++
++func (r *raft) ReadMessages() []Message {
++	msgs := r.msgs
++	r.msgs = make([]Message, 0)
++
++	return msgs
++}
++
++func (r *raft) Step(m Message) error {
++	// TODO(bmizerany): this likely allocs - prevent that.
++	defer func() { r.Commit = r.raftLog.committed }()
++
++	if m.Type == msgHup {
++		r.becomeCandidate()
++		if r.q() == r.poll(r.id, true) {
++			r.becomeLeader()
++		}
++		for i := range r.prs {
++			if i == r.id {
++				continue
++			}
++			lasti := r.raftLog.lastIndex()
++			r.send(Message{To: i, Type: msgVote, Index: lasti, LogTerm: r.raftLog.term(lasti)})
++		}
++	}
++
++	switch {
++	case m.Term == 0:
++		// local message
++	case m.Term > r.Term:
++		lead := m.From
++		if m.Type == msgVote {
++			lead = none
++		}
++		r.becomeFollower(m.Term, lead)
++	case m.Term < r.Term:
++		// ignore
++	}
++
++	stepmap[r.state](r, m)
++	return nil
++}
++
++func (r *raft) handleAppendEntries(m Message) {
++	if r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...) {
++		r.LastIndex = r.raftLog.lastIndex()
++		r.send(Message{To: m.From, Type: msgAppResp, Index: r.raftLog.lastIndex()})
++	} else {
++		r.send(Message{To: m.From, Type: msgAppResp, Index: -1})
++	}
++}
++
++func (r *raft) handleSnapshot(m Message) {
++	if r.restore(m.Snapshot) {
++		r.send(Message{To: m.From, Type: msgAppResp, Index: r.raftLog.lastIndex()})
++	} else {
++		r.send(Message{To: m.From, Type: msgAppResp, Index: r.raftLog.committed})
++	}
++}
++
++func (r *raft) addNode(id int64) {
++	r.setProgress(id, 0, r.raftLog.lastIndex()+1)
++	r.configuring = false
++	if id == r.id {
++		r.promotable = true
++	}
++}
++
++func (r *raft) removeNode(id int64) {
++	r.delProgress(id)
++	r.configuring = false
++}
++
++type stepFunc func(r *raft, m Message)
++
++func stepLeader(r *raft, m Message) {
++	switch m.Type {
++	case msgBeat:
++		r.bcastHeartbeat()
++	case msgProp:
++		if len(m.Entries) != 1 {
++			panic("unexpected length(entries) of a msgProp")
++		}
++		e := m.Entries[0]
++		if e.isConfig() {
++			if r.configuring {
++				panic("pending conf")
++			}
++			r.configuring = true
++		}
++		r.appendEntry(e)
++		r.bcastAppend()
++	case msgAppResp:
++		if m.Index < 0 {
++			r.prs[m.From].decr()
++			r.sendAppend(m.From)
++		} else {
++			r.prs[m.From].update(m.Index)
++			if r.maybeCommit() {
++				r.bcastAppend()
++			}
++		}
++	case msgVote:
++		r.send(Message{To: m.From, Type: msgVoteResp, Index: -1})
++	}
++}
++
++func stepCandidate(r *raft, m Message) {
++	switch m.Type {
++	case msgProp:
++		panic("no leader")
++	case msgApp:
++		r.becomeFollower(r.Term, m.From)
++		r.handleAppendEntries(m)
++	case msgSnap:
++		r.becomeFollower(m.Term, m.From)
++		r.handleSnapshot(m)
++	case msgVote:
++		r.send(Message{To: m.From, Type: msgVoteResp, Index: -1})
++	case msgVoteResp:
++		gr := r.poll(m.From, m.Index >= 0)
++		switch r.q() {
++		case gr:
++			r.becomeLeader()
++			r.bcastAppend()
++		case len(r.votes) - gr:
++			r.becomeFollower(r.Term, none)
++		}
++	}
++}
++
++func stepFollower(r *raft, m Message) {
++	switch m.Type {
++	case msgProp:
++		if r.lead == none {
++			panic("no leader")
++		}
++		m.To = r.lead
++		r.send(m)
++	case msgApp:
++		r.lead = m.From
++		r.handleAppendEntries(m)
++	case msgSnap:
++		r.handleSnapshot(m)
++	case msgVote:
++		if (r.Vote == none || r.Vote == m.From) && r.raftLog.isUpToDate(m.Index, m.LogTerm) {
++			r.Vote = m.From
++			r.send(Message{To: m.From, Type: msgVoteResp, Index: r.raftLog.lastIndex()})
++		} else {
++			r.send(Message{To: m.From, Type: msgVoteResp, Index: -1})
++		}
++	}
++}
++
++func (r *raft) compact(d []byte) {
++	r.raftLog.snap(d, r.raftLog.applied, r.raftLog.term(r.raftLog.applied), r.nodes())
++	r.raftLog.compact(r.raftLog.applied)
++}
++
++// restore recovers the statemachine from a snapshot. It restores the log and the
++// configuration of statemachine.
++func (r *raft) restore(s Snapshot) bool {
++	if s.Index <= r.raftLog.committed {
++		return false
++	}
++
++	r.raftLog.restore(s)
++	r.LastIndex = r.raftLog.lastIndex()
++	r.prs = make(map[int64]*progress)
++	for _, n := range s.Nodes {
++		if n == r.id {
++			r.setProgress(n, r.raftLog.lastIndex(), r.raftLog.lastIndex()+1)
++		} else {
++			r.setProgress(n, 0, r.raftLog.lastIndex()+1)
++		}
++	}
++	r.configuring = false
++	return true
++}
++
++func (r *raft) needSnapshot(i int64) bool {
++	if i < r.raftLog.offset {
++		if r.raftLog.snapshot.IsEmpty() {
++			panic("need non-empty snapshot")
++		}
++		return true
++	}
++	return false
++}
++
++func (r *raft) nodes() []int64 {
++	nodes := make([]int64, 0, len(r.prs))
++	for k := range r.prs {
++		nodes = append(nodes, k)
++	}
++	return nodes
++}
++
++func (r *raft) setProgress(id, match, next int64) {
++	r.prs[id] = &progress{next: next, match: match}
++}
++
++func (r *raft) delProgress(id int64) {
++	delete(r.prs, id)
++}
++
++func (r *raft) loadEnts(ents []Entry) {
++	if !r.raftLog.isEmpty() {
++		panic("cannot load entries when log is not empty")
++	}
++	r.raftLog.append(0, ents...)
++	r.raftLog.unstable = r.raftLog.lastIndex() + 1
++}
++
++func (r *raft) loadState(state State) {
++	r.raftLog.committed = state.Commit
++	r.Term = state.Term
++	r.Vote = state.Vote
++}
++
++func (s *State) IsEmpty() bool {
++	return s.Term == 0
++}
+diff --git a/raft/raft_test.go b/raft/raft_test.go
+new file mode 100644
+index 0000000..511cf93
+--- /dev/null
++++ b/raft/raft_test.go
+@@ -0,0 +1,1035 @@
++package raft
++
++import (
++	"bytes"
++	"math/rand"
++	"reflect"
++	"sort"
++	"testing"
++)
++
++// nextEnts returns the appliable entries and updates the applied index
++func (r *raft) nextEnts() (ents []Entry) {
++	ents = r.raftLog.nextEnts()
++	r.raftLog.resetNextEnts()
++	return ents
++}
++
++type Interface interface {
++	Step(m Message) error
++	ReadMessages() []Message
++}
++
++func TestLeaderElection(t *testing.T) {
++	tests := []struct {
++		*network
++		state stateType
++	}{
++		{newNetwork(nil, nil, nil), stateLeader},
++		{newNetwork(nil, nil, nopStepper), stateLeader},
++		{newNetwork(nil, nopStepper, nopStepper), stateCandidate},
++		{newNetwork(nil, nopStepper, nopStepper, nil), stateCandidate},
++		{newNetwork(nil, nopStepper, nopStepper, nil, nil), stateLeader},
++
++		// three logs further along than 0
++		{newNetwork(nil, ents(1), ents(2), ents(1, 3), nil), stateFollower},
++
++		// logs converge
++		{newNetwork(ents(1), nil, ents(2), ents(1), nil), stateLeader},
++	}
++
++	for i, tt := range tests {
++		tt.send(Message{From: 0, To: 0, Type: msgHup})
++		sm := tt.network.peers[0].(*raft)
++		if sm.state != tt.state {
++			t.Errorf("#%d: state = %s, want %s", i, sm.state, tt.state)
++		}
++		if g := sm.Term; g != 1 {
++			t.Errorf("#%d: term = %d, want %d", i, g, 1)
++		}
++	}
++}
++
++func TestLogReplication(t *testing.T) {
++	tests := []struct {
++		*network
++		msgs       []Message
++		wcommitted int64
++	}{
++		{
++			newNetwork(nil, nil, nil),
++			[]Message{
++				{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}},
++			},
++			2,
++		},
++		{
++			newNetwork(nil, nil, nil),
++			[]Message{
++
++				{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}},
++				{From: 0, To: 1, Type: msgHup},
++				{From: 0, To: 1, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}},
++			},
++			4,
++		},
++	}
++
++	for i, tt := range tests {
++		tt.send(Message{From: 0, To: 0, Type: msgHup})
++
++		for _, m := range tt.msgs {
++			tt.send(m)
++		}
++
++		for j, x := range tt.network.peers {
++			sm := x.(*raft)
++
++			if sm.raftLog.committed != tt.wcommitted {
++				t.Errorf("#%d.%d: committed = %d, want %d", i, j, sm.raftLog.committed, tt.wcommitted)
++			}
++
++			ents := make([]Entry, 0)
++			for _, e := range sm.nextEnts() {
++				if e.Data != nil {
++					ents = append(ents, e)
++				}
++			}
++			props := make([]Message, 0)
++			for _, m := range tt.msgs {
++				if m.Type == msgProp {
++					props = append(props, m)
++				}
++			}
++			for k, m := range props {
++				if !bytes.Equal(ents[k].Data, m.Entries[0].Data) {
++					t.Errorf("#%d.%d: data = %d, want %d", i, j, ents[k].Data, m.Entries[0].Data)
++				}
++			}
++		}
++	}
++}
++
++func TestSingleNodeCommit(t *testing.T) {
++	tt := newNetwork(nil)
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++
++	sm := tt.peers[0].(*raft)
++	if sm.raftLog.committed != 3 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 3)
++	}
++}
++
++// TestCannotCommitWithoutNewTermEntry tests the entries cannot be committed
++// when leader changes, no new proposal comes in and ChangeTerm proposal is
++// filtered.
++func TestCannotCommitWithoutNewTermEntry(t *testing.T) {
++	tt := newNetwork(nil, nil, nil, nil, nil)
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++
++	// 0 cannot reach 2,3,4
++	tt.cut(0, 2)
++	tt.cut(0, 3)
++	tt.cut(0, 4)
++
++	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++
++	sm := tt.peers[0].(*raft)
++	if sm.raftLog.committed != 1 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 1)
++	}
++
++	// network recovery
++	tt.recover()
++	// avoid committing ChangeTerm proposal
++	tt.ignore(msgApp)
++
++	// elect 1 as the new leader with term 2
++	tt.send(Message{From: 1, To: 1, Type: msgHup})
++
++	// no log entries from previous term should be committed
++	sm = tt.peers[1].(*raft)
++	if sm.raftLog.committed != 1 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 1)
++	}
++
++	tt.recover()
++
++	// send out a heartbeat
++	// after append a ChangeTerm entry from the current term, all entries
++	// should be committed
++	tt.send(Message{From: 1, To: 1, Type: msgBeat})
++
++	if sm.raftLog.committed != 4 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 4)
++	}
++
++	// still be able to append a entry
++	tt.send(Message{From: 1, To: 1, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++
++	if sm.raftLog.committed != 5 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 5)
++	}
++}
++
++// TestCommitWithoutNewTermEntry tests the entries could be committed
++// when leader changes, no new proposal comes in.
++func TestCommitWithoutNewTermEntry(t *testing.T) {
++	tt := newNetwork(nil, nil, nil, nil, nil)
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++
++	// 0 cannot reach 2,3,4
++	tt.cut(0, 2)
++	tt.cut(0, 3)
++	tt.cut(0, 4)
++
++	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
++
++	sm := tt.peers[0].(*raft)
++	if sm.raftLog.committed != 1 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 1)
++	}
++
++	// network recovery
++	tt.recover()
++
++	// elect 1 as the new leader with term 2
++	// after append a ChangeTerm entry from the current term, all entries
++	// should be committed
++	tt.send(Message{From: 1, To: 1, Type: msgHup})
++
++	if sm.raftLog.committed != 4 {
++		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 4)
++	}
++}
++
++func TestDuelingCandidates(t *testing.T) {
++	a := newRaft(0, nil) // k, id are set later
++	b := newRaft(0, nil)
++	c := newRaft(0, nil)
++
++	nt := newNetwork(a, b, c)
++	nt.cut(0, 2)
++
++	nt.send(Message{From: 0, To: 0, Type: msgHup})
++	nt.send(Message{From: 2, To: 2, Type: msgHup})
++
++	nt.recover()
++	nt.send(Message{From: 2, To: 2, Type: msgHup})
++
++	wlog := &raftLog{ents: []Entry{{}, Entry{Type: Normal, Data: nil, Term: 1, Index: 1}}, committed: 1}
++	tests := []struct {
++		sm      *raft
++		state   stateType
++		term    int64
++		raftLog *raftLog
++	}{
++		{a, stateFollower, 2, wlog},
++		{b, stateFollower, 2, wlog},
++		{c, stateFollower, 2, newLog()},
++	}
++
++	for i, tt := range tests {
++		if g := tt.sm.state; g != tt.state {
++			t.Errorf("#%d: state = %s, want %s", i, g, tt.state)
++		}
++		if g := tt.sm.Term; g != tt.term {
++			t.Errorf("#%d: term = %d, want %d", i, g, tt.term)
++		}
++		base := ltoa(tt.raftLog)
++		if sm, ok := nt.peers[int64(i)].(*raft); ok {
++			l := ltoa(sm.raftLog)
++			if g := diffu(base, l); g != "" {
++				t.Errorf("#%d: diff:\n%s", i, g)
++			}
++		} else {
++			t.Logf("#%d: empty log", i)
++		}
++	}
++}
++
++func TestCandidateConcede(t *testing.T) {
++	tt := newNetwork(nil, nil, nil)
++	tt.isolate(0)
++
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++	tt.send(Message{From: 2, To: 2, Type: msgHup})
++
++	// heal the partition
++	tt.recover()
++
++	data := []byte("force follower")
++	// send a proposal to 2 to flush out a msgApp to 0
++	tt.send(Message{From: 2, To: 2, Type: msgProp, Entries: []Entry{{Data: data}}})
++
++	a := tt.peers[0].(*raft)
++	if g := a.state; g != stateFollower {
++		t.Errorf("state = %s, want %s", g, stateFollower)
++	}
++	if g := a.Term; g != 1 {
++		t.Errorf("term = %d, want %d", g, 1)
++	}
++	wantLog := ltoa(&raftLog{ents: []Entry{{}, {Type: Normal, Data: nil, Term: 1, Index: 1}, {Term: 1, Index: 2, Data: data}}, committed: 2})
++	for i, p := range tt.peers {
++		if sm, ok := p.(*raft); ok {
++			l := ltoa(sm.raftLog)
++			if g := diffu(wantLog, l); g != "" {
++				t.Errorf("#%d: diff:\n%s", i, g)
++			}
++		} else {
++			t.Logf("#%d: empty log", i)
++		}
++	}
++}
++
++func TestSingleNodeCandidate(t *testing.T) {
++	tt := newNetwork(nil)
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++
++	sm := tt.peers[0].(*raft)
++	if sm.state != stateLeader {
++		t.Errorf("state = %d, want %d", sm.state, stateLeader)
++	}
++}
++
++func TestOldMessages(t *testing.T) {
++	tt := newNetwork(nil, nil, nil)
++	// make 0 leader @ term 3
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++	tt.send(Message{From: 1, To: 1, Type: msgHup})
++	tt.send(Message{From: 0, To: 0, Type: msgHup})
++	// pretend we're an old leader trying to make progress
++	tt.send(Message{From: 0, To: 0, Type: msgApp, Term: 1, Entries: []Entry{{Term: 1}}})
++
++	l := &raftLog{
++		ents: []Entry{
++			{}, {Type: Normal, Data: nil, Term: 1, Index: 1},
++			{Type: Normal, Data: nil, Term: 2, Index: 2}, {Type: Normal, Data: nil, Term: 3, Index: 3},
++		},
++		committed: 3,
++	}
++	base := ltoa(l)
++	for i, p := range tt.peers {
++		if sm, ok := p.(*raft); ok {
++			l := ltoa(sm.raftLog)
++			if g := diffu(base, l); g != "" {
++				t.Errorf("#%d: diff:\n%s", i, g)
++			}
++		} else {
++			t.Logf("#%d: empty log", i)
++		}
++	}
++}
++
++// TestOldMessagesReply - optimization - reply with new term.
++
++func TestProposal(t *testing.T) {
++	tests := []struct {
++		*network
++		success bool
++	}{
++		{newNetwork(nil, nil, nil), true},
++		{newNetwork(nil, nil, nopStepper), true},
++		{newNetwork(nil, nopStepper, nopStepper), false},
++		{newNetwork(nil, nopStepper, nopStepper, nil), false},
++		{newNetwork(nil, nopStepper, nopStepper, nil, nil), true},
++	}
++
++	for i, tt := range tests {
++		send := func(m Message) {
++			defer func() {
++				// only recover is we expect it to panic so
++				// panics we don't expect go up.
++				if !tt.success {
++					e := recover()
++					if e != nil {
++						t.Logf("#%d: err: %s", i, e)
++					}
++				}
++			}()
++			tt.send(m)
++		}
++
++		data := []byte("somedata")
++
++		// promote 0 the leader
++		send(Message{From: 0, To: 0, Type: msgHup})
++		send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: data}}})
++
++		wantLog := newLog()
++		if tt.success {
++			wantLog = &raftLog{ents: []Entry{{}, {Type: Normal, Data: nil, Term: 1, Index: 1}, {Term: 1, Index: 2, Data: data}}, committed: 2}
++		}
++		base := ltoa(wantLog)
++		for i, p := range tt.peers {
++			if sm, ok := p.(*raft); ok {
++				l := ltoa(sm.raftLog)
++				if g := diffu(base, l); g != "" {
++					t.Errorf("#%d: diff:\n%s", i, g)
++				}
++			} else {
++				t.Logf("#%d: empty log", i)
++			}
++		}
++		sm := tt.network.peers[0].(*raft)
++		if g := sm.Term; g != 1 {
++			t.Errorf("#%d: term = %d, want %d", i, g, 1)
++		}
++	}
++}
++
++func TestProposalByProxy(t *testing.T) {
++	data := []byte("somedata")
++	tests := []*network{
++		newNetwork(nil, nil, nil),
++		newNetwork(nil, nil, nopStepper),
++	}
++
++	for i, tt := range tests {
++		// promote 0 the leader
++		tt.send(Message{From: 0, To: 0, Type: msgHup})
++
++		// propose via follower
++		tt.send(Message{From: 1, To: 1, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}})
++
++		wantLog := &raftLog{ents: []Entry{{}, {Type: Normal, Data: nil, Term: 1, Index: 1}, {Term: 1, Data: data, Index: 2}}, committed: 2}
++		base := ltoa(wantLog)
++		for i, p := range tt.peers {
++			if sm, ok := p.(*raft); ok {
++				l := ltoa(sm.raftLog)
++				if g := diffu(base, l); g != "" {
++					t.Errorf("#%d: diff:\n%s", i, g)
++				}
++			} else {
++				t.Logf("#%d: empty log", i)
++			}
++		}
++		sm := tt.peers[0].(*raft)
++		if g := sm.Term; g != 1 {
++			t.Errorf("#%d: term = %d, want %d", i, g, 1)
++		}
++	}
++}
++
++func TestCommit(t *testing.T) {
++	tests := []struct {
++		matches []int64
++		logs    []Entry
++		smTerm  int64
++		w       int64
++	}{
++		// single
++		{[]int64{1}, []Entry{{}, {Term: 1}}, 1, 1},
++		{[]int64{1}, []Entry{{}, {Term: 1}}, 2, 0},
++		{[]int64{2}, []Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
++		{[]int64{1}, []Entry{{}, {Term: 2}}, 2, 1},
++
++		// odd
++		{[]int64{2, 1, 1}, []Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
++		{[]int64{2, 1, 1}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
++		{[]int64{2, 1, 2}, []Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
++		{[]int64{2, 1, 2}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
++
++		// even
++		{[]int64{2, 1, 1, 1}, []Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
++		{[]int64{2, 1, 1, 1}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
++		{[]int64{2, 1, 1, 2}, []Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
++		{[]int64{2, 1, 1, 2}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
++		{[]int64{2, 1, 2, 2}, []Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
++		{[]int64{2, 1, 2, 2}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
++	}
++
++	for i, tt := range tests {
++		prs := make(map[int64]*progress)
++		for j := 0; j < len(tt.matches); j++ {
++			prs[int64(j)] = &progress{tt.matches[j], tt.matches[j] + 1}
++		}
++		sm := &raft{raftLog: &raftLog{ents: tt.logs}, prs: prs, State: State{Term: tt.smTerm}}
++		sm.maybeCommit()
++		if g := sm.raftLog.committed; g != tt.w {
++			t.Errorf("#%d: committed = %d, want %d", i, g, tt.w)
++		}
++	}
++}
++
++// TestHandleMsgApp ensures:
++// 1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
++// 2. If an existing entry conflicts with a new one (same index but different terms),
++//    delete the existing entry and all that follow it; append any new entries not already in the log.
++// 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
++func TestHandleMsgApp(t *testing.T) {
++	tests := []struct {
++		m       Message
++		wIndex  int64
++		wCommit int64
++		wAccept bool
++	}{
++		// Ensure 1
++		{Message{Type: msgApp, Term: 2, LogTerm: 3, Index: 2, Commit: 3}, 2, 0, false}, // previous log mismatch
++		{Message{Type: msgApp, Term: 2, LogTerm: 3, Index: 3, Commit: 3}, 2, 0, false}, // previous log non-exist
++
++		// Ensure 2
++		{Message{Type: msgApp, Term: 2, LogTerm: 1, Index: 1, Commit: 1}, 2, 1, true},
++		{Message{Type: msgApp, Term: 2, LogTerm: 0, Index: 0, Commit: 1, Entries: []Entry{{Term: 2}}}, 1, 1, true},
++		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 3, Entries: []Entry{{Term: 2}, {Term: 2}}}, 4, 3, true},
++		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 4, Entries: []Entry{{Term: 2}}}, 3, 3, true},
++		{Message{Type: msgApp, Term: 2, LogTerm: 1, Index: 1, Commit: 4, Entries: []Entry{{Term: 2}}}, 2, 2, true},
++
++		// Ensure 3
++		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 2}, 2, 2, true},
++		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 4}, 2, 2, true}, // commit upto min(commit, last)
++	}
++
++	for i, tt := range tests {
++		sm := &raft{
++			state:   stateFollower,
++			State:   State{Term: 2},
++			raftLog: &raftLog{committed: 0, ents: []Entry{{}, {Term: 1}, {Term: 2}}},
++		}
++
++		sm.handleAppendEntries(tt.m)
++		if sm.raftLog.lastIndex() != tt.wIndex {
++			t.Errorf("#%d: lastIndex = %d, want %d", i, sm.raftLog.lastIndex(), tt.wIndex)
++		}
++		if sm.raftLog.committed != tt.wCommit {
++			t.Errorf("#%d: committed = %d, want %d", i, sm.raftLog.committed, tt.wCommit)
++		}
++		m := sm.ReadMessages()
++		if len(m) != 1 {
++			t.Errorf("#%d: msg = nil, want 1")
++		}
++		gaccept := true
++		if m[0].Index == -1 {
++			gaccept = false
++		}
++		if gaccept != tt.wAccept {
++			t.Errorf("#%d: accept = %v, want %v", gaccept, tt.wAccept)
++		}
++	}
++}
++
++func TestRecvMsgVote(t *testing.T) {
++	tests := []struct {
++		state   stateType
++		i, term int64
++		voteFor int64
++		w       int64
++	}{
++		{stateFollower, 0, 0, none, -1},
++		{stateFollower, 0, 1, none, -1},
++		{stateFollower, 0, 2, none, -1},
++		{stateFollower, 0, 3, none, 2},
++
++		{stateFollower, 1, 0, none, -1},
++		{stateFollower, 1, 1, none, -1},
++		{stateFollower, 1, 2, none, -1},
++		{stateFollower, 1, 3, none, 2},
++
++		{stateFollower, 2, 0, none, -1},
++		{stateFollower, 2, 1, none, -1},
++		{stateFollower, 2, 2, none, 2},
++		{stateFollower, 2, 3, none, 2},
++
++		{stateFollower, 3, 0, none, -1},
++		{stateFollower, 3, 1, none, -1},
++		{stateFollower, 3, 2, none, 2},
++		{stateFollower, 3, 3, none, 2},
++
++		{stateFollower, 3, 2, 1, 2},
++		{stateFollower, 3, 2, 0, -1},
++
++		{stateLeader, 3, 3, 0, -1},
++		{stateCandidate, 3, 3, 0, -1},
++	}
++
++	for i, tt := range tests {
++		sm := &raft{
++			state:   tt.state,
++			State:   State{Vote: tt.voteFor},
++			raftLog: &raftLog{ents: []Entry{{}, {Term: 2}, {Term: 2}}},
++		}
++
++		sm.Step(Message{Type: msgVote, From: 1, Index: tt.i, LogTerm: tt.term})
++
++		msgs := sm.ReadMessages()
++		if g := len(msgs); g != 1 {
++			t.Errorf("#%d: len(msgs) = %d, want 1", i, g)
++			continue
++		}
++		if g := msgs[0].Index; g != tt.w {
++			t.Errorf("#%d, m.Index = %d, want %d", i, g, tt.w)
++		}
++	}
++}
++
++func TestStateTransition(t *testing.T) {
++	tests := []struct {
++		from   stateType
++		to     stateType
++		wallow bool
++		wterm  int64
++		wlead  int64
++	}{
++		{stateFollower, stateFollower, true, 1, none},
++		{stateFollower, stateCandidate, true, 1, none},
++		{stateFollower, stateLeader, false, -1, none},
++
++		{stateCandidate, stateFollower, true, 0, none},
++		{stateCandidate, stateCandidate, true, 1, none},
++		{stateCandidate, stateLeader, true, 0, 0},
++
++		{stateLeader, stateFollower, true, 1, none},
++		{stateLeader, stateCandidate, false, 1, none},
++		{stateLeader, stateLeader, true, 0, 0},
++	}
++
++	for i, tt := range tests {
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					if tt.wallow == true {
++						t.Errorf("%d: allow = %v, want %v", i, false, true)
++					}
++				}
++			}()
++
++			sm := newRaft(0, []int64{0})
++			sm.state = tt.from
++
++			switch tt.to {
++			case stateFollower:
++				sm.becomeFollower(tt.wterm, tt.wlead)
++			case stateCandidate:
++				sm.becomeCandidate()
++			case stateLeader:
++				sm.becomeLeader()
++			}
++
++			if sm.Term != tt.wterm {
++				t.Errorf("%d: term = %d, want %d", i, sm.Term, tt.wterm)
++			}
++			if sm.lead != tt.wlead {
++				t.Errorf("%d: lead = %d, want %d", i, sm.lead, tt.wlead)
++			}
++		}()
++	}
++}
++
++func TestConf(t *testing.T) {
++	sm := newRaft(0, []int64{0})
++	sm.becomeCandidate()
++	sm.becomeLeader()
++
++	sm.Step(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Type: AddNode}}})
++	if sm.raftLog.lastIndex() != 2 {
++		t.Errorf("lastindex = %d, want %d", sm.raftLog.lastIndex(), 1)
++	}
++	if !sm.configuring {
++		t.Errorf("pendingConf = %v, want %v", sm.configuring, true)
++	}
++	if sm.raftLog.ents[2].Type != AddNode {
++		t.Errorf("type = %d, want %d", sm.raftLog.ents[1].Type, AddNode)
++	}
++
++	// deny the second configuration change request if there is a pending one
++	paniced := false
++	defer func() { recover(); paniced = true }()
++	sm.Step(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Type: AddNode}}})
++	if !paniced {
++		t.Errorf("expected panic")
++	}
++	if sm.raftLog.lastIndex() != 2 {
++		t.Errorf("lastindex = %d, want %d", sm.raftLog.lastIndex(), 1)
++	}
++}
++
++// Ensures that the new leader sets the pendingConf flag correctly according to
++// the uncommitted log entries
++func TestConfChangeLeader(t *testing.T) {
++	tests := []struct {
++		et       int64
++		wPending bool
++	}{
++		{Normal, false},
++		{AddNode, true},
++		{RemoveNode, true},
++	}
++
++	for i, tt := range tests {
++		sm := newRaft(0, []int64{0})
++		sm.raftLog = &raftLog{ents: []Entry{{}, {Type: tt.et}}}
++
++		sm.becomeCandidate()
++		sm.becomeLeader()
++
++		if sm.configuring != tt.wPending {
++			t.Errorf("#%d: pendingConf = %v, want %v", i, sm.configuring, tt.wPending)
++		}
++	}
++}
++
++func TestAllServerStepdown(t *testing.T) {
++	tests := []struct {
++		state stateType
++
++		wstate stateType
++		wterm  int64
++		windex int64
++	}{
++		{stateFollower, stateFollower, 3, 1},
++		{stateCandidate, stateFollower, 3, 1},
++		{stateLeader, stateFollower, 3, 2},
++	}
++
++	tmsgTypes := [...]messageType{msgVote, msgApp}
++	tterm := int64(3)
++
++	for i, tt := range tests {
++		sm := newRaft(0, []int64{0, 1, 2})
++		switch tt.state {
++		case stateFollower:
++			sm.becomeFollower(1, 0)
++		case stateCandidate:
++			sm.becomeCandidate()
++		case stateLeader:
++			sm.becomeCandidate()
++			sm.becomeLeader()
++		}
++
++		for j, msgType := range tmsgTypes {
++			sm.Step(Message{From: 1, Type: msgType, Term: tterm, LogTerm: tterm})
++
++			if sm.state != tt.wstate {
++				t.Errorf("#%d.%d state = %v , want %v", i, j, sm.state, tt.wstate)
++			}
++			if sm.Term != tt.wterm {
++				t.Errorf("#%d.%d term = %v , want %v", i, j, sm.Term, tt.wterm)
++			}
++			if int64(len(sm.raftLog.ents)) != tt.windex {
++				t.Errorf("#%d.%d index = %v , want %v", i, j, len(sm.raftLog.ents), tt.windex)
++			}
++			wlead := int64(1)
++			if msgType == msgVote {
++				wlead = none
++			}
++			if sm.lead != wlead {
++				t.Errorf("#%d, sm.lead = %d, want %d", i, sm.lead, none)
++			}
++		}
++	}
++}
++
++func TestLeaderAppResp(t *testing.T) {
++	tests := []struct {
++		index      int64
++		wmsgNum    int
++		windex     int64
++		wcommitted int64
++	}{
++		{-1, 1, 1, 0}, // bad resp; leader does not commit; reply with log entries
++		{2, 2, 2, 2},  // good resp; leader commits; broadcast with commit index
++	}
++
++	for i, tt := range tests {
++		// sm term is 1 after it becomes the leader.
++		// thus the last log term must be 1 to be committed.
++		sm := newRaft(0, []int64{0, 1, 2})
++		sm.raftLog = &raftLog{ents: []Entry{{}, {Term: 0}, {Term: 1}}}
++		sm.becomeCandidate()
++		sm.becomeLeader()
++		sm.ReadMessages()
++		sm.Step(Message{From: 1, Type: msgAppResp, Index: tt.index, Term: sm.Term})
++		msgs := sm.ReadMessages()
++
++		if len(msgs) != tt.wmsgNum {
++			t.Errorf("#%d msgNum = %d, want %d", i, len(msgs), tt.wmsgNum)
++		}
++		for j, msg := range msgs {
++			if msg.Index != tt.windex {
++				t.Errorf("#%d.%d index = %d, want %d", i, j, msg.Index, tt.windex)
++			}
++			if msg.Commit != tt.wcommitted {
++				t.Errorf("#%d.%d commit = %d, want %d", i, j, msg.Commit, tt.wcommitted)
++			}
++		}
++	}
++}
++
++// tests the output of the statemachine when receiving msgBeat
++func TestRecvMsgBeat(t *testing.T) {
++	tests := []struct {
++		state stateType
++		wMsg  int
++	}{
++		{stateLeader, 2},
++		// candidate and follower should ignore msgBeat
++		{stateCandidate, 0},
++		{stateFollower, 0},
++	}
++
++	for i, tt := range tests {
++		sm := newRaft(0, []int64{0, 1, 2})
++		sm.raftLog = &raftLog{ents: []Entry{{}, {Term: 0}, {Term: 1}}}
++		sm.Term = 1
++		sm.state = tt.state
++		sm.Step(Message{From: 0, To: 0, Type: msgBeat})
++
++		msgs := sm.ReadMessages()
++		if len(msgs) != tt.wMsg {
++			t.Errorf("%d: len(msgs) = %d, want %d", i, len(msgs), tt.wMsg)
++		}
++		for _, m := range msgs {
++			if m.Type != msgApp {
++				t.Errorf("%d: msg.type = %v, want %v", m.Type, msgApp)
++			}
++		}
++	}
++}
++
++func TestRestore(t *testing.T) {
++	s := Snapshot{
++		ClusterId: 0xBEEF,
++		Index:     defaultCompactThreshold + 1,
++		Term:      defaultCompactThreshold + 1,
++		Nodes:     []int64{0, 1, 2},
++	}
++
++	sm := newRaft(0, []int64{0, 1})
++	if ok := sm.restore(s); !ok {
++		t.Fatal("restore fail, want succeed")
++	}
++
++	if sm.clusterId != s.ClusterId {
++		t.Errorf("sm.cluster = %x, want %x", sm.clusterId, s.ClusterId)
++	}
++	if sm.raftLog.lastIndex() != s.Index {
++		t.Errorf("log.lastIndex = %d, want %d", sm.raftLog.lastIndex(), s.Index)
++	}
++	if sm.raftLog.term(s.Index) != s.Term {
++		t.Errorf("log.lastTerm = %d, want %d", sm.raftLog.term(s.Index), s.Term)
++	}
++	sg := int64Slice(sm.nodes())
++	sw := int64Slice(s.Nodes)
++	sort.Sort(sg)
++	sort.Sort(sw)
++	if !reflect.DeepEqual(sg, sw) {
++		t.Errorf("sm.Nodes = %+v, want %+v", sg, sw)
++	}
++	if !reflect.DeepEqual(sm.raftLog.snapshot, s) {
++		t.Errorf("snapshot = %+v, want %+v", sm.raftLog.snapshot, s)
++	}
++
++	if ok := sm.restore(s); ok {
++		t.Fatal("restore succeed, want fail")
++	}
++}
++
++func TestProvideSnap(t *testing.T) {
++	s := Snapshot{
++		Index: defaultCompactThreshold + 1,
++		Term:  defaultCompactThreshold + 1,
++		Nodes: []int64{0, 1},
++	}
++	sm := newRaft(0, []int64{0})
++	// restore the statemachin from a snapshot
++	// so it has a compacted log and a snapshot
++	sm.restore(s)
++
++	sm.becomeCandidate()
++	sm.becomeLeader()
++
++	sm.Step(Message{From: 0, To: 0, Type: msgBeat})
++	msgs := sm.ReadMessages()
++	if len(msgs) != 1 {
++		t.Errorf("len(msgs) = %d, want 1", len(msgs))
++	}
++	m := msgs[0]
++	if m.Type != msgApp {
++		t.Errorf("m.Type = %v, want %v", m.Type, msgApp)
++	}
++
++	// force set the next of node 1, so that
++	// node 1 needs a snapshot
++	sm.prs[1].next = sm.raftLog.offset
++
++	sm.Step(Message{From: 1, To: 0, Type: msgAppResp, Index: -1})
++	msgs = sm.ReadMessages()
++	if len(msgs) != 1 {
++		t.Errorf("len(msgs) = %d, want 1", len(msgs))
++	}
++	m = msgs[0]
++	if m.Type != msgSnap {
++		t.Errorf("m.Type = %v, want %v", m.Type, msgSnap)
++	}
++}
++
++func TestRestoreFromSnapMsg(t *testing.T) {
++	s := Snapshot{
++		Index: defaultCompactThreshold + 1,
++		Term:  defaultCompactThreshold + 1,
++		Nodes: []int64{0, 1},
++	}
++	m := Message{Type: msgSnap, From: 0, Term: 1, Snapshot: s}
++
++	sm := newRaft(1, []int64{0, 1})
++	sm.Step(m)
++
++	if !reflect.DeepEqual(sm.raftLog.snapshot, s) {
++		t.Errorf("snapshot = %+v, want %+v", sm.raftLog.snapshot, s)
++	}
++}
++
++func TestSlowNodeRestore(t *testing.T) {
++	nt := newNetwork(nil, nil, nil)
++	nt.send(Message{From: 0, To: 0, Type: msgHup})
++
++	nt.isolate(2)
++	for j := 0; j < defaultCompactThreshold+1; j++ {
++		nt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{}}})
++	}
++	lead := nt.peers[0].(*raft)
++	lead.nextEnts()
++	lead.compact(nil)
++
++	nt.recover()
++	nt.send(Message{From: 0, To: 0, Type: msgBeat})
++
++	follower := nt.peers[2].(*raft)
++	if !reflect.DeepEqual(follower.raftLog.snapshot, lead.raftLog.snapshot) {
++		t.Errorf("follower.snap = %+v, want %+v", follower.raftLog.snapshot, lead.raftLog.snapshot)
++	}
++
++	committed := follower.raftLog.lastIndex()
++	nt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{}}})
++	if follower.raftLog.committed != committed+1 {
++		t.Errorf("follower.comitted = %d, want %d", follower.raftLog.committed, committed+1)
++	}
++}
++
++func ents(terms ...int64) *raft {
++	ents := []Entry{{}}
++	for _, term := range terms {
++		ents = append(ents, Entry{Term: term})
++	}
++
++	sm := &raft{raftLog: &raftLog{ents: ents}}
++	sm.reset(0)
++	return sm
++}
++
++type network struct {
++	peers   map[int64]Interface
++	dropm   map[connem]float64
++	ignorem map[messageType]bool
++}
++
++// newNetwork initializes a network from peers.
++// A nil node will be replaced with a new *stateMachine.
++// A *stateMachine will get its k, id.
++// When using stateMachine, the address list is always [0, n).
++func newNetwork(peers ...Interface) *network {
++	size := len(peers)
++	defaultPeerAddrs := make([]int64, size)
++	for i := 0; i < size; i++ {
++		defaultPeerAddrs[i] = int64(i)
++	}
++
++	npeers := make(map[int64]Interface, size)
++
++	for id, p := range peers {
++		nid := int64(id)
++		switch v := p.(type) {
++		case nil:
++			sm := newRaft(nid, defaultPeerAddrs)
++			npeers[nid] = sm
++		case *raft:
++			v.id = nid
++			v.prs = make(map[int64]*progress)
++			for i := 0; i < size; i++ {
++				v.prs[int64(i)] = &progress{}
++			}
++			v.reset(0)
++			npeers[nid] = v
++		default:
++			npeers[nid] = v
++		}
++	}
++	return &network{
++		peers:   npeers,
++		dropm:   make(map[connem]float64),
++		ignorem: make(map[messageType]bool),
++	}
++}
++
++func (nw *network) send(msgs ...Message) {
++	for len(msgs) > 0 {
++		m := msgs[0]
++		p := nw.peers[m.To]
++		p.Step(m)
++		msgs = append(msgs[1:], nw.filter(p.ReadMessages())...)
++	}
++}
++
++func (nw *network) drop(from, to int64, perc float64) {
++	nw.dropm[connem{from, to}] = perc
++}
++
++func (nw *network) cut(one, other int64) {
++	nw.drop(one, other, 1)
++	nw.drop(other, one, 1)
++}
++
++func (nw *network) isolate(id int64) {
++	for i := 0; i < len(nw.peers); i++ {
++		nid := int64(i)
++		if nid != id {
++			nw.drop(id, nid, 1.0)
++			nw.drop(nid, id, 1.0)
++		}
++	}
++}
++
++func (nw *network) ignore(t messageType) {
++	nw.ignorem[t] = true
++}
++
++func (nw *network) recover() {
++	nw.dropm = make(map[connem]float64)
++	nw.ignorem = make(map[messageType]bool)
++}
++
++func (nw *network) filter(msgs []Message) []Message {
++	mm := make([]Message, 0)
++	for _, m := range msgs {
++		if nw.ignorem[m.Type] {
++			continue
++		}
++		switch m.Type {
++		case msgHup:
++			// hups never go over the network, so don't drop them but panic
++			panic("unexpected msgHup")
++		default:
++			perc := nw.dropm[connem{m.From, m.To}]
++			if n := rand.Float64(); n < perc {
++				continue
++			}
++		}
++		mm = append(mm, m)
++	}
++	return mm
++}
++
++type connem struct {
++	from, to int64
++}
++
++type blackHole struct{}
++
++func (blackHole) Step(Message) error      { return nil }
++func (blackHole) ReadMessages() []Message { return nil }
++
++var nopStepper = &blackHole{}
+diff --git a/raft/snapshot.go b/raft/snapshot.go
+new file mode 100644
+index 0000000..95a8ca4
+--- /dev/null
++++ b/raft/snapshot.go
+@@ -0,0 +1,18 @@
++package raft
++
++var emptySnapshot = Snapshot{}
++
++type Snapshot struct {
++	ClusterId int64
++	Data      []byte
++	// the configuration
++	Nodes []int64
++	// the index at which the snapshot was taken.
++	Index int64
++	// the log term of the index
++	Term int64
++}
++
++func (s Snapshot) IsEmpty() bool {
++	return s.Term == 0
++}
+diff --git a/raft/state.pb.go b/raft/state.pb.go
+new file mode 100644
+index 0000000..4152a7a
+--- /dev/null
++++ b/raft/state.pb.go
+@@ -0,0 +1,230 @@
++// Code generated by protoc-gen-gogo.
++// source: state.proto
++// DO NOT EDIT!
++
++/*
++	Package raft is a generated protocol buffer package.
++
++	It is generated from these files:
++		state.proto
++
++	It has these top-level messages:
++		State
++*/
++package raft
++
++import proto "code.google.com/p/gogoprotobuf/proto"
++import json "encoding/json"
++import math "math"
++
++// discarding unused import gogoproto "code.google.com/p/gogoprotobuf/gogoproto/gogo.pb"
++
++import io "io"
++import code_google_com_p_gogoprotobuf_proto "code.google.com/p/gogoprotobuf/proto"
++
++// Reference proto, json, and math imports to suppress error if they are not otherwise used.
++var _ = proto.Marshal
++var _ = &json.SyntaxError{}
++var _ = math.Inf
++
++type State struct {
++	Term             int64  `protobuf:"varint,1,req,name=term" json:"term"`
++	Vote             int64  `protobuf:"varint,2,req,name=vote" json:"vote"`
++	Commit           int64  `protobuf:"varint,3,req,name=commit" json:"commit"`
++	LastIndex        int64  `protobuf:"varint,4,req,name=lastIndex" json:"lastIndex"`
++	XXX_unrecognized []byte `json:"-"`
++}
++
++func (m *State) Reset()         { *m = State{} }
++func (m *State) String() string { return proto.CompactTextString(m) }
++func (*State) ProtoMessage()    {}
++
++func init() {
++}
++func (m *State) Unmarshal(data []byte) error {
++	l := len(data)
++	index := 0
++	for index < l {
++		var wire uint64
++		for shift := uint(0); ; shift += 7 {
++			if index >= l {
++				return io.ErrUnexpectedEOF
++			}
++			b := data[index]
++			index++
++			wire |= (uint64(b) & 0x7F) << shift
++			if b < 0x80 {
++				break
++			}
++		}
++		fieldNum := int32(wire >> 3)
++		wireType := int(wire & 0x7)
++		switch fieldNum {
++		case 1:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.Term |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 2:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.Vote |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 3:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.Commit |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 4:
++			if wireType != 0 {
++				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
++			}
++			for shift := uint(0); ; shift += 7 {
++				if index >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[index]
++				index++
++				m.LastIndex |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		default:
++			var sizeOfWire int
++			for {
++				sizeOfWire++
++				wire >>= 7
++				if wire == 0 {
++					break
++				}
++			}
++			index -= sizeOfWire
++			skippy, err := code_google_com_p_gogoprotobuf_proto.Skip(data[index:])
++			if err != nil {
++				return err
++			}
++			if (index + skippy) > l {
++				return io.ErrUnexpectedEOF
++			}
++			m.XXX_unrecognized = append(m.XXX_unrecognized, data[index:index+skippy]...)
++			index += skippy
++		}
++	}
++	return nil
++}
++func (m *State) Size() (n int) {
++	var l int
++	_ = l
++	n += 1 + sovState(uint64(m.Term))
++	n += 1 + sovState(uint64(m.Vote))
++	n += 1 + sovState(uint64(m.Commit))
++	n += 1 + sovState(uint64(m.LastIndex))
++	if m.XXX_unrecognized != nil {
++		n += len(m.XXX_unrecognized)
++	}
++	return n
++}
++
++func sovState(x uint64) (n int) {
++	for {
++		n++
++		x >>= 7
++		if x == 0 {
++			break
++		}
++	}
++	return n
++}
++func sozState(x uint64) (n int) {
++	return sovState(uint64((x << 1) ^ uint64((int64(x) >> 63))))
++}
++func (m *State) Marshal() (data []byte, err error) {
++	size := m.Size()
++	data = make([]byte, size)
++	n, err := m.MarshalTo(data)
++	if err != nil {
++		return nil, err
++	}
++	return data[:n], nil
++}
++
++func (m *State) MarshalTo(data []byte) (n int, err error) {
++	var i int
++	_ = i
++	var l int
++	_ = l
++	data[i] = 0x8
++	i++
++	i = encodeVarintState(data, i, uint64(m.Term))
++	data[i] = 0x10
++	i++
++	i = encodeVarintState(data, i, uint64(m.Vote))
++	data[i] = 0x18
++	i++
++	i = encodeVarintState(data, i, uint64(m.Commit))
++	data[i] = 0x20
++	i++
++	i = encodeVarintState(data, i, uint64(m.LastIndex))
++	if m.XXX_unrecognized != nil {
++		i += copy(data[i:], m.XXX_unrecognized)
++	}
++	return i, nil
++}
++func encodeFixed64State(data []byte, offset int, v uint64) int {
++	data[offset] = uint8(v)
++	data[offset+1] = uint8(v >> 8)
++	data[offset+2] = uint8(v >> 16)
++	data[offset+3] = uint8(v >> 24)
++	data[offset+4] = uint8(v >> 32)
++	data[offset+5] = uint8(v >> 40)
++	data[offset+6] = uint8(v >> 48)
++	data[offset+7] = uint8(v >> 56)
++	return offset + 8
++}
++func encodeFixed32State(data []byte, offset int, v uint32) int {
++	data[offset] = uint8(v)
++	data[offset+1] = uint8(v >> 8)
++	data[offset+2] = uint8(v >> 16)
++	data[offset+3] = uint8(v >> 24)
++	return offset + 4
++}
++func encodeVarintState(data []byte, offset int, v uint64) int {
++	for v >= 1<<7 {
++		data[offset] = uint8(v&0x7f | 0x80)
++		v >>= 7
++		offset++
++	}
++	data[offset] = uint8(v)
++	return offset + 1
++}
+diff --git a/raft/state.proto b/raft/state.proto
+new file mode 100644
+index 0000000..bfdfcab
+--- /dev/null
++++ b/raft/state.proto
+@@ -0,0 +1,15 @@
++package raft;
++
++import "code.google.com/p/gogoprotobuf/gogoproto/gogo.proto";
++
++option (gogoproto.marshaler_all) = true;
++option (gogoproto.sizer_all) = true;
++option (gogoproto.unmarshaler_all) = true;
++option (gogoproto.goproto_getters_all) = false;
++
++message State {
++	required int64 term   = 1 [(gogoproto.nullable) = false];
++	required int64 vote   = 2 [(gogoproto.nullable) = false];
++	required int64 commit = 3 [(gogoproto.nullable) = false];
++	required int64 lastIndex = 4 [(gogoproto.nullable) = false];
++}
+diff --git a/raft2/diff_test.go b/raft2/diff_test.go
+deleted file mode 100644
+index 96c5d68..0000000
+--- a/raft2/diff_test.go
++++ /dev/null
+@@ -1,51 +0,0 @@
+-package raft
+-
+-import (
+-	"fmt"
+-	"io"
+-	"io/ioutil"
+-	"os"
+-	"os/exec"
+-	"strings"
+-)
+-
+-func diffu(a, b string) string {
+-	if a == b {
+-		return ""
+-	}
+-	aname, bname := mustTemp("base", a), mustTemp("other", b)
+-	defer os.Remove(aname)
+-	defer os.Remove(bname)
+-	cmd := exec.Command("diff", "-u", aname, bname)
+-	buf, err := cmd.CombinedOutput()
+-	if err != nil {
+-		if _, ok := err.(*exec.ExitError); ok {
+-			// do nothing
+-			return string(buf)
+-		}
+-		panic(err)
+-	}
+-	return string(buf)
+-}
+-
+-func mustTemp(pre, body string) string {
+-	f, err := ioutil.TempFile("", pre)
+-	if err != nil {
+-		panic(err)
+-	}
+-	_, err = io.Copy(f, strings.NewReader(body))
+-	if err != nil {
+-		panic(err)
+-	}
+-	f.Close()
+-	return f.Name()
+-}
+-
+-func ltoa(l *raftLog) string {
+-	s := fmt.Sprintf("committed: %d\n", l.committed)
+-	s += fmt.Sprintf("applied:  %d\n", l.applied)
+-	for i, e := range l.ents {
+-		s += fmt.Sprintf("#%d: %+v\n", i, e)
+-	}
+-	return s
+-}
+diff --git a/raft2/entry.pb.go b/raft2/entry.pb.go
+deleted file mode 100644
+index 0d6ff69..0000000
+--- a/raft2/entry.pb.go
++++ /dev/null
+@@ -1,243 +0,0 @@
+-// Code generated by protoc-gen-gogo.
+-// source: entry.proto
+-// DO NOT EDIT!
+-
+-/*
+-	Package raft is a generated protocol buffer package.
+-
+-	It is generated from these files:
+-		entry.proto
+-
+-	It has these top-level messages:
+-		Entry
+-*/
+-package raft
+-
+-import proto "code.google.com/p/gogoprotobuf/proto"
+-import json "encoding/json"
+-import math "math"
+-
+-// discarding unused import gogoproto "code.google.com/p/gogoprotobuf/gogoproto/gogo.pb"
+-
+-import io "io"
+-import code_google_com_p_gogoprotobuf_proto "code.google.com/p/gogoprotobuf/proto"
+-
+-// Reference proto, json, and math imports to suppress error if they are not otherwise used.
+-var _ = proto.Marshal
+-var _ = &json.SyntaxError{}
+-var _ = math.Inf
+-
+-type Entry struct {
+-	Type             int64  `protobuf:"varint,1,req,name=type" json:"type"`
+-	Term             int64  `protobuf:"varint,2,req,name=term" json:"term"`
+-	Index            int64  `protobuf:"varint,3,req,name=index" json:"index"`
+-	Data             []byte `protobuf:"bytes,4,opt,name=data" json:"data,omitempty"`
+-	XXX_unrecognized []byte `json:"-"`
+-}
+-
+-func (m *Entry) Reset()         { *m = Entry{} }
+-func (m *Entry) String() string { return proto.CompactTextString(m) }
+-func (*Entry) ProtoMessage()    {}
+-
+-func init() {
+-}
+-func (m *Entry) Unmarshal(data []byte) error {
+-	l := len(data)
+-	index := 0
+-	for index < l {
+-		var wire uint64
+-		for shift := uint(0); ; shift += 7 {
+-			if index >= l {
+-				return io.ErrUnexpectedEOF
+-			}
+-			b := data[index]
+-			index++
+-			wire |= (uint64(b) & 0x7F) << shift
+-			if b < 0x80 {
+-				break
+-			}
+-		}
+-		fieldNum := int32(wire >> 3)
+-		wireType := int(wire & 0x7)
+-		switch fieldNum {
+-		case 1:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.Type |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		case 2:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.Term |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		case 3:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.Index |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		case 4:
+-			if wireType != 2 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			var byteLen int
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				byteLen |= (int(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-			postIndex := index + byteLen
+-			if postIndex > l {
+-				return io.ErrUnexpectedEOF
+-			}
+-			m.Data = append(m.Data, data[index:postIndex]...)
+-			index = postIndex
+-		default:
+-			var sizeOfWire int
+-			for {
+-				sizeOfWire++
+-				wire >>= 7
+-				if wire == 0 {
+-					break
+-				}
+-			}
+-			index -= sizeOfWire
+-			skippy, err := code_google_com_p_gogoprotobuf_proto.Skip(data[index:])
+-			if err != nil {
+-				return err
+-			}
+-			if (index + skippy) > l {
+-				return io.ErrUnexpectedEOF
+-			}
+-			m.XXX_unrecognized = append(m.XXX_unrecognized, data[index:index+skippy]...)
+-			index += skippy
+-		}
+-	}
+-	return nil
+-}
+-func (m *Entry) Size() (n int) {
+-	var l int
+-	_ = l
+-	n += 1 + sovEntry(uint64(m.Type))
+-	n += 1 + sovEntry(uint64(m.Term))
+-	n += 1 + sovEntry(uint64(m.Index))
+-	if m.Data != nil {
+-		l = len(m.Data)
+-		n += 1 + l + sovEntry(uint64(l))
+-	}
+-	if m.XXX_unrecognized != nil {
+-		n += len(m.XXX_unrecognized)
+-	}
+-	return n
+-}
+-
+-func sovEntry(x uint64) (n int) {
+-	for {
+-		n++
+-		x >>= 7
+-		if x == 0 {
+-			break
+-		}
+-	}
+-	return n
+-}
+-func sozEntry(x uint64) (n int) {
+-	return sovEntry(uint64((x << 1) ^ uint64((int64(x) >> 63))))
+-}
+-func (m *Entry) Marshal() (data []byte, err error) {
+-	size := m.Size()
+-	data = make([]byte, size)
+-	n, err := m.MarshalTo(data)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return data[:n], nil
+-}
+-
+-func (m *Entry) MarshalTo(data []byte) (n int, err error) {
+-	var i int
+-	_ = i
+-	var l int
+-	_ = l
+-	data[i] = 0x8
+-	i++
+-	i = encodeVarintEntry(data, i, uint64(m.Type))
+-	data[i] = 0x10
+-	i++
+-	i = encodeVarintEntry(data, i, uint64(m.Term))
+-	data[i] = 0x18
+-	i++
+-	i = encodeVarintEntry(data, i, uint64(m.Index))
+-	if m.Data != nil {
+-		data[i] = 0x22
+-		i++
+-		i = encodeVarintEntry(data, i, uint64(len(m.Data)))
+-		i += copy(data[i:], m.Data)
+-	}
+-	if m.XXX_unrecognized != nil {
+-		i += copy(data[i:], m.XXX_unrecognized)
+-	}
+-	return i, nil
+-}
+-func encodeFixed64Entry(data []byte, offset int, v uint64) int {
+-	data[offset] = uint8(v)
+-	data[offset+1] = uint8(v >> 8)
+-	data[offset+2] = uint8(v >> 16)
+-	data[offset+3] = uint8(v >> 24)
+-	data[offset+4] = uint8(v >> 32)
+-	data[offset+5] = uint8(v >> 40)
+-	data[offset+6] = uint8(v >> 48)
+-	data[offset+7] = uint8(v >> 56)
+-	return offset + 8
+-}
+-func encodeFixed32Entry(data []byte, offset int, v uint32) int {
+-	data[offset] = uint8(v)
+-	data[offset+1] = uint8(v >> 8)
+-	data[offset+2] = uint8(v >> 16)
+-	data[offset+3] = uint8(v >> 24)
+-	return offset + 4
+-}
+-func encodeVarintEntry(data []byte, offset int, v uint64) int {
+-	for v >= 1<<7 {
+-		data[offset] = uint8(v&0x7f | 0x80)
+-		v >>= 7
+-		offset++
+-	}
+-	data[offset] = uint8(v)
+-	return offset + 1
+-}
+diff --git a/raft2/entry.proto b/raft2/entry.proto
+deleted file mode 100644
+index b9606c3..0000000
+--- a/raft2/entry.proto
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package raft;
+-
+-import "code.google.com/p/gogoprotobuf/gogoproto/gogo.proto";
+-
+-option (gogoproto.marshaler_all) = true;
+-option (gogoproto.sizer_all) = true;
+-option (gogoproto.unmarshaler_all) = true;
+-option (gogoproto.goproto_getters_all) = false;
+-
+-message Entry {
+-	required int64 type  = 1 [(gogoproto.nullable) = false];
+-	required int64 term  = 2 [(gogoproto.nullable) = false];
+-	required int64 index = 3 [(gogoproto.nullable) = false];
+-	optional bytes data  = 4;
+-}
+diff --git a/raft2/example_test.go b/raft2/example_test.go
+deleted file mode 100644
+index 513236f..0000000
+--- a/raft2/example_test.go
++++ /dev/null
+@@ -1,37 +0,0 @@
+-package raft
+-
+-import (
+-	"log"
+-
+-	"code.google.com/p/go.net/context"
+-)
+-
+-func applyToStore(ents []Entry)   {}
+-func sendMessages(msgs []Message) {}
+-func saveStateToDisk(st State)    {}
+-func saveToDisk(ents []Entry)     {}
+-
+-func Example_Node() {
+-	n := Start(context.Background(), 0, nil)
+-
+-	// stuff to n happens in other goroutines
+-
+-	// the last known state
+-	var prev State
+-	for {
+-		// ReadState blocks until there is new state ready.
+-		st, ents, cents, msgs, err := n.ReadState(context.Background())
+-		if err != nil {
+-			log.Fatal(err)
+-		}
+-
+-		if !prev.Equal(st) {
+-			saveStateToDisk(st)
+-			prev = st
+-		}
+-
+-		saveToDisk(ents)
+-		go applyToStore(cents)
+-		sendMessages(msgs)
+-	}
+-}
+diff --git a/raft2/genproto.sh b/raft2/genproto.sh
+deleted file mode 100644
+index 39dc53a..0000000
+--- a/raft2/genproto.sh
++++ /dev/null
+@@ -1 +0,0 @@
+-exec protoc --gogo_out=. -I=.:$GOPATH/src/code.google.com/p/gogoprotobuf/protobuf:$GOPATH/src *.proto
+diff --git a/raft2/log.go b/raft2/log.go
+deleted file mode 100644
+index 1fc3312..0000000
+--- a/raft2/log.go
++++ /dev/null
+@@ -1,232 +0,0 @@
+-package raft
+-
+-import "fmt"
+-
+-const (
+-	Normal int64 = iota
+-
+-	ClusterInit
+-	AddNode
+-	RemoveNode
+-)
+-
+-const (
+-	defaultCompactThreshold = 10000
+-)
+-
+-func (e *Entry) isConfig() bool {
+-	return e.Type == AddNode || e.Type == RemoveNode
+-}
+-
+-type raftLog struct {
+-	ents             []Entry
+-	unstable         int64
+-	committed        int64
+-	applied          int64
+-	offset           int64
+-	snapshot         Snapshot
+-	unstableSnapshot Snapshot
+-
+-	// want a compact after the number of entries exceeds the threshold
+-	// TODO(xiangli) size might be a better criteria
+-	compactThreshold int64
+-}
+-
+-func newLog() *raftLog {
+-	return &raftLog{
+-		ents:             make([]Entry, 1),
+-		unstable:         1,
+-		committed:        0,
+-		applied:          0,
+-		compactThreshold: defaultCompactThreshold,
+-	}
+-}
+-
+-func (l *raftLog) isEmpty() bool {
+-	return l.offset == 0 && len(l.ents) == 1
+-}
+-
+-func (l *raftLog) String() string {
+-	return fmt.Sprintf("offset=%d committed=%d applied=%d len(ents)=%d", l.offset, l.committed, l.applied, len(l.ents))
+-}
+-
+-func (l *raftLog) maybeAppend(index, logTerm, committed int64, ents ...Entry) bool {
+-	if l.matchTerm(index, logTerm) {
+-		from := index + 1
+-		ci := l.findConflict(from, ents)
+-		switch {
+-		case ci == -1:
+-		case ci <= l.committed:
+-			panic("conflict with committed entry")
+-		default:
+-			l.append(ci-1, ents[ci-from:]...)
+-		}
+-		if l.committed < committed {
+-			l.committed = min(committed, l.lastIndex())
+-		}
+-		return true
+-	}
+-	return false
+-}
+-
+-func (l *raftLog) append(after int64, ents ...Entry) int64 {
+-	l.ents = append(l.slice(l.offset, after+1), ents...)
+-	l.unstable = min(l.unstable, after+1)
+-	return l.lastIndex()
+-}
+-
+-func (l *raftLog) findConflict(from int64, ents []Entry) int64 {
+-	for i, ne := range ents {
+-		if oe := l.at(from + int64(i)); oe == nil || oe.Term != ne.Term {
+-			return from + int64(i)
+-		}
+-	}
+-	return -1
+-}
+-
+-func (l *raftLog) unstableEnts() []Entry {
+-	ents := l.entries(l.unstable)
+-	if ents == nil {
+-		return nil
+-	}
+-	cpy := make([]Entry, len(ents))
+-	copy(cpy, ents)
+-	return cpy
+-}
+-
+-func (l *raftLog) resetUnstable() {
+-	l.unstable = l.lastIndex() + 1
+-}
+-
+-// nextEnts returns all the available entries for execution.
+-// all the returned entries will be marked as applied.
+-func (l *raftLog) nextEnts() (ents []Entry) {
+-	if l.committed > l.applied {
+-		ents := l.slice(l.applied+1, l.committed+1)
+-		if ents == nil {
+-			return nil
+-		}
+-		cpy := make([]Entry, len(ents))
+-		copy(cpy, ents)
+-		return cpy
+-	}
+-	return nil
+-}
+-
+-func (l *raftLog) resetNextEnts() {
+-	if l.committed > l.applied {
+-		l.applied = l.committed
+-	}
+-}
+-
+-func (l *raftLog) lastIndex() int64 {
+-	return int64(len(l.ents)) - 1 + l.offset
+-}
+-
+-func (l *raftLog) term(i int64) int64 {
+-	if e := l.at(i); e != nil {
+-		return e.Term
+-	}
+-	return -1
+-}
+-
+-func (l *raftLog) entries(i int64) []Entry {
+-	// never send out the first entry
+-	// first entry is only used for matching
+-	// prevLogTerm
+-	if i == l.offset {
+-		panic("cannot return the first entry in log")
+-	}
+-	return l.slice(i, l.lastIndex()+1)
+-}
+-
+-func (l *raftLog) isUpToDate(i, term int64) bool {
+-	e := l.at(l.lastIndex())
+-	return term > e.Term || (term == e.Term && i >= l.lastIndex())
+-}
+-
+-func (l *raftLog) matchTerm(i, term int64) bool {
+-	if e := l.at(i); e != nil {
+-		return e.Term == term
+-	}
+-	return false
+-}
+-
+-func (l *raftLog) maybeCommit(maxIndex, term int64) bool {
+-	if maxIndex > l.committed && l.term(maxIndex) == term {
+-		l.committed = maxIndex
+-		return true
+-	}
+-	return false
+-}
+-
+-// compact compacts all log entries until i.
+-// It removes the log entries before i, exclusive.
+-// i must be not smaller than the index of the first entry
+-// and not greater than the index of the last entry.
+-// the number of entries after compaction will be returned.
+-func (l *raftLog) compact(i int64) int64 {
+-	if l.isOutOfBounds(i) {
+-		panic(fmt.Sprintf("compact %d out of bounds [%d:%d]", i, l.offset, l.lastIndex()))
+-	}
+-	l.ents = l.slice(i, l.lastIndex()+1)
+-	l.unstable = max(i+1, l.unstable)
+-	l.offset = i
+-	return int64(len(l.ents))
+-}
+-
+-func (l *raftLog) snap(d []byte, clusterId, index, term int64, nodes []int64) {
+-	l.snapshot = Snapshot{clusterId, d, nodes, index, term}
+-}
+-
+-func (l *raftLog) shouldCompact() bool {
+-	return (l.applied - l.offset) > l.compactThreshold
+-}
+-
+-func (l *raftLog) restore(s Snapshot) {
+-	l.ents = []Entry{{Term: s.Term}}
+-	l.unstable = s.Index + 1
+-	l.committed = s.Index
+-	l.applied = s.Index
+-	l.offset = s.Index
+-	l.snapshot = s
+-}
+-
+-func (l *raftLog) at(i int64) *Entry {
+-	if l.isOutOfBounds(i) {
+-		return nil
+-	}
+-	return &l.ents[i-l.offset]
+-}
+-
+-// slice get a slice of log entries from lo through hi-1, inclusive.
+-func (l *raftLog) slice(lo int64, hi int64) []Entry {
+-	if lo >= hi {
+-		return nil
+-	}
+-	if l.isOutOfBounds(lo) || l.isOutOfBounds(hi-1) {
+-		return nil
+-	}
+-	return l.ents[lo-l.offset : hi-l.offset]
+-}
+-
+-func (l *raftLog) isOutOfBounds(i int64) bool {
+-	if i < l.offset || i > l.lastIndex() {
+-		return true
+-	}
+-	return false
+-}
+-
+-func min(a, b int64) int64 {
+-	if a > b {
+-		return b
+-	}
+-	return a
+-}
+-
+-func max(a, b int64) int64 {
+-	if a > b {
+-		return a
+-	}
+-	return b
+-}
+diff --git a/raft2/log_test.go b/raft2/log_test.go
+deleted file mode 100644
+index 5af620b..0000000
+--- a/raft2/log_test.go
++++ /dev/null
+@@ -1,303 +0,0 @@
+-package raft
+-
+-import (
+-	"reflect"
+-	"testing"
+-)
+-
+-// TestAppend ensures:
+-// 1. If an existing entry conflicts with a new one (same index
+-// but different terms), delete the existing entry and all that
+-// follow it
+-// 2.Append any new entries not already in the log
+-func TestAppend(t *testing.T) {
+-	previousEnts := []Entry{{Term: 1}, {Term: 2}}
+-	previousUnstable := int64(3)
+-	tests := []struct {
+-		after     int64
+-		ents      []Entry
+-		windex    int64
+-		wents     []Entry
+-		wunstable int64
+-	}{
+-		{
+-			2,
+-			[]Entry{},
+-			2,
+-			[]Entry{{Term: 1}, {Term: 2}},
+-			3,
+-		},
+-		{
+-			2,
+-			[]Entry{{Term: 2}},
+-			3,
+-			[]Entry{{Term: 1}, {Term: 2}, {Term: 2}},
+-			3,
+-		},
+-		// conflicts with index 1
+-		{
+-			0,
+-			[]Entry{{Term: 2}},
+-			1,
+-			[]Entry{{Term: 2}},
+-			1,
+-		},
+-		// conflicts with index 2
+-		{
+-			1,
+-			[]Entry{{Term: 3}, {Term: 3}},
+-			3,
+-			[]Entry{{Term: 1}, {Term: 3}, {Term: 3}},
+-			2,
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		raftLog := newLog()
+-		raftLog.ents = append(raftLog.ents, previousEnts...)
+-		raftLog.unstable = previousUnstable
+-		index := raftLog.append(tt.after, tt.ents...)
+-		if index != tt.windex {
+-			t.Errorf("#%d: lastIndex = %d, want %d", i, index, tt.windex)
+-		}
+-		if g := raftLog.entries(1); !reflect.DeepEqual(g, tt.wents) {
+-			t.Errorf("#%d: logEnts = %+v, want %+v", i, g, tt.wents)
+-		}
+-		if g := raftLog.unstable; g != tt.wunstable {
+-			t.Errorf("#%d: unstable = %d, want %d", i, g, tt.wunstable)
+-		}
+-	}
+-}
+-
+-// TestCompactionSideEffects ensures that all the log related funcationality works correctly after
+-// a compaction.
+-func TestCompactionSideEffects(t *testing.T) {
+-	var i int64
+-	lastIndex := int64(1000)
+-	raftLog := newLog()
+-
+-	for i = 0; i < lastIndex; i++ {
+-		raftLog.append(int64(i), Entry{Term: int64(i + 1), Index: int64(i + 1)})
+-	}
+-
+-	raftLog.compact(500)
+-
+-	if raftLog.lastIndex() != lastIndex {
+-		t.Errorf("lastIndex = %d, want %d", raftLog.lastIndex(), lastIndex)
+-	}
+-
+-	for i := raftLog.offset; i <= raftLog.lastIndex(); i++ {
+-		if raftLog.term(i) != i {
+-			t.Errorf("term(%d) = %d, want %d", i, raftLog.term(i), i)
+-		}
+-	}
+-
+-	for i := raftLog.offset; i <= raftLog.lastIndex(); i++ {
+-		if !raftLog.matchTerm(i, i) {
+-			t.Errorf("matchTerm(%d) = false, want true", i)
+-		}
+-	}
+-
+-	unstableEnts := raftLog.unstableEnts()
+-	if g := len(unstableEnts); g != 500 {
+-		t.Errorf("len(unstableEntries) = %d, want = %d", g, 500)
+-	}
+-	if unstableEnts[0].Index != 501 {
+-		t.Errorf("Index = %d, want = %d", unstableEnts[0].Index, 501)
+-	}
+-
+-	prev := raftLog.lastIndex()
+-	raftLog.append(raftLog.lastIndex(), Entry{Term: raftLog.lastIndex() + 1})
+-	if raftLog.lastIndex() != prev+1 {
+-		t.Errorf("lastIndex = %d, want = %d", raftLog.lastIndex(), prev+1)
+-	}
+-
+-	ents := raftLog.entries(raftLog.lastIndex())
+-	if len(ents) != 1 {
+-		t.Errorf("len(entries) = %d, want = %d", len(ents), 1)
+-	}
+-}
+-
+-func TestUnstableEnts(t *testing.T) {
+-	previousEnts := []Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}}
+-	tests := []struct {
+-		unstable  int64
+-		wents     []Entry
+-		wunstable int64
+-	}{
+-		{3, nil, 3},
+-		{1, previousEnts, 3},
+-	}
+-
+-	for i, tt := range tests {
+-		raftLog := newLog()
+-		raftLog.ents = append(raftLog.ents, previousEnts...)
+-		raftLog.unstable = tt.unstable
+-		ents := raftLog.unstableEnts()
+-		raftLog.resetUnstable()
+-		if !reflect.DeepEqual(ents, tt.wents) {
+-			t.Errorf("#%d: unstableEnts = %+v, want %+v", i, ents, tt.wents)
+-		}
+-		if g := raftLog.unstable; g != tt.wunstable {
+-			t.Errorf("#%d: unstable = %d, want %d", i, g, tt.wunstable)
+-		}
+-	}
+-}
+-
+-//TestCompaction ensures that the number of log entreis is correct after compactions.
+-func TestCompaction(t *testing.T) {
+-	tests := []struct {
+-		app     int
+-		compact []int64
+-		wleft   []int
+-		wallow  bool
+-	}{
+-		// out of upper bound
+-		{1000, []int64{1001}, []int{-1}, false},
+-		{1000, []int64{300, 500, 800, 900}, []int{701, 501, 201, 101}, true},
+-		// out of lower bound
+-		{1000, []int64{300, 299}, []int{701, -1}, false},
+-	}
+-
+-	for i, tt := range tests {
+-		func() {
+-			defer func() {
+-				if r := recover(); r != nil {
+-					if tt.wallow == true {
+-						t.Errorf("%d: allow = %v, want %v", i, false, true)
+-					}
+-				}
+-			}()
+-
+-			raftLog := newLog()
+-			for i := 0; i < tt.app; i++ {
+-				raftLog.append(int64(i), Entry{})
+-			}
+-
+-			for j := 0; j < len(tt.compact); j++ {
+-				raftLog.compact(tt.compact[j])
+-				if len(raftLog.ents) != tt.wleft[j] {
+-					t.Errorf("#%d.%d len = %d, want %d", i, j, len(raftLog.ents), tt.wleft[j])
+-				}
+-			}
+-		}()
+-	}
+-}
+-
+-func TestLogRestore(t *testing.T) {
+-	var i int64
+-	raftLog := newLog()
+-	for i = 0; i < 100; i++ {
+-		raftLog.append(i, Entry{Term: i + 1})
+-	}
+-
+-	index := int64(1000)
+-	term := int64(1000)
+-	raftLog.restore(Snapshot{Index: index, Term: term})
+-
+-	// only has the guard entry
+-	if len(raftLog.ents) != 1 {
+-		t.Errorf("len = %d, want 0", len(raftLog.ents))
+-	}
+-	if raftLog.offset != index {
+-		t.Errorf("offset = %d, want %d", raftLog.offset, index)
+-	}
+-	if raftLog.applied != index {
+-		t.Errorf("applied = %d, want %d", raftLog.applied, index)
+-	}
+-	if raftLog.committed != index {
+-		t.Errorf("comitted = %d, want %d", raftLog.committed, index)
+-	}
+-	if raftLog.unstable != index+1 {
+-		t.Errorf("unstable = %d, want %d", raftLog.unstable, index+1)
+-	}
+-	if raftLog.term(index) != term {
+-		t.Errorf("term = %d, want %d", raftLog.term(index), term)
+-	}
+-}
+-
+-func TestIsOutOfBounds(t *testing.T) {
+-	offset := int64(100)
+-	num := int64(100)
+-	l := &raftLog{offset: offset, ents: make([]Entry, num)}
+-
+-	tests := []struct {
+-		index int64
+-		w     bool
+-	}{
+-		{offset - 1, true},
+-		{offset, false},
+-		{offset + num/2, false},
+-		{offset + num - 1, false},
+-		{offset + num, true},
+-	}
+-
+-	for i, tt := range tests {
+-		g := l.isOutOfBounds(tt.index)
+-		if g != tt.w {
+-			t.Errorf("#%d: isOutOfBounds = %v, want %v", i, g, tt.w)
+-		}
+-	}
+-}
+-
+-func TestAt(t *testing.T) {
+-	var i int64
+-	offset := int64(100)
+-	num := int64(100)
+-
+-	l := &raftLog{offset: offset}
+-	for i = 0; i < num; i++ {
+-		l.ents = append(l.ents, Entry{Term: i})
+-	}
+-
+-	tests := []struct {
+-		index int64
+-		w     *Entry
+-	}{
+-		{offset - 1, nil},
+-		{offset, &Entry{Term: 0}},
+-		{offset + num/2, &Entry{Term: num / 2}},
+-		{offset + num - 1, &Entry{Term: num - 1}},
+-		{offset + num, nil},
+-	}
+-
+-	for i, tt := range tests {
+-		g := l.at(tt.index)
+-		if !reflect.DeepEqual(g, tt.w) {
+-			t.Errorf("#%d: at = %v, want %v", i, g, tt.w)
+-		}
+-	}
+-}
+-
+-func TestSlice(t *testing.T) {
+-	var i int64
+-	offset := int64(100)
+-	num := int64(100)
+-
+-	l := &raftLog{offset: offset}
+-	for i = 0; i < num; i++ {
+-		l.ents = append(l.ents, Entry{Term: i})
+-	}
+-
+-	tests := []struct {
+-		from int64
+-		to   int64
+-		w    []Entry
+-	}{
+-		{offset - 1, offset + 1, nil},
+-		{offset, offset + 1, []Entry{{Term: 0}}},
+-		{offset + num/2, offset + num/2 + 1, []Entry{{Term: num / 2}}},
+-		{offset + num - 1, offset + num, []Entry{{Term: num - 1}}},
+-		{offset + num, offset + num + 1, nil},
+-
+-		{offset + num/2, offset + num/2, nil},
+-		{offset + num/2, offset + num/2 - 1, nil},
+-	}
+-
+-	for i, tt := range tests {
+-		g := l.slice(tt.from, tt.to)
+-		if !reflect.DeepEqual(g, tt.w) {
+-			t.Errorf("#%d: from %d to %d = %v, want %v", i, tt.from, tt.to, g, tt.w)
+-		}
+-	}
+-}
+diff --git a/raft2/node.go b/raft2/node.go
+deleted file mode 100644
+index d81021f..0000000
+--- a/raft2/node.go
++++ /dev/null
+@@ -1,127 +0,0 @@
+-// Package raft implements raft.
+-package raft
+-
+-import "code.google.com/p/go.net/context"
+-
+-type stateResp struct {
+-	st          State
+-	ents, cents []Entry
+-	msgs        []Message
+-}
+-
+-func (a State) Equal(b State) bool {
+-	return a.Term == b.Term && a.Vote == b.Vote && a.LastIndex == b.LastIndex
+-}
+-
+-func (sr stateResp) containsUpdates(prev stateResp) bool {
+-	return !prev.st.Equal(sr.st) || len(sr.ents) > 0 || len(sr.cents) > 0 || len(sr.msgs) > 0
+-}
+-
+-type Node struct {
+-	ctx    context.Context
+-	propc  chan []byte
+-	recvc  chan Message
+-	statec chan stateResp
+-	tickc  chan struct{}
+-}
+-
+-func Start(ctx context.Context, id int64, peers []int64) *Node {
+-	n := &Node{
+-		ctx:    ctx,
+-		propc:  make(chan []byte),
+-		recvc:  make(chan Message),
+-		statec: make(chan stateResp),
+-		tickc:  make(chan struct{}),
+-	}
+-	r := newRaft(id, peers)
+-	go n.run(r)
+-	return n
+-}
+-
+-func (n *Node) run(r *raft) {
+-	propc := n.propc
+-	statec := n.statec
+-
+-	var prev stateResp
+-	for {
+-		if r.hasLeader() {
+-			propc = n.propc
+-		} else {
+-			// We cannot accept proposals because we don't know who
+-			// to send them to, so we'll apply back-pressure and
+-			// block senders.
+-			propc = nil
+-		}
+-
+-		sr := stateResp{
+-			r.State,
+-			r.raftLog.unstableEnts(),
+-			r.raftLog.nextEnts(),
+-			r.msgs,
+-		}
+-
+-		if sr.containsUpdates(prev) {
+-			statec = n.statec
+-		} else {
+-			statec = nil
+-		}
+-
+-		select {
+-		case p := <-propc:
+-			r.propose(p)
+-		case m := <-n.recvc:
+-			r.Step(m) // raft never returns an error
+-		case <-n.tickc:
+-			// r.tick()
+-		case statec <- sr:
+-			r.raftLog.resetNextEnts()
+-			r.raftLog.resetUnstable()
+-			r.msgs = nil
+-		case <-n.ctx.Done():
+-			return
+-		}
+-	}
+-}
+-
+-func (n *Node) Tick() error {
+-	select {
+-	case n.tickc <- struct{}{}:
+-		return nil
+-	case <-n.ctx.Done():
+-		return n.ctx.Err()
+-	}
+-}
+-
+-// Propose proposes data be appended to the log.
+-func (n *Node) Propose(ctx context.Context, data []byte) error {
+-	select {
+-	case n.propc <- data:
+-		return nil
+-	case <-ctx.Done():
+-		return ctx.Err()
+-	case <-n.ctx.Done():
+-		return n.ctx.Err()
+-	}
+-}
+-
+-// Step advances the state machine using m.
+-func (n *Node) Step(m Message) error {
+-	select {
+-	case n.recvc <- m:
+-		return nil
+-	case <-n.ctx.Done():
+-		return n.ctx.Err()
+-	}
+-}
+-
+-// ReadState returns the current point-in-time state.
+-func (n *Node) ReadState(ctx context.Context) (st State, ents, cents []Entry, msgs []Message, err error) {
+-	select {
+-	case sr := <-n.statec:
+-		return sr.st, sr.ents, sr.cents, sr.msgs, nil
+-	case <-ctx.Done():
+-		return State{}, nil, nil, nil, ctx.Err()
+-	case <-n.ctx.Done():
+-		return State{}, nil, nil, nil, n.ctx.Err()
+-	}
+-}
+diff --git a/raft2/node_test.go b/raft2/node_test.go
+deleted file mode 100644
+index 0a0cadc..0000000
+--- a/raft2/node_test.go
++++ /dev/null
+@@ -1,5 +0,0 @@
+-package raft
+-
+-import "testing"
+-
+-func TestNode(t *testing.T) {}
+diff --git a/raft2/raft.go b/raft2/raft.go
+deleted file mode 100644
+index 170ca6c..0000000
+--- a/raft2/raft.go
++++ /dev/null
+@@ -1,536 +0,0 @@
+-package raft
+-
+-import (
+-	"errors"
+-	"fmt"
+-	"sort"
+-)
+-
+-const none = -1
+-
+-type messageType int64
+-
+-const (
+-	msgHup messageType = iota
+-	msgBeat
+-	msgProp
+-	msgApp
+-	msgAppResp
+-	msgVote
+-	msgVoteResp
+-	msgSnap
+-	msgDenied
+-)
+-
+-var mtmap = [...]string{
+-	msgHup:      "msgHup",
+-	msgBeat:     "msgBeat",
+-	msgProp:     "msgProp",
+-	msgApp:      "msgApp",
+-	msgAppResp:  "msgAppResp",
+-	msgVote:     "msgVote",
+-	msgVoteResp: "msgVoteResp",
+-	msgSnap:     "msgSnap",
+-	msgDenied:   "msgDenied",
+-}
+-
+-func (mt messageType) String() string {
+-	return mtmap[int64(mt)]
+-}
+-
+-var errNoLeader = errors.New("no leader")
+-
+-const (
+-	stateFollower stateType = iota
+-	stateCandidate
+-	stateLeader
+-)
+-
+-type stateType int64
+-
+-var stmap = [...]string{
+-	stateFollower:  "stateFollower",
+-	stateCandidate: "stateCandidate",
+-	stateLeader:    "stateLeader",
+-}
+-
+-var stepmap = [...]stepFunc{
+-	stateFollower:  stepFollower,
+-	stateCandidate: stepCandidate,
+-	stateLeader:    stepLeader,
+-}
+-
+-func (st stateType) String() string {
+-	return stmap[int64(st)]
+-}
+-
+-type Message struct {
+-	Type     messageType
+-	To       int64
+-	From     int64
+-	Term     int64
+-	LogTerm  int64
+-	Index    int64
+-	Entries  []Entry
+-	Commit   int64
+-	Snapshot Snapshot
+-}
+-
+-func (m Message) String() string {
+-	return fmt.Sprintf("type=%v from=%x to=%x term=%d logTerm=%d i=%d ci=%d len(ents)=%d",
+-		m.Type, m.From, m.To, m.Term, m.LogTerm, m.Index, m.Commit, len(m.Entries))
+-}
+-
+-type progress struct {
+-	match, next int64
+-}
+-
+-func (pr *progress) update(n int64) {
+-	pr.match = n
+-	pr.next = n + 1
+-}
+-
+-func (pr *progress) decr() {
+-	if pr.next--; pr.next < 1 {
+-		pr.next = 1
+-	}
+-}
+-
+-func (pr *progress) String() string {
+-	return fmt.Sprintf("n=%d m=%d", pr.next, pr.match)
+-}
+-
+-// int64Slice implements sort interface
+-type int64Slice []int64
+-
+-func (p int64Slice) Len() int           { return len(p) }
+-func (p int64Slice) Less(i, j int) bool { return p[i] < p[j] }
+-func (p int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+-
+-type raft struct {
+-	State
+-
+-	id int64
+-
+-	// the term we are participating in at any time
+-	index int64
+-
+-	// the log
+-	raftLog *raftLog
+-
+-	prs map[int64]*progress
+-
+-	state stateType
+-
+-	votes map[int64]bool
+-
+-	msgs []Message
+-
+-	// the leader id
+-	lead int64
+-
+-	// pending reconfiguration
+-	configuring bool
+-
+-	// promotable indicates whether state machine could be promoted.
+-	// New machine has to wait until it has been added to the cluster, or it
+-	// may become the leader of the cluster without it.
+-	promotable bool
+-}
+-
+-func newRaft(id int64, peers []int64) *raft {
+-	if id == none {
+-		panic("cannot use none id")
+-	}
+-	r := &raft{id: id, lead: none, raftLog: newLog(), prs: make(map[int64]*progress)}
+-	for _, p := range peers {
+-		r.prs[p] = &progress{}
+-	}
+-	r.reset(0)
+-	return r
+-}
+-
+-func (r *raft) hasLeader() bool { return r.lead != none }
+-
+-func (r *raft) propose(data []byte) {
+-	r.Step(Message{From: r.id, Type: msgProp, Entries: []Entry{{Data: data}}})
+-}
+-
+-func (r *raft) String() string {
+-	s := fmt.Sprintf(`state=%v term=%d`, r.state, r.Term)
+-	switch r.state {
+-	case stateFollower:
+-		s += fmt.Sprintf(" vote=%v lead=%v", r.Vote, r.lead)
+-	case stateCandidate:
+-		s += fmt.Sprintf(` votes="%v"`, r.votes)
+-	case stateLeader:
+-		s += fmt.Sprintf(` prs="%v"`, r.prs)
+-	}
+-	return s
+-}
+-
+-func (r *raft) poll(id int64, v bool) (granted int) {
+-	if _, ok := r.votes[id]; !ok {
+-		r.votes[id] = v
+-	}
+-	for _, vv := range r.votes {
+-		if vv {
+-			granted++
+-		}
+-	}
+-	return granted
+-}
+-
+-// send persists state to stable storage and then sends to its mailbox.
+-func (r *raft) send(m Message) {
+-	m.From = r.id
+-	m.Term = r.Term
+-	r.msgs = append(r.msgs, m)
+-}
+-
+-// sendAppend sends RRPC, with entries to the given peer.
+-func (r *raft) sendAppend(to int64) {
+-	pr := r.prs[to]
+-	m := Message{}
+-	m.To = to
+-	m.Index = pr.next - 1
+-	if r.needSnapshot(m.Index) {
+-		m.Type = msgSnap
+-		m.Snapshot = r.raftLog.snapshot
+-	} else {
+-		m.Type = msgApp
+-		m.LogTerm = r.raftLog.term(pr.next - 1)
+-		m.Entries = r.raftLog.entries(pr.next)
+-		m.Commit = r.raftLog.committed
+-	}
+-	r.send(m)
+-}
+-
+-// sendHeartbeat sends RRPC, without entries to the given peer.
+-func (r *raft) sendHeartbeat(to int64) {
+-	pr := r.prs[to]
+-	index := max(pr.next-1, r.raftLog.lastIndex())
+-	m := Message{
+-		To:      to,
+-		Type:    msgApp,
+-		Index:   index,
+-		LogTerm: r.raftLog.term(index),
+-		Commit:  r.raftLog.committed,
+-	}
+-	r.send(m)
+-}
+-
+-// bcastAppend sends RRPC, with entries to all peers that are not up-to-date according to r.mis.
+-func (r *raft) bcastAppend() {
+-	for i := range r.prs {
+-		if i == r.id {
+-			continue
+-		}
+-		r.sendAppend(i)
+-	}
+-}
+-
+-// bcastHeartbeat sends RRPC, without entries to all the peers.
+-func (r *raft) bcastHeartbeat() {
+-	for i := range r.prs {
+-		if i == r.id {
+-			continue
+-		}
+-		r.sendHeartbeat(i)
+-	}
+-}
+-
+-func (r *raft) maybeCommit() bool {
+-	// TODO(bmizerany): optimize.. Currently naive
+-	mis := make(int64Slice, 0, len(r.prs))
+-	for i := range r.prs {
+-		mis = append(mis, r.prs[i].match)
+-	}
+-	sort.Sort(sort.Reverse(mis))
+-	mci := mis[r.q()-1]
+-
+-	return r.raftLog.maybeCommit(mci, r.Term)
+-}
+-
+-func (r *raft) reset(term int64) {
+-	r.Term = term
+-	r.lead = none
+-	r.Vote = none
+-	r.votes = make(map[int64]bool)
+-	for i := range r.prs {
+-		r.prs[i] = &progress{next: r.raftLog.lastIndex() + 1}
+-		if i == r.id {
+-			r.prs[i].match = r.raftLog.lastIndex()
+-		}
+-	}
+-}
+-
+-func (r *raft) q() int {
+-	return len(r.prs)/2 + 1
+-}
+-
+-func (r *raft) appendEntry(e Entry) {
+-	e.Term = r.Term
+-	e.Index = r.raftLog.lastIndex() + 1
+-	r.LastIndex = r.raftLog.append(r.raftLog.lastIndex(), e)
+-	r.prs[r.id].update(r.raftLog.lastIndex())
+-	r.maybeCommit()
+-}
+-
+-func (r *raft) becomeFollower(term int64, lead int64) {
+-	r.reset(term)
+-	r.lead = lead
+-	r.state = stateFollower
+-	r.configuring = false
+-}
+-
+-func (r *raft) becomeCandidate() {
+-	// TODO(xiangli) remove the panic when the raft implementation is stable
+-	if r.state == stateLeader {
+-		panic("invalid transition [leader -> candidate]")
+-	}
+-	r.reset(r.Term + 1)
+-	r.Vote = r.id
+-	r.state = stateCandidate
+-}
+-
+-func (r *raft) becomeLeader() {
+-	// TODO(xiangli) remove the panic when the raft implementation is stable
+-	if r.state == stateFollower {
+-		panic("invalid transition [follower -> leader]")
+-	}
+-	r.reset(r.Term)
+-	r.lead = r.id
+-	r.state = stateLeader
+-
+-	for _, e := range r.raftLog.entries(r.raftLog.committed + 1) {
+-		if e.isConfig() {
+-			r.configuring = true
+-		}
+-	}
+-
+-	r.appendEntry(Entry{Type: Normal, Data: nil})
+-}
+-
+-func (r *raft) ReadMessages() []Message {
+-	msgs := r.msgs
+-	r.msgs = make([]Message, 0)
+-
+-	return msgs
+-}
+-
+-func (r *raft) Step(m Message) error {
+-	// TODO(bmizerany): this likely allocs - prevent that.
+-	defer func() { r.Commit = r.raftLog.committed }()
+-
+-	if m.Type == msgHup {
+-		r.becomeCandidate()
+-		if r.q() == r.poll(r.id, true) {
+-			r.becomeLeader()
+-		}
+-		for i := range r.prs {
+-			if i == r.id {
+-				continue
+-			}
+-			lasti := r.raftLog.lastIndex()
+-			r.send(Message{To: i, Type: msgVote, Index: lasti, LogTerm: r.raftLog.term(lasti)})
+-		}
+-	}
+-
+-	switch {
+-	case m.Term == 0:
+-		// local message
+-	case m.Term > r.Term:
+-		lead := m.From
+-		if m.Type == msgVote {
+-			lead = none
+-		}
+-		r.becomeFollower(m.Term, lead)
+-	case m.Term < r.Term:
+-		// ignore
+-	}
+-
+-	stepmap[r.state](r, m)
+-	return nil
+-}
+-
+-func (r *raft) handleAppendEntries(m Message) {
+-	if r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...) {
+-		r.LastIndex = r.raftLog.lastIndex()
+-		r.send(Message{To: m.From, Type: msgAppResp, Index: r.raftLog.lastIndex()})
+-	} else {
+-		r.send(Message{To: m.From, Type: msgAppResp, Index: -1})
+-	}
+-}
+-
+-func (r *raft) handleSnapshot(m Message) {
+-	if r.restore(m.Snapshot) {
+-		r.send(Message{To: m.From, Type: msgAppResp, Index: r.raftLog.lastIndex()})
+-	} else {
+-		r.send(Message{To: m.From, Type: msgAppResp, Index: r.raftLog.committed})
+-	}
+-}
+-
+-func (r *raft) addNode(id int64) {
+-	r.setProgress(id, 0, r.raftLog.lastIndex()+1)
+-	r.configuring = false
+-	if id == r.id {
+-		r.promotable = true
+-	}
+-}
+-
+-func (r *raft) removeNode(id int64) {
+-	r.delProgress(id)
+-	r.configuring = false
+-}
+-
+-type stepFunc func(r *raft, m Message)
+-
+-func stepLeader(r *raft, m Message) {
+-	switch m.Type {
+-	case msgBeat:
+-		r.bcastHeartbeat()
+-	case msgProp:
+-		if len(m.Entries) != 1 {
+-			panic("unexpected length(entries) of a msgProp")
+-		}
+-		e := m.Entries[0]
+-		if e.isConfig() {
+-			if r.configuring {
+-				panic("pending conf")
+-			}
+-			r.configuring = true
+-		}
+-		r.appendEntry(e)
+-		r.bcastAppend()
+-	case msgAppResp:
+-		if m.Index < 0 {
+-			r.prs[m.From].decr()
+-			r.sendAppend(m.From)
+-		} else {
+-			r.prs[m.From].update(m.Index)
+-			if r.maybeCommit() {
+-				r.bcastAppend()
+-			}
+-		}
+-	case msgVote:
+-		r.send(Message{To: m.From, Type: msgVoteResp, Index: -1})
+-	}
+-}
+-
+-func stepCandidate(r *raft, m Message) {
+-	switch m.Type {
+-	case msgProp:
+-		panic("no leader")
+-	case msgApp:
+-		r.becomeFollower(r.Term, m.From)
+-		r.handleAppendEntries(m)
+-	case msgSnap:
+-		r.becomeFollower(m.Term, m.From)
+-		r.handleSnapshot(m)
+-	case msgVote:
+-		r.send(Message{To: m.From, Type: msgVoteResp, Index: -1})
+-	case msgVoteResp:
+-		gr := r.poll(m.From, m.Index >= 0)
+-		switch r.q() {
+-		case gr:
+-			r.becomeLeader()
+-			r.bcastAppend()
+-		case len(r.votes) - gr:
+-			r.becomeFollower(r.Term, none)
+-		}
+-	}
+-}
+-
+-func stepFollower(r *raft, m Message) {
+-	switch m.Type {
+-	case msgProp:
+-		if r.lead == none {
+-			panic("no leader")
+-		}
+-		m.To = r.lead
+-		r.send(m)
+-	case msgApp:
+-		r.lead = m.From
+-		r.handleAppendEntries(m)
+-	case msgSnap:
+-		r.handleSnapshot(m)
+-	case msgVote:
+-		if (r.Vote == none || r.Vote == m.From) && r.raftLog.isUpToDate(m.Index, m.LogTerm) {
+-			r.Vote = m.From
+-			r.send(Message{To: m.From, Type: msgVoteResp, Index: r.raftLog.lastIndex()})
+-		} else {
+-			r.send(Message{To: m.From, Type: msgVoteResp, Index: -1})
+-		}
+-	}
+-}
+-
+-func (r *raft) compact(d []byte) {
+-	r.raftLog.snap(d, r.raftLog.applied, r.raftLog.term(r.raftLog.applied), r.nodes())
+-	r.raftLog.compact(r.raftLog.applied)
+-}
+-
+-// restore recovers the statemachine from a snapshot. It restores the log and the
+-// configuration of statemachine.
+-func (r *raft) restore(s Snapshot) bool {
+-	if s.Index <= r.raftLog.committed {
+-		return false
+-	}
+-
+-	r.raftLog.restore(s)
+-	r.LastIndex = r.raftLog.lastIndex()
+-	r.prs = make(map[int64]*progress)
+-	for _, n := range s.Nodes {
+-		if n == r.id {
+-			r.setProgress(n, r.raftLog.lastIndex(), r.raftLog.lastIndex()+1)
+-		} else {
+-			r.setProgress(n, 0, r.raftLog.lastIndex()+1)
+-		}
+-	}
+-	r.configuring = false
+-	return true
+-}
+-
+-func (r *raft) needSnapshot(i int64) bool {
+-	if i < r.raftLog.offset {
+-		if r.raftLog.snapshot.IsEmpty() {
+-			panic("need non-empty snapshot")
+-		}
+-		return true
+-	}
+-	return false
+-}
+-
+-func (r *raft) nodes() []int64 {
+-	nodes := make([]int64, 0, len(r.prs))
+-	for k := range r.prs {
+-		nodes = append(nodes, k)
+-	}
+-	return nodes
+-}
+-
+-func (r *raft) setProgress(id, match, next int64) {
+-	r.prs[id] = &progress{next: next, match: match}
+-}
+-
+-func (r *raft) delProgress(id int64) {
+-	delete(r.prs, id)
+-}
+-
+-func (r *raft) loadEnts(ents []Entry) {
+-	if !r.raftLog.isEmpty() {
+-		panic("cannot load entries when log is not empty")
+-	}
+-	r.raftLog.append(0, ents...)
+-	r.raftLog.unstable = r.raftLog.lastIndex() + 1
+-}
+-
+-func (r *raft) loadState(state State) {
+-	r.raftLog.committed = state.Commit
+-	r.Term = state.Term
+-	r.Vote = state.Vote
+-}
+-
+-func (s *State) IsEmpty() bool {
+-	return s.Term == 0
+-}
+diff --git a/raft2/raft_test.go b/raft2/raft_test.go
+deleted file mode 100644
+index 511cf93..0000000
+--- a/raft2/raft_test.go
++++ /dev/null
+@@ -1,1035 +0,0 @@
+-package raft
+-
+-import (
+-	"bytes"
+-	"math/rand"
+-	"reflect"
+-	"sort"
+-	"testing"
+-)
+-
+-// nextEnts returns the appliable entries and updates the applied index
+-func (r *raft) nextEnts() (ents []Entry) {
+-	ents = r.raftLog.nextEnts()
+-	r.raftLog.resetNextEnts()
+-	return ents
+-}
+-
+-type Interface interface {
+-	Step(m Message) error
+-	ReadMessages() []Message
+-}
+-
+-func TestLeaderElection(t *testing.T) {
+-	tests := []struct {
+-		*network
+-		state stateType
+-	}{
+-		{newNetwork(nil, nil, nil), stateLeader},
+-		{newNetwork(nil, nil, nopStepper), stateLeader},
+-		{newNetwork(nil, nopStepper, nopStepper), stateCandidate},
+-		{newNetwork(nil, nopStepper, nopStepper, nil), stateCandidate},
+-		{newNetwork(nil, nopStepper, nopStepper, nil, nil), stateLeader},
+-
+-		// three logs further along than 0
+-		{newNetwork(nil, ents(1), ents(2), ents(1, 3), nil), stateFollower},
+-
+-		// logs converge
+-		{newNetwork(ents(1), nil, ents(2), ents(1), nil), stateLeader},
+-	}
+-
+-	for i, tt := range tests {
+-		tt.send(Message{From: 0, To: 0, Type: msgHup})
+-		sm := tt.network.peers[0].(*raft)
+-		if sm.state != tt.state {
+-			t.Errorf("#%d: state = %s, want %s", i, sm.state, tt.state)
+-		}
+-		if g := sm.Term; g != 1 {
+-			t.Errorf("#%d: term = %d, want %d", i, g, 1)
+-		}
+-	}
+-}
+-
+-func TestLogReplication(t *testing.T) {
+-	tests := []struct {
+-		*network
+-		msgs       []Message
+-		wcommitted int64
+-	}{
+-		{
+-			newNetwork(nil, nil, nil),
+-			[]Message{
+-				{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}},
+-			},
+-			2,
+-		},
+-		{
+-			newNetwork(nil, nil, nil),
+-			[]Message{
+-
+-				{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}},
+-				{From: 0, To: 1, Type: msgHup},
+-				{From: 0, To: 1, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}},
+-			},
+-			4,
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		tt.send(Message{From: 0, To: 0, Type: msgHup})
+-
+-		for _, m := range tt.msgs {
+-			tt.send(m)
+-		}
+-
+-		for j, x := range tt.network.peers {
+-			sm := x.(*raft)
+-
+-			if sm.raftLog.committed != tt.wcommitted {
+-				t.Errorf("#%d.%d: committed = %d, want %d", i, j, sm.raftLog.committed, tt.wcommitted)
+-			}
+-
+-			ents := make([]Entry, 0)
+-			for _, e := range sm.nextEnts() {
+-				if e.Data != nil {
+-					ents = append(ents, e)
+-				}
+-			}
+-			props := make([]Message, 0)
+-			for _, m := range tt.msgs {
+-				if m.Type == msgProp {
+-					props = append(props, m)
+-				}
+-			}
+-			for k, m := range props {
+-				if !bytes.Equal(ents[k].Data, m.Entries[0].Data) {
+-					t.Errorf("#%d.%d: data = %d, want %d", i, j, ents[k].Data, m.Entries[0].Data)
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-func TestSingleNodeCommit(t *testing.T) {
+-	tt := newNetwork(nil)
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-
+-	sm := tt.peers[0].(*raft)
+-	if sm.raftLog.committed != 3 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 3)
+-	}
+-}
+-
+-// TestCannotCommitWithoutNewTermEntry tests the entries cannot be committed
+-// when leader changes, no new proposal comes in and ChangeTerm proposal is
+-// filtered.
+-func TestCannotCommitWithoutNewTermEntry(t *testing.T) {
+-	tt := newNetwork(nil, nil, nil, nil, nil)
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-
+-	// 0 cannot reach 2,3,4
+-	tt.cut(0, 2)
+-	tt.cut(0, 3)
+-	tt.cut(0, 4)
+-
+-	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-
+-	sm := tt.peers[0].(*raft)
+-	if sm.raftLog.committed != 1 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 1)
+-	}
+-
+-	// network recovery
+-	tt.recover()
+-	// avoid committing ChangeTerm proposal
+-	tt.ignore(msgApp)
+-
+-	// elect 1 as the new leader with term 2
+-	tt.send(Message{From: 1, To: 1, Type: msgHup})
+-
+-	// no log entries from previous term should be committed
+-	sm = tt.peers[1].(*raft)
+-	if sm.raftLog.committed != 1 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 1)
+-	}
+-
+-	tt.recover()
+-
+-	// send out a heartbeat
+-	// after append a ChangeTerm entry from the current term, all entries
+-	// should be committed
+-	tt.send(Message{From: 1, To: 1, Type: msgBeat})
+-
+-	if sm.raftLog.committed != 4 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 4)
+-	}
+-
+-	// still be able to append a entry
+-	tt.send(Message{From: 1, To: 1, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-
+-	if sm.raftLog.committed != 5 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 5)
+-	}
+-}
+-
+-// TestCommitWithoutNewTermEntry tests the entries could be committed
+-// when leader changes, no new proposal comes in.
+-func TestCommitWithoutNewTermEntry(t *testing.T) {
+-	tt := newNetwork(nil, nil, nil, nil, nil)
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-
+-	// 0 cannot reach 2,3,4
+-	tt.cut(0, 2)
+-	tt.cut(0, 3)
+-	tt.cut(0, 4)
+-
+-	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-	tt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: []byte("some data")}}})
+-
+-	sm := tt.peers[0].(*raft)
+-	if sm.raftLog.committed != 1 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 1)
+-	}
+-
+-	// network recovery
+-	tt.recover()
+-
+-	// elect 1 as the new leader with term 2
+-	// after append a ChangeTerm entry from the current term, all entries
+-	// should be committed
+-	tt.send(Message{From: 1, To: 1, Type: msgHup})
+-
+-	if sm.raftLog.committed != 4 {
+-		t.Errorf("committed = %d, want %d", sm.raftLog.committed, 4)
+-	}
+-}
+-
+-func TestDuelingCandidates(t *testing.T) {
+-	a := newRaft(0, nil) // k, id are set later
+-	b := newRaft(0, nil)
+-	c := newRaft(0, nil)
+-
+-	nt := newNetwork(a, b, c)
+-	nt.cut(0, 2)
+-
+-	nt.send(Message{From: 0, To: 0, Type: msgHup})
+-	nt.send(Message{From: 2, To: 2, Type: msgHup})
+-
+-	nt.recover()
+-	nt.send(Message{From: 2, To: 2, Type: msgHup})
+-
+-	wlog := &raftLog{ents: []Entry{{}, Entry{Type: Normal, Data: nil, Term: 1, Index: 1}}, committed: 1}
+-	tests := []struct {
+-		sm      *raft
+-		state   stateType
+-		term    int64
+-		raftLog *raftLog
+-	}{
+-		{a, stateFollower, 2, wlog},
+-		{b, stateFollower, 2, wlog},
+-		{c, stateFollower, 2, newLog()},
+-	}
+-
+-	for i, tt := range tests {
+-		if g := tt.sm.state; g != tt.state {
+-			t.Errorf("#%d: state = %s, want %s", i, g, tt.state)
+-		}
+-		if g := tt.sm.Term; g != tt.term {
+-			t.Errorf("#%d: term = %d, want %d", i, g, tt.term)
+-		}
+-		base := ltoa(tt.raftLog)
+-		if sm, ok := nt.peers[int64(i)].(*raft); ok {
+-			l := ltoa(sm.raftLog)
+-			if g := diffu(base, l); g != "" {
+-				t.Errorf("#%d: diff:\n%s", i, g)
+-			}
+-		} else {
+-			t.Logf("#%d: empty log", i)
+-		}
+-	}
+-}
+-
+-func TestCandidateConcede(t *testing.T) {
+-	tt := newNetwork(nil, nil, nil)
+-	tt.isolate(0)
+-
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-	tt.send(Message{From: 2, To: 2, Type: msgHup})
+-
+-	// heal the partition
+-	tt.recover()
+-
+-	data := []byte("force follower")
+-	// send a proposal to 2 to flush out a msgApp to 0
+-	tt.send(Message{From: 2, To: 2, Type: msgProp, Entries: []Entry{{Data: data}}})
+-
+-	a := tt.peers[0].(*raft)
+-	if g := a.state; g != stateFollower {
+-		t.Errorf("state = %s, want %s", g, stateFollower)
+-	}
+-	if g := a.Term; g != 1 {
+-		t.Errorf("term = %d, want %d", g, 1)
+-	}
+-	wantLog := ltoa(&raftLog{ents: []Entry{{}, {Type: Normal, Data: nil, Term: 1, Index: 1}, {Term: 1, Index: 2, Data: data}}, committed: 2})
+-	for i, p := range tt.peers {
+-		if sm, ok := p.(*raft); ok {
+-			l := ltoa(sm.raftLog)
+-			if g := diffu(wantLog, l); g != "" {
+-				t.Errorf("#%d: diff:\n%s", i, g)
+-			}
+-		} else {
+-			t.Logf("#%d: empty log", i)
+-		}
+-	}
+-}
+-
+-func TestSingleNodeCandidate(t *testing.T) {
+-	tt := newNetwork(nil)
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-
+-	sm := tt.peers[0].(*raft)
+-	if sm.state != stateLeader {
+-		t.Errorf("state = %d, want %d", sm.state, stateLeader)
+-	}
+-}
+-
+-func TestOldMessages(t *testing.T) {
+-	tt := newNetwork(nil, nil, nil)
+-	// make 0 leader @ term 3
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-	tt.send(Message{From: 1, To: 1, Type: msgHup})
+-	tt.send(Message{From: 0, To: 0, Type: msgHup})
+-	// pretend we're an old leader trying to make progress
+-	tt.send(Message{From: 0, To: 0, Type: msgApp, Term: 1, Entries: []Entry{{Term: 1}}})
+-
+-	l := &raftLog{
+-		ents: []Entry{
+-			{}, {Type: Normal, Data: nil, Term: 1, Index: 1},
+-			{Type: Normal, Data: nil, Term: 2, Index: 2}, {Type: Normal, Data: nil, Term: 3, Index: 3},
+-		},
+-		committed: 3,
+-	}
+-	base := ltoa(l)
+-	for i, p := range tt.peers {
+-		if sm, ok := p.(*raft); ok {
+-			l := ltoa(sm.raftLog)
+-			if g := diffu(base, l); g != "" {
+-				t.Errorf("#%d: diff:\n%s", i, g)
+-			}
+-		} else {
+-			t.Logf("#%d: empty log", i)
+-		}
+-	}
+-}
+-
+-// TestOldMessagesReply - optimization - reply with new term.
+-
+-func TestProposal(t *testing.T) {
+-	tests := []struct {
+-		*network
+-		success bool
+-	}{
+-		{newNetwork(nil, nil, nil), true},
+-		{newNetwork(nil, nil, nopStepper), true},
+-		{newNetwork(nil, nopStepper, nopStepper), false},
+-		{newNetwork(nil, nopStepper, nopStepper, nil), false},
+-		{newNetwork(nil, nopStepper, nopStepper, nil, nil), true},
+-	}
+-
+-	for i, tt := range tests {
+-		send := func(m Message) {
+-			defer func() {
+-				// only recover is we expect it to panic so
+-				// panics we don't expect go up.
+-				if !tt.success {
+-					e := recover()
+-					if e != nil {
+-						t.Logf("#%d: err: %s", i, e)
+-					}
+-				}
+-			}()
+-			tt.send(m)
+-		}
+-
+-		data := []byte("somedata")
+-
+-		// promote 0 the leader
+-		send(Message{From: 0, To: 0, Type: msgHup})
+-		send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Data: data}}})
+-
+-		wantLog := newLog()
+-		if tt.success {
+-			wantLog = &raftLog{ents: []Entry{{}, {Type: Normal, Data: nil, Term: 1, Index: 1}, {Term: 1, Index: 2, Data: data}}, committed: 2}
+-		}
+-		base := ltoa(wantLog)
+-		for i, p := range tt.peers {
+-			if sm, ok := p.(*raft); ok {
+-				l := ltoa(sm.raftLog)
+-				if g := diffu(base, l); g != "" {
+-					t.Errorf("#%d: diff:\n%s", i, g)
+-				}
+-			} else {
+-				t.Logf("#%d: empty log", i)
+-			}
+-		}
+-		sm := tt.network.peers[0].(*raft)
+-		if g := sm.Term; g != 1 {
+-			t.Errorf("#%d: term = %d, want %d", i, g, 1)
+-		}
+-	}
+-}
+-
+-func TestProposalByProxy(t *testing.T) {
+-	data := []byte("somedata")
+-	tests := []*network{
+-		newNetwork(nil, nil, nil),
+-		newNetwork(nil, nil, nopStepper),
+-	}
+-
+-	for i, tt := range tests {
+-		// promote 0 the leader
+-		tt.send(Message{From: 0, To: 0, Type: msgHup})
+-
+-		// propose via follower
+-		tt.send(Message{From: 1, To: 1, Type: msgProp, Entries: []Entry{{Data: []byte("somedata")}}})
+-
+-		wantLog := &raftLog{ents: []Entry{{}, {Type: Normal, Data: nil, Term: 1, Index: 1}, {Term: 1, Data: data, Index: 2}}, committed: 2}
+-		base := ltoa(wantLog)
+-		for i, p := range tt.peers {
+-			if sm, ok := p.(*raft); ok {
+-				l := ltoa(sm.raftLog)
+-				if g := diffu(base, l); g != "" {
+-					t.Errorf("#%d: diff:\n%s", i, g)
+-				}
+-			} else {
+-				t.Logf("#%d: empty log", i)
+-			}
+-		}
+-		sm := tt.peers[0].(*raft)
+-		if g := sm.Term; g != 1 {
+-			t.Errorf("#%d: term = %d, want %d", i, g, 1)
+-		}
+-	}
+-}
+-
+-func TestCommit(t *testing.T) {
+-	tests := []struct {
+-		matches []int64
+-		logs    []Entry
+-		smTerm  int64
+-		w       int64
+-	}{
+-		// single
+-		{[]int64{1}, []Entry{{}, {Term: 1}}, 1, 1},
+-		{[]int64{1}, []Entry{{}, {Term: 1}}, 2, 0},
+-		{[]int64{2}, []Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
+-		{[]int64{1}, []Entry{{}, {Term: 2}}, 2, 1},
+-
+-		// odd
+-		{[]int64{2, 1, 1}, []Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
+-		{[]int64{2, 1, 1}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+-		{[]int64{2, 1, 2}, []Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
+-		{[]int64{2, 1, 2}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+-
+-		// even
+-		{[]int64{2, 1, 1, 1}, []Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
+-		{[]int64{2, 1, 1, 1}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+-		{[]int64{2, 1, 1, 2}, []Entry{{}, {Term: 1}, {Term: 2}}, 1, 1},
+-		{[]int64{2, 1, 1, 2}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+-		{[]int64{2, 1, 2, 2}, []Entry{{}, {Term: 1}, {Term: 2}}, 2, 2},
+-		{[]int64{2, 1, 2, 2}, []Entry{{}, {Term: 1}, {Term: 1}}, 2, 0},
+-	}
+-
+-	for i, tt := range tests {
+-		prs := make(map[int64]*progress)
+-		for j := 0; j < len(tt.matches); j++ {
+-			prs[int64(j)] = &progress{tt.matches[j], tt.matches[j] + 1}
+-		}
+-		sm := &raft{raftLog: &raftLog{ents: tt.logs}, prs: prs, State: State{Term: tt.smTerm}}
+-		sm.maybeCommit()
+-		if g := sm.raftLog.committed; g != tt.w {
+-			t.Errorf("#%d: committed = %d, want %d", i, g, tt.w)
+-		}
+-	}
+-}
+-
+-// TestHandleMsgApp ensures:
+-// 1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+-// 2. If an existing entry conflicts with a new one (same index but different terms),
+-//    delete the existing entry and all that follow it; append any new entries not already in the log.
+-// 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+-func TestHandleMsgApp(t *testing.T) {
+-	tests := []struct {
+-		m       Message
+-		wIndex  int64
+-		wCommit int64
+-		wAccept bool
+-	}{
+-		// Ensure 1
+-		{Message{Type: msgApp, Term: 2, LogTerm: 3, Index: 2, Commit: 3}, 2, 0, false}, // previous log mismatch
+-		{Message{Type: msgApp, Term: 2, LogTerm: 3, Index: 3, Commit: 3}, 2, 0, false}, // previous log non-exist
+-
+-		// Ensure 2
+-		{Message{Type: msgApp, Term: 2, LogTerm: 1, Index: 1, Commit: 1}, 2, 1, true},
+-		{Message{Type: msgApp, Term: 2, LogTerm: 0, Index: 0, Commit: 1, Entries: []Entry{{Term: 2}}}, 1, 1, true},
+-		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 3, Entries: []Entry{{Term: 2}, {Term: 2}}}, 4, 3, true},
+-		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 4, Entries: []Entry{{Term: 2}}}, 3, 3, true},
+-		{Message{Type: msgApp, Term: 2, LogTerm: 1, Index: 1, Commit: 4, Entries: []Entry{{Term: 2}}}, 2, 2, true},
+-
+-		// Ensure 3
+-		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 2}, 2, 2, true},
+-		{Message{Type: msgApp, Term: 2, LogTerm: 2, Index: 2, Commit: 4}, 2, 2, true}, // commit upto min(commit, last)
+-	}
+-
+-	for i, tt := range tests {
+-		sm := &raft{
+-			state:   stateFollower,
+-			State:   State{Term: 2},
+-			raftLog: &raftLog{committed: 0, ents: []Entry{{}, {Term: 1}, {Term: 2}}},
+-		}
+-
+-		sm.handleAppendEntries(tt.m)
+-		if sm.raftLog.lastIndex() != tt.wIndex {
+-			t.Errorf("#%d: lastIndex = %d, want %d", i, sm.raftLog.lastIndex(), tt.wIndex)
+-		}
+-		if sm.raftLog.committed != tt.wCommit {
+-			t.Errorf("#%d: committed = %d, want %d", i, sm.raftLog.committed, tt.wCommit)
+-		}
+-		m := sm.ReadMessages()
+-		if len(m) != 1 {
+-			t.Errorf("#%d: msg = nil, want 1")
+-		}
+-		gaccept := true
+-		if m[0].Index == -1 {
+-			gaccept = false
+-		}
+-		if gaccept != tt.wAccept {
+-			t.Errorf("#%d: accept = %v, want %v", gaccept, tt.wAccept)
+-		}
+-	}
+-}
+-
+-func TestRecvMsgVote(t *testing.T) {
+-	tests := []struct {
+-		state   stateType
+-		i, term int64
+-		voteFor int64
+-		w       int64
+-	}{
+-		{stateFollower, 0, 0, none, -1},
+-		{stateFollower, 0, 1, none, -1},
+-		{stateFollower, 0, 2, none, -1},
+-		{stateFollower, 0, 3, none, 2},
+-
+-		{stateFollower, 1, 0, none, -1},
+-		{stateFollower, 1, 1, none, -1},
+-		{stateFollower, 1, 2, none, -1},
+-		{stateFollower, 1, 3, none, 2},
+-
+-		{stateFollower, 2, 0, none, -1},
+-		{stateFollower, 2, 1, none, -1},
+-		{stateFollower, 2, 2, none, 2},
+-		{stateFollower, 2, 3, none, 2},
+-
+-		{stateFollower, 3, 0, none, -1},
+-		{stateFollower, 3, 1, none, -1},
+-		{stateFollower, 3, 2, none, 2},
+-		{stateFollower, 3, 3, none, 2},
+-
+-		{stateFollower, 3, 2, 1, 2},
+-		{stateFollower, 3, 2, 0, -1},
+-
+-		{stateLeader, 3, 3, 0, -1},
+-		{stateCandidate, 3, 3, 0, -1},
+-	}
+-
+-	for i, tt := range tests {
+-		sm := &raft{
+-			state:   tt.state,
+-			State:   State{Vote: tt.voteFor},
+-			raftLog: &raftLog{ents: []Entry{{}, {Term: 2}, {Term: 2}}},
+-		}
+-
+-		sm.Step(Message{Type: msgVote, From: 1, Index: tt.i, LogTerm: tt.term})
+-
+-		msgs := sm.ReadMessages()
+-		if g := len(msgs); g != 1 {
+-			t.Errorf("#%d: len(msgs) = %d, want 1", i, g)
+-			continue
+-		}
+-		if g := msgs[0].Index; g != tt.w {
+-			t.Errorf("#%d, m.Index = %d, want %d", i, g, tt.w)
+-		}
+-	}
+-}
+-
+-func TestStateTransition(t *testing.T) {
+-	tests := []struct {
+-		from   stateType
+-		to     stateType
+-		wallow bool
+-		wterm  int64
+-		wlead  int64
+-	}{
+-		{stateFollower, stateFollower, true, 1, none},
+-		{stateFollower, stateCandidate, true, 1, none},
+-		{stateFollower, stateLeader, false, -1, none},
+-
+-		{stateCandidate, stateFollower, true, 0, none},
+-		{stateCandidate, stateCandidate, true, 1, none},
+-		{stateCandidate, stateLeader, true, 0, 0},
+-
+-		{stateLeader, stateFollower, true, 1, none},
+-		{stateLeader, stateCandidate, false, 1, none},
+-		{stateLeader, stateLeader, true, 0, 0},
+-	}
+-
+-	for i, tt := range tests {
+-		func() {
+-			defer func() {
+-				if r := recover(); r != nil {
+-					if tt.wallow == true {
+-						t.Errorf("%d: allow = %v, want %v", i, false, true)
+-					}
+-				}
+-			}()
+-
+-			sm := newRaft(0, []int64{0})
+-			sm.state = tt.from
+-
+-			switch tt.to {
+-			case stateFollower:
+-				sm.becomeFollower(tt.wterm, tt.wlead)
+-			case stateCandidate:
+-				sm.becomeCandidate()
+-			case stateLeader:
+-				sm.becomeLeader()
+-			}
+-
+-			if sm.Term != tt.wterm {
+-				t.Errorf("%d: term = %d, want %d", i, sm.Term, tt.wterm)
+-			}
+-			if sm.lead != tt.wlead {
+-				t.Errorf("%d: lead = %d, want %d", i, sm.lead, tt.wlead)
+-			}
+-		}()
+-	}
+-}
+-
+-func TestConf(t *testing.T) {
+-	sm := newRaft(0, []int64{0})
+-	sm.becomeCandidate()
+-	sm.becomeLeader()
+-
+-	sm.Step(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Type: AddNode}}})
+-	if sm.raftLog.lastIndex() != 2 {
+-		t.Errorf("lastindex = %d, want %d", sm.raftLog.lastIndex(), 1)
+-	}
+-	if !sm.configuring {
+-		t.Errorf("pendingConf = %v, want %v", sm.configuring, true)
+-	}
+-	if sm.raftLog.ents[2].Type != AddNode {
+-		t.Errorf("type = %d, want %d", sm.raftLog.ents[1].Type, AddNode)
+-	}
+-
+-	// deny the second configuration change request if there is a pending one
+-	paniced := false
+-	defer func() { recover(); paniced = true }()
+-	sm.Step(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{Type: AddNode}}})
+-	if !paniced {
+-		t.Errorf("expected panic")
+-	}
+-	if sm.raftLog.lastIndex() != 2 {
+-		t.Errorf("lastindex = %d, want %d", sm.raftLog.lastIndex(), 1)
+-	}
+-}
+-
+-// Ensures that the new leader sets the pendingConf flag correctly according to
+-// the uncommitted log entries
+-func TestConfChangeLeader(t *testing.T) {
+-	tests := []struct {
+-		et       int64
+-		wPending bool
+-	}{
+-		{Normal, false},
+-		{AddNode, true},
+-		{RemoveNode, true},
+-	}
+-
+-	for i, tt := range tests {
+-		sm := newRaft(0, []int64{0})
+-		sm.raftLog = &raftLog{ents: []Entry{{}, {Type: tt.et}}}
+-
+-		sm.becomeCandidate()
+-		sm.becomeLeader()
+-
+-		if sm.configuring != tt.wPending {
+-			t.Errorf("#%d: pendingConf = %v, want %v", i, sm.configuring, tt.wPending)
+-		}
+-	}
+-}
+-
+-func TestAllServerStepdown(t *testing.T) {
+-	tests := []struct {
+-		state stateType
+-
+-		wstate stateType
+-		wterm  int64
+-		windex int64
+-	}{
+-		{stateFollower, stateFollower, 3, 1},
+-		{stateCandidate, stateFollower, 3, 1},
+-		{stateLeader, stateFollower, 3, 2},
+-	}
+-
+-	tmsgTypes := [...]messageType{msgVote, msgApp}
+-	tterm := int64(3)
+-
+-	for i, tt := range tests {
+-		sm := newRaft(0, []int64{0, 1, 2})
+-		switch tt.state {
+-		case stateFollower:
+-			sm.becomeFollower(1, 0)
+-		case stateCandidate:
+-			sm.becomeCandidate()
+-		case stateLeader:
+-			sm.becomeCandidate()
+-			sm.becomeLeader()
+-		}
+-
+-		for j, msgType := range tmsgTypes {
+-			sm.Step(Message{From: 1, Type: msgType, Term: tterm, LogTerm: tterm})
+-
+-			if sm.state != tt.wstate {
+-				t.Errorf("#%d.%d state = %v , want %v", i, j, sm.state, tt.wstate)
+-			}
+-			if sm.Term != tt.wterm {
+-				t.Errorf("#%d.%d term = %v , want %v", i, j, sm.Term, tt.wterm)
+-			}
+-			if int64(len(sm.raftLog.ents)) != tt.windex {
+-				t.Errorf("#%d.%d index = %v , want %v", i, j, len(sm.raftLog.ents), tt.windex)
+-			}
+-			wlead := int64(1)
+-			if msgType == msgVote {
+-				wlead = none
+-			}
+-			if sm.lead != wlead {
+-				t.Errorf("#%d, sm.lead = %d, want %d", i, sm.lead, none)
+-			}
+-		}
+-	}
+-}
+-
+-func TestLeaderAppResp(t *testing.T) {
+-	tests := []struct {
+-		index      int64
+-		wmsgNum    int
+-		windex     int64
+-		wcommitted int64
+-	}{
+-		{-1, 1, 1, 0}, // bad resp; leader does not commit; reply with log entries
+-		{2, 2, 2, 2},  // good resp; leader commits; broadcast with commit index
+-	}
+-
+-	for i, tt := range tests {
+-		// sm term is 1 after it becomes the leader.
+-		// thus the last log term must be 1 to be committed.
+-		sm := newRaft(0, []int64{0, 1, 2})
+-		sm.raftLog = &raftLog{ents: []Entry{{}, {Term: 0}, {Term: 1}}}
+-		sm.becomeCandidate()
+-		sm.becomeLeader()
+-		sm.ReadMessages()
+-		sm.Step(Message{From: 1, Type: msgAppResp, Index: tt.index, Term: sm.Term})
+-		msgs := sm.ReadMessages()
+-
+-		if len(msgs) != tt.wmsgNum {
+-			t.Errorf("#%d msgNum = %d, want %d", i, len(msgs), tt.wmsgNum)
+-		}
+-		for j, msg := range msgs {
+-			if msg.Index != tt.windex {
+-				t.Errorf("#%d.%d index = %d, want %d", i, j, msg.Index, tt.windex)
+-			}
+-			if msg.Commit != tt.wcommitted {
+-				t.Errorf("#%d.%d commit = %d, want %d", i, j, msg.Commit, tt.wcommitted)
+-			}
+-		}
+-	}
+-}
+-
+-// tests the output of the statemachine when receiving msgBeat
+-func TestRecvMsgBeat(t *testing.T) {
+-	tests := []struct {
+-		state stateType
+-		wMsg  int
+-	}{
+-		{stateLeader, 2},
+-		// candidate and follower should ignore msgBeat
+-		{stateCandidate, 0},
+-		{stateFollower, 0},
+-	}
+-
+-	for i, tt := range tests {
+-		sm := newRaft(0, []int64{0, 1, 2})
+-		sm.raftLog = &raftLog{ents: []Entry{{}, {Term: 0}, {Term: 1}}}
+-		sm.Term = 1
+-		sm.state = tt.state
+-		sm.Step(Message{From: 0, To: 0, Type: msgBeat})
+-
+-		msgs := sm.ReadMessages()
+-		if len(msgs) != tt.wMsg {
+-			t.Errorf("%d: len(msgs) = %d, want %d", i, len(msgs), tt.wMsg)
+-		}
+-		for _, m := range msgs {
+-			if m.Type != msgApp {
+-				t.Errorf("%d: msg.type = %v, want %v", m.Type, msgApp)
+-			}
+-		}
+-	}
+-}
+-
+-func TestRestore(t *testing.T) {
+-	s := Snapshot{
+-		ClusterId: 0xBEEF,
+-		Index:     defaultCompactThreshold + 1,
+-		Term:      defaultCompactThreshold + 1,
+-		Nodes:     []int64{0, 1, 2},
+-	}
+-
+-	sm := newRaft(0, []int64{0, 1})
+-	if ok := sm.restore(s); !ok {
+-		t.Fatal("restore fail, want succeed")
+-	}
+-
+-	if sm.clusterId != s.ClusterId {
+-		t.Errorf("sm.cluster = %x, want %x", sm.clusterId, s.ClusterId)
+-	}
+-	if sm.raftLog.lastIndex() != s.Index {
+-		t.Errorf("log.lastIndex = %d, want %d", sm.raftLog.lastIndex(), s.Index)
+-	}
+-	if sm.raftLog.term(s.Index) != s.Term {
+-		t.Errorf("log.lastTerm = %d, want %d", sm.raftLog.term(s.Index), s.Term)
+-	}
+-	sg := int64Slice(sm.nodes())
+-	sw := int64Slice(s.Nodes)
+-	sort.Sort(sg)
+-	sort.Sort(sw)
+-	if !reflect.DeepEqual(sg, sw) {
+-		t.Errorf("sm.Nodes = %+v, want %+v", sg, sw)
+-	}
+-	if !reflect.DeepEqual(sm.raftLog.snapshot, s) {
+-		t.Errorf("snapshot = %+v, want %+v", sm.raftLog.snapshot, s)
+-	}
+-
+-	if ok := sm.restore(s); ok {
+-		t.Fatal("restore succeed, want fail")
+-	}
+-}
+-
+-func TestProvideSnap(t *testing.T) {
+-	s := Snapshot{
+-		Index: defaultCompactThreshold + 1,
+-		Term:  defaultCompactThreshold + 1,
+-		Nodes: []int64{0, 1},
+-	}
+-	sm := newRaft(0, []int64{0})
+-	// restore the statemachin from a snapshot
+-	// so it has a compacted log and a snapshot
+-	sm.restore(s)
+-
+-	sm.becomeCandidate()
+-	sm.becomeLeader()
+-
+-	sm.Step(Message{From: 0, To: 0, Type: msgBeat})
+-	msgs := sm.ReadMessages()
+-	if len(msgs) != 1 {
+-		t.Errorf("len(msgs) = %d, want 1", len(msgs))
+-	}
+-	m := msgs[0]
+-	if m.Type != msgApp {
+-		t.Errorf("m.Type = %v, want %v", m.Type, msgApp)
+-	}
+-
+-	// force set the next of node 1, so that
+-	// node 1 needs a snapshot
+-	sm.prs[1].next = sm.raftLog.offset
+-
+-	sm.Step(Message{From: 1, To: 0, Type: msgAppResp, Index: -1})
+-	msgs = sm.ReadMessages()
+-	if len(msgs) != 1 {
+-		t.Errorf("len(msgs) = %d, want 1", len(msgs))
+-	}
+-	m = msgs[0]
+-	if m.Type != msgSnap {
+-		t.Errorf("m.Type = %v, want %v", m.Type, msgSnap)
+-	}
+-}
+-
+-func TestRestoreFromSnapMsg(t *testing.T) {
+-	s := Snapshot{
+-		Index: defaultCompactThreshold + 1,
+-		Term:  defaultCompactThreshold + 1,
+-		Nodes: []int64{0, 1},
+-	}
+-	m := Message{Type: msgSnap, From: 0, Term: 1, Snapshot: s}
+-
+-	sm := newRaft(1, []int64{0, 1})
+-	sm.Step(m)
+-
+-	if !reflect.DeepEqual(sm.raftLog.snapshot, s) {
+-		t.Errorf("snapshot = %+v, want %+v", sm.raftLog.snapshot, s)
+-	}
+-}
+-
+-func TestSlowNodeRestore(t *testing.T) {
+-	nt := newNetwork(nil, nil, nil)
+-	nt.send(Message{From: 0, To: 0, Type: msgHup})
+-
+-	nt.isolate(2)
+-	for j := 0; j < defaultCompactThreshold+1; j++ {
+-		nt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{}}})
+-	}
+-	lead := nt.peers[0].(*raft)
+-	lead.nextEnts()
+-	lead.compact(nil)
+-
+-	nt.recover()
+-	nt.send(Message{From: 0, To: 0, Type: msgBeat})
+-
+-	follower := nt.peers[2].(*raft)
+-	if !reflect.DeepEqual(follower.raftLog.snapshot, lead.raftLog.snapshot) {
+-		t.Errorf("follower.snap = %+v, want %+v", follower.raftLog.snapshot, lead.raftLog.snapshot)
+-	}
+-
+-	committed := follower.raftLog.lastIndex()
+-	nt.send(Message{From: 0, To: 0, Type: msgProp, Entries: []Entry{{}}})
+-	if follower.raftLog.committed != committed+1 {
+-		t.Errorf("follower.comitted = %d, want %d", follower.raftLog.committed, committed+1)
+-	}
+-}
+-
+-func ents(terms ...int64) *raft {
+-	ents := []Entry{{}}
+-	for _, term := range terms {
+-		ents = append(ents, Entry{Term: term})
+-	}
+-
+-	sm := &raft{raftLog: &raftLog{ents: ents}}
+-	sm.reset(0)
+-	return sm
+-}
+-
+-type network struct {
+-	peers   map[int64]Interface
+-	dropm   map[connem]float64
+-	ignorem map[messageType]bool
+-}
+-
+-// newNetwork initializes a network from peers.
+-// A nil node will be replaced with a new *stateMachine.
+-// A *stateMachine will get its k, id.
+-// When using stateMachine, the address list is always [0, n).
+-func newNetwork(peers ...Interface) *network {
+-	size := len(peers)
+-	defaultPeerAddrs := make([]int64, size)
+-	for i := 0; i < size; i++ {
+-		defaultPeerAddrs[i] = int64(i)
+-	}
+-
+-	npeers := make(map[int64]Interface, size)
+-
+-	for id, p := range peers {
+-		nid := int64(id)
+-		switch v := p.(type) {
+-		case nil:
+-			sm := newRaft(nid, defaultPeerAddrs)
+-			npeers[nid] = sm
+-		case *raft:
+-			v.id = nid
+-			v.prs = make(map[int64]*progress)
+-			for i := 0; i < size; i++ {
+-				v.prs[int64(i)] = &progress{}
+-			}
+-			v.reset(0)
+-			npeers[nid] = v
+-		default:
+-			npeers[nid] = v
+-		}
+-	}
+-	return &network{
+-		peers:   npeers,
+-		dropm:   make(map[connem]float64),
+-		ignorem: make(map[messageType]bool),
+-	}
+-}
+-
+-func (nw *network) send(msgs ...Message) {
+-	for len(msgs) > 0 {
+-		m := msgs[0]
+-		p := nw.peers[m.To]
+-		p.Step(m)
+-		msgs = append(msgs[1:], nw.filter(p.ReadMessages())...)
+-	}
+-}
+-
+-func (nw *network) drop(from, to int64, perc float64) {
+-	nw.dropm[connem{from, to}] = perc
+-}
+-
+-func (nw *network) cut(one, other int64) {
+-	nw.drop(one, other, 1)
+-	nw.drop(other, one, 1)
+-}
+-
+-func (nw *network) isolate(id int64) {
+-	for i := 0; i < len(nw.peers); i++ {
+-		nid := int64(i)
+-		if nid != id {
+-			nw.drop(id, nid, 1.0)
+-			nw.drop(nid, id, 1.0)
+-		}
+-	}
+-}
+-
+-func (nw *network) ignore(t messageType) {
+-	nw.ignorem[t] = true
+-}
+-
+-func (nw *network) recover() {
+-	nw.dropm = make(map[connem]float64)
+-	nw.ignorem = make(map[messageType]bool)
+-}
+-
+-func (nw *network) filter(msgs []Message) []Message {
+-	mm := make([]Message, 0)
+-	for _, m := range msgs {
+-		if nw.ignorem[m.Type] {
+-			continue
+-		}
+-		switch m.Type {
+-		case msgHup:
+-			// hups never go over the network, so don't drop them but panic
+-			panic("unexpected msgHup")
+-		default:
+-			perc := nw.dropm[connem{m.From, m.To}]
+-			if n := rand.Float64(); n < perc {
+-				continue
+-			}
+-		}
+-		mm = append(mm, m)
+-	}
+-	return mm
+-}
+-
+-type connem struct {
+-	from, to int64
+-}
+-
+-type blackHole struct{}
+-
+-func (blackHole) Step(Message) error      { return nil }
+-func (blackHole) ReadMessages() []Message { return nil }
+-
+-var nopStepper = &blackHole{}
+diff --git a/raft2/snapshot.go b/raft2/snapshot.go
+deleted file mode 100644
+index 95a8ca4..0000000
+--- a/raft2/snapshot.go
++++ /dev/null
+@@ -1,18 +0,0 @@
+-package raft
+-
+-var emptySnapshot = Snapshot{}
+-
+-type Snapshot struct {
+-	ClusterId int64
+-	Data      []byte
+-	// the configuration
+-	Nodes []int64
+-	// the index at which the snapshot was taken.
+-	Index int64
+-	// the log term of the index
+-	Term int64
+-}
+-
+-func (s Snapshot) IsEmpty() bool {
+-	return s.Term == 0
+-}
+diff --git a/raft2/state.pb.go b/raft2/state.pb.go
+deleted file mode 100644
+index 4152a7a..0000000
+--- a/raft2/state.pb.go
++++ /dev/null
+@@ -1,230 +0,0 @@
+-// Code generated by protoc-gen-gogo.
+-// source: state.proto
+-// DO NOT EDIT!
+-
+-/*
+-	Package raft is a generated protocol buffer package.
+-
+-	It is generated from these files:
+-		state.proto
+-
+-	It has these top-level messages:
+-		State
+-*/
+-package raft
+-
+-import proto "code.google.com/p/gogoprotobuf/proto"
+-import json "encoding/json"
+-import math "math"
+-
+-// discarding unused import gogoproto "code.google.com/p/gogoprotobuf/gogoproto/gogo.pb"
+-
+-import io "io"
+-import code_google_com_p_gogoprotobuf_proto "code.google.com/p/gogoprotobuf/proto"
+-
+-// Reference proto, json, and math imports to suppress error if they are not otherwise used.
+-var _ = proto.Marshal
+-var _ = &json.SyntaxError{}
+-var _ = math.Inf
+-
+-type State struct {
+-	Term             int64  `protobuf:"varint,1,req,name=term" json:"term"`
+-	Vote             int64  `protobuf:"varint,2,req,name=vote" json:"vote"`
+-	Commit           int64  `protobuf:"varint,3,req,name=commit" json:"commit"`
+-	LastIndex        int64  `protobuf:"varint,4,req,name=lastIndex" json:"lastIndex"`
+-	XXX_unrecognized []byte `json:"-"`
+-}
+-
+-func (m *State) Reset()         { *m = State{} }
+-func (m *State) String() string { return proto.CompactTextString(m) }
+-func (*State) ProtoMessage()    {}
+-
+-func init() {
+-}
+-func (m *State) Unmarshal(data []byte) error {
+-	l := len(data)
+-	index := 0
+-	for index < l {
+-		var wire uint64
+-		for shift := uint(0); ; shift += 7 {
+-			if index >= l {
+-				return io.ErrUnexpectedEOF
+-			}
+-			b := data[index]
+-			index++
+-			wire |= (uint64(b) & 0x7F) << shift
+-			if b < 0x80 {
+-				break
+-			}
+-		}
+-		fieldNum := int32(wire >> 3)
+-		wireType := int(wire & 0x7)
+-		switch fieldNum {
+-		case 1:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.Term |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		case 2:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.Vote |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		case 3:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.Commit |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		case 4:
+-			if wireType != 0 {
+-				return code_google_com_p_gogoprotobuf_proto.ErrWrongType
+-			}
+-			for shift := uint(0); ; shift += 7 {
+-				if index >= l {
+-					return io.ErrUnexpectedEOF
+-				}
+-				b := data[index]
+-				index++
+-				m.LastIndex |= (int64(b) & 0x7F) << shift
+-				if b < 0x80 {
+-					break
+-				}
+-			}
+-		default:
+-			var sizeOfWire int
+-			for {
+-				sizeOfWire++
+-				wire >>= 7
+-				if wire == 0 {
+-					break
+-				}
+-			}
+-			index -= sizeOfWire
+-			skippy, err := code_google_com_p_gogoprotobuf_proto.Skip(data[index:])
+-			if err != nil {
+-				return err
+-			}
+-			if (index + skippy) > l {
+-				return io.ErrUnexpectedEOF
+-			}
+-			m.XXX_unrecognized = append(m.XXX_unrecognized, data[index:index+skippy]...)
+-			index += skippy
+-		}
+-	}
+-	return nil
+-}
+-func (m *State) Size() (n int) {
+-	var l int
+-	_ = l
+-	n += 1 + sovState(uint64(m.Term))
+-	n += 1 + sovState(uint64(m.Vote))
+-	n += 1 + sovState(uint64(m.Commit))
+-	n += 1 + sovState(uint64(m.LastIndex))
+-	if m.XXX_unrecognized != nil {
+-		n += len(m.XXX_unrecognized)
+-	}
+-	return n
+-}
+-
+-func sovState(x uint64) (n int) {
+-	for {
+-		n++
+-		x >>= 7
+-		if x == 0 {
+-			break
+-		}
+-	}
+-	return n
+-}
+-func sozState(x uint64) (n int) {
+-	return sovState(uint64((x << 1) ^ uint64((int64(x) >> 63))))
+-}
+-func (m *State) Marshal() (data []byte, err error) {
+-	size := m.Size()
+-	data = make([]byte, size)
+-	n, err := m.MarshalTo(data)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return data[:n], nil
+-}
+-
+-func (m *State) MarshalTo(data []byte) (n int, err error) {
+-	var i int
+-	_ = i
+-	var l int
+-	_ = l
+-	data[i] = 0x8
+-	i++
+-	i = encodeVarintState(data, i, uint64(m.Term))
+-	data[i] = 0x10
+-	i++
+-	i = encodeVarintState(data, i, uint64(m.Vote))
+-	data[i] = 0x18
+-	i++
+-	i = encodeVarintState(data, i, uint64(m.Commit))
+-	data[i] = 0x20
+-	i++
+-	i = encodeVarintState(data, i, uint64(m.LastIndex))
+-	if m.XXX_unrecognized != nil {
+-		i += copy(data[i:], m.XXX_unrecognized)
+-	}
+-	return i, nil
+-}
+-func encodeFixed64State(data []byte, offset int, v uint64) int {
+-	data[offset] = uint8(v)
+-	data[offset+1] = uint8(v >> 8)
+-	data[offset+2] = uint8(v >> 16)
+-	data[offset+3] = uint8(v >> 24)
+-	data[offset+4] = uint8(v >> 32)
+-	data[offset+5] = uint8(v >> 40)
+-	data[offset+6] = uint8(v >> 48)
+-	data[offset+7] = uint8(v >> 56)
+-	return offset + 8
+-}
+-func encodeFixed32State(data []byte, offset int, v uint32) int {
+-	data[offset] = uint8(v)
+-	data[offset+1] = uint8(v >> 8)
+-	data[offset+2] = uint8(v >> 16)
+-	data[offset+3] = uint8(v >> 24)
+-	return offset + 4
+-}
+-func encodeVarintState(data []byte, offset int, v uint64) int {
+-	for v >= 1<<7 {
+-		data[offset] = uint8(v&0x7f | 0x80)
+-		v >>= 7
+-		offset++
+-	}
+-	data[offset] = uint8(v)
+-	return offset + 1
+-}
+diff --git a/raft2/state.proto b/raft2/state.proto
+deleted file mode 100644
+index bfdfcab..0000000
+--- a/raft2/state.proto
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package raft;
+-
+-import "code.google.com/p/gogoprotobuf/gogoproto/gogo.proto";
+-
+-option (gogoproto.marshaler_all) = true;
+-option (gogoproto.sizer_all) = true;
+-option (gogoproto.unmarshaler_all) = true;
+-option (gogoproto.goproto_getters_all) = false;
+-
+-message State {
+-	required int64 term   = 1 [(gogoproto.nullable) = false];
+-	required int64 vote   = 2 [(gogoproto.nullable) = false];
+-	required int64 commit = 3 [(gogoproto.nullable) = false];
+-	required int64 lastIndex = 4 [(gogoproto.nullable) = false];
+-}

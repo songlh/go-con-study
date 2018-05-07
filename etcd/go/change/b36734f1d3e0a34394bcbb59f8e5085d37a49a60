@@ -1,0 +1,58 @@
+commit b36734f1d3e0a34394bcbb59f8e5085d37a49a60
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Tue Mar 14 14:03:32 2017 -0700
+
+    clientv3: synchronize on goroutines in TestBalancerDoNotBlockOnClose
+    
+    Was leaking dialers.
+
+diff --git a/clientv3/balancer_test.go b/clientv3/balancer_test.go
+index 79e2140..5245b69 100644
+--- a/clientv3/balancer_test.go
++++ b/clientv3/balancer_test.go
+@@ -148,22 +148,40 @@ func TestBalancerDoNotBlockOnClose(t *testing.T) {
+ 		}
+ 		kvc := pb.NewKVClient(conn)
+ 		<-sb.readyc
++
++		var wg sync.WaitGroup
++		wg.Add(100)
++		cctx, cancel := context.WithCancel(context.TODO())
+ 		for j := 0; j < 100; j++ {
+-			go kvc.Range(context.TODO(), &pb.RangeRequest{}, grpc.FailFast(false))
++			go func() {
++				defer wg.Done()
++				kvc.Range(cctx, &pb.RangeRequest{}, grpc.FailFast(false))
++			}()
+ 		}
+ 		// balancer.Close() might block
+ 		// if balancer and grpc deadlock each other.
+-		closec := make(chan struct{})
++		bclosec, cclosec := make(chan struct{}), make(chan struct{})
+ 		go func() {
+-			defer close(closec)
++			defer close(bclosec)
+ 			sb.Close()
+ 		}()
+-		go conn.Close()
++		go func() {
++			defer close(cclosec)
++			conn.Close()
++		}()
+ 		select {
+-		case <-closec:
++		case <-bclosec:
+ 		case <-time.After(3 * time.Second):
+ 			testutil.FatalStack(t, "balancer close timeout")
+ 		}
++		select {
++		case <-cclosec:
++		case <-time.After(3 * time.Second):
++			t.Fatal("grpc conn close timeout")
++		}
++
++		cancel()
++		wg.Wait()
+ 	}
+ }
+ 

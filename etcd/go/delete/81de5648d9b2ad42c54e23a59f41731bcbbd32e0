@@ -1,0 +1,53 @@
+commit 81de5648d9b2ad42c54e23a59f41731bcbbd32e0
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Mar 31 00:03:34 2016 -0700
+
+    etcdserver: force backend commit before acking physical compaction
+
+diff --git a/etcdserver/v3demo_server.go b/etcdserver/v3demo_server.go
+index 2c16c11..47a8bea 100644
+--- a/etcdserver/v3demo_server.go
++++ b/etcdserver/v3demo_server.go
+@@ -98,6 +98,12 @@ func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.
+ 	result, err := s.processInternalRaftRequest(ctx, pb.InternalRaftRequest{Compaction: r})
+ 	if r.Physical && result.physc != nil {
+ 		<-result.physc
++		// The compaction is done deleting keys; the hash is now settled
++		// but the data is not necessarily committed. If there's a crash,
++		// the hash may revert to a hash prior to compaction completing
++		// if the compaction resumes. Force the finished compaction to
++		// commit so it won't resume following a crash.
++		s.be.ForceCommit()
+ 	}
+ 	if err != nil {
+ 		return nil, err
+diff --git a/storage/kvstore.go b/storage/kvstore.go
+index b87e2c2..3b6d166 100644
+--- a/storage/kvstore.go
++++ b/storage/kvstore.go
+@@ -357,16 +357,21 @@ func (s *store) restore() error {
+ 	}
+ 
+ 	_, scheduledCompactBytes := tx.UnsafeRange(metaBucketName, scheduledCompactKeyName, nil, 0)
++	scheduledCompact := int64(0)
+ 	if len(scheduledCompactBytes) != 0 {
+-		scheduledCompact := bytesToRev(scheduledCompactBytes[0]).main
+-		if scheduledCompact > s.compactMainRev {
+-			log.Printf("storage: resume scheduled compaction at %d", scheduledCompact)
+-			go s.Compact(scheduledCompact)
++		scheduledCompact = bytesToRev(scheduledCompactBytes[0]).main
++		if scheduledCompact <= s.compactMainRev {
++			scheduledCompact = 0
+ 		}
+ 	}
+ 
+ 	tx.Unlock()
+ 
++	if scheduledCompact != 0 {
++		s.Compact(scheduledCompact)
++		log.Printf("storage: resume scheduled compaction at %d", scheduledCompact)
++	}
++
+ 	return nil
+ }
+ 

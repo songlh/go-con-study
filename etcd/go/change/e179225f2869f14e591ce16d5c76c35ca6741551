@@ -1,0 +1,52 @@
+commit e179225f2869f14e591ce16d5c76c35ca6741551
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Wed Jan 4 16:23:27 2017 -0800
+
+    grpcproxy: tear down watch when client context is done
+    
+    If client closes but all watch streams are not canceled, the outstanding
+    watch will wait until it is canceled, causing watch server to potentially
+    wait forever to close.
+    
+    Fixes #7102
+
+diff --git a/proxy/grpcproxy/watch.go b/proxy/grpcproxy/watch.go
+index 2c070b3..42d196c 100644
+--- a/proxy/grpcproxy/watch.go
++++ b/proxy/grpcproxy/watch.go
+@@ -122,23 +122,23 @@ func (wp *watchProxy) Watch(stream pb.Watch_WatchServer) (err error) {
+ 		defer func() { stopc <- struct{}{} }()
+ 		wps.sendLoop()
+ 	}()
+-	if leaderc != nil {
+-		go func() {
+-			defer func() { stopc <- struct{}{} }()
+-			select {
+-			case <-leaderc:
+-			case <-ctx.Done():
+-			}
+-		}()
+-	}
++	// tear down watch if leader goes down or entire watch proxy is terminated
++	go func() {
++		defer func() { stopc <- struct{}{} }()
++		select {
++		case <-leaderc:
++		case <-ctx.Done():
++		case <-wp.ctx.Done():
++		}
++	}()
+ 
+ 	<-stopc
++	cancel()
++
+ 	// recv/send may only shutdown after function exits;
+ 	// goroutine notifies proxy that stream is through
+ 	go func() {
+-		if leaderc != nil {
+-			<-stopc
+-		}
++		<-stopc
+ 		<-stopc
+ 		wps.close()
+ 		wp.wg.Done()

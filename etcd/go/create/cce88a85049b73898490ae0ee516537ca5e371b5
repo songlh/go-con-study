@@ -1,0 +1,2626 @@
+commit cce88a85049b73898490ae0ee516537ca5e371b5
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Thu Aug 14 11:14:54 2014 -0700
+
+    etcd: better testing...
+
+diff --git a/etcd/etcd_functional_test.go b/etcd/etcd_functional_test.go
+index a3ae5f6..b716ec8 100644
+--- a/etcd/etcd_functional_test.go
++++ b/etcd/etcd_functional_test.go
+@@ -17,17 +17,10 @@ limitations under the License.
+ package etcd
+ 
+ import (
+-	"fmt"
+ 	"math/rand"
+-	"net/http/httptest"
+-	"net/url"
+-	"reflect"
+ 	"testing"
+ 	"time"
+ 
+-	"github.com/coreos/etcd/conf"
+-	"github.com/coreos/etcd/store"
+-
+ 	"github.com/coreos/etcd/third_party/github.com/coreos/go-etcd/etcd"
+ )
+ 
+@@ -36,39 +29,20 @@ func TestKillLeader(t *testing.T) {
+ 	tests := []int{3, 5, 9}
+ 
+ 	for i, tt := range tests {
+-		es, hs := buildCluster(tt, false)
+-		waitCluster(t, es)
+-
+-		var totalTime time.Duration
++		cl := testCluster{Size: tt}
++		cl.Start()
+ 		for j := 0; j < tt; j++ {
+-			lead, _ := waitLeader(es)
+-			es[lead].Stop()
+-			hs[lead].Close()
+-			time.Sleep(es[0].tickDuration * defaultElection * 2)
+-
+-			start := time.Now()
+-			if g, _ := waitLeader(es); g == lead {
++			lead, _ := cl.Leader()
++			cl.Node(int(lead)).Stop()
++			// wait for leader election timeout
++			time.Sleep(cl.Node(0).e.tickDuration * defaultElection * 2)
++			if g, _ := cl.Leader(); g == lead {
+ 				t.Errorf("#%d.%d: lead = %d, want not %d", i, j, g, lead)
+ 			}
+-			take := time.Now().Sub(start)
+-			totalTime += take
+-			avgTime := totalTime / (time.Duration)(i+1)
+-			fmt.Println("Total time:", totalTime, "; Avg time:", avgTime)
+-
+-			c := newTestConfig()
+-			c.DataDir = es[lead].cfg.DataDir
+-			c.Addr = hs[lead].Listener.Addr().String()
+-			id := es[lead].id
+-			e, h := newUnstartedTestServer(c, id, false)
+-			err := startServer(t, e)
+-			if err != nil {
+-				t.Fatalf("#%d.%d: %v", i, j, err)
+-			}
+-			es[lead] = e
+-			hs[lead] = h
++			cl.Node(int(lead)).Start()
++			cl.Node(int(lead)).WaitMode(participantMode, 3)
+ 		}
+-
+-		destoryCluster(t, es, hs)
++		cl.Destroy()
+ 	}
+ }
+ 
+@@ -77,289 +51,146 @@ func TestKillRandom(t *testing.T) {
+ 	tests := []int{3, 5, 9}
+ 
+ 	for _, tt := range tests {
+-		es, hs := buildCluster(tt, false)
+-		waitCluster(t, es)
+-
++		cl := testCluster{Size: tt}
++		cl.Start()
+ 		for j := 0; j < tt; j++ {
+-			waitLeader(es)
+-
++			// we cannot kill the majority
++			// wait for the majority
++			cl.Leader()
+ 			toKill := make(map[int64]struct{})
+ 			for len(toKill) != tt/2-1 {
+ 				toKill[rand.Int63n(int64(tt))] = struct{}{}
+ 			}
+ 			for k := range toKill {
+-				es[k].Stop()
+-				hs[k].Close()
++				cl.Node(int(k)).Stop()
+ 			}
+ 
+-			time.Sleep(es[0].tickDuration * defaultElection * 2)
+-
+-			waitLeader(es)
+-
++			// wait for leader election timeout
++			time.Sleep(cl.Node(0).e.tickDuration * defaultElection * 2)
++			cl.Leader()
+ 			for k := range toKill {
+-				c := newTestConfig()
+-				c.DataDir = es[k].cfg.DataDir
+-				c.Addr = hs[k].Listener.Addr().String()
+-				id := es[k].id
+-				e, h := newUnstartedTestServer(c, id, false)
+-				err := startServer(t, e)
+-				if err != nil {
+-					t.Fatal(err)
+-				}
+-				es[k] = e
+-				hs[k] = h
++				cl.Node(int(k)).Start()
++				cl.Node(int(k)).WaitMode(participantMode, 3)
+ 			}
+ 		}
+-
+-		destoryCluster(t, es, hs)
++		cl.Destroy()
+ 	}
+ }
+ 
+ func TestJoinThroughFollower(t *testing.T) {
+ 	defer afterTest(t)
+-	tests := []int{3, 4, 5, 6}
++	tests := []int{3, 5, 7}
+ 
+ 	for _, tt := range tests {
+-		es := make([]*Server, tt)
+-		hs := make([]*httptest.Server, tt)
+-		for i := 0; i < tt; i++ {
+-			c := newTestConfig()
+-			if i > 0 {
+-				c.Peers = []string{hs[i-1].URL}
+-			}
+-			es[i], hs[i] = newUnstartedTestServer(c, int64(i), false)
+-		}
+-
+-		go es[0].Run()
++		bt := &testServer{}
++		bt.Start()
++		cl := testCluster{nodes: []*testServer{bt}}
++		seed := bt.URL
+ 
+ 		for i := 1; i < tt; i++ {
+-			go es[i].Run()
+-			waitLeader(es[:i])
+-		}
+-		waitCluster(t, es)
+-
+-		destoryCluster(t, es, hs)
+-	}
+-}
+-
+-func TestClusterConfigReload(t *testing.T) {
+-	defer afterTest(t)
+-	tests := []int{3, 4, 5, 6}
+-
+-	for i, tt := range tests {
+-		es, hs := buildCluster(tt, false)
+-		waitCluster(t, es)
+-
+-		lead, _ := waitLeader(es)
+-		cc := conf.NewClusterConfig()
+-		cc.ActiveSize = 15
+-		cc.RemoveDelay = 60
+-		if err := es[lead].p.setClusterConfig(cc); err != nil {
+-			t.Fatalf("#%d: setClusterConfig err = %v", i, err)
+-		}
+-
+-		for k := range es {
+-			es[k].Stop()
+-			hs[k].Close()
+-		}
+-
+-		for k := range es {
+ 			c := newTestConfig()
+-			c.DataDir = es[k].cfg.DataDir
+-			c.Addr = hs[k].Listener.Addr().String()
+-			id := es[k].id
+-			e, h := newUnstartedTestServer(c, id, false)
+-			err := startServer(t, e)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			es[k] = e
+-			hs[k] = h
+-		}
+-
+-		lead, _ = waitLeader(es)
+-		// wait for msgAppResp to commit all entries
+-		time.Sleep(2 * defaultHeartbeat * es[lead].tickDuration)
+-		if g := es[lead].p.clusterConfig(); !reflect.DeepEqual(g, cc) {
+-			t.Errorf("#%d: clusterConfig = %+v, want %+v", i, g, cc)
+-		}
+-
+-		destoryCluster(t, es, hs)
++			c.Peers = []string{seed}
++			ts := &testServer{Config: c, Id: int64(i)}
++			ts.Start()
++			ts.WaitMode(participantMode, 3)
++			cl.nodes = append(cl.nodes, ts)
++			cl.Leader()
++			seed = ts.URL
++		}
++		cl.Destroy()
+ 	}
+ }
+ 
+-func TestMultiNodeKillOne(t *testing.T) {
++// func TestClusterConfigReload(t *testing.T) {
++// 	defer afterTest(t)
++// 	tests := []int{3, 5, 7}
++
++// 	for i, tt := range tests {
++// 		es, hs := buildCluster(tt, false)
++// 		waitCluster(t, es)
++
++// 		lead, _ := waitLeader(es)
++// 		conf := config.NewClusterConfig()
++// 		conf.ActiveSize = 15
++// 		conf.RemoveDelay = 60
++// 		if err := es[lead].p.setClusterConfig(conf); err != nil {
++// 			t.Fatalf("#%d: setClusterConfig err = %v", i, err)
++// 		}
++
++// 		for k := range es {
++// 			es[k].Stop()
++// 			hs[k].Close()
++// 		}
++
++// 		for k := range es {
++// 			c := newTestConfig()
++// 			c.DataDir = es[k].config.DataDir
++// 			c.Addr = hs[k].Listener.Addr().String()
++// 			id := es[k].id
++// 			e, h := newUnstartedTestServer(c, id, false)
++// 			err := startServer(t, e)
++// 			if err != nil {
++// 				t.Fatal(err)
++// 			}
++// 			es[k] = e
++// 			hs[k] = h
++// 		}
++
++// 		lead, _ = waitLeader(es)
++// 		// wait for msgAppResp to commit all entries
++// 		time.Sleep(2 * defaultHeartbeat * es[lead].tickDuration)
++// 		if g := es[lead].p.clusterConfig(); !reflect.DeepEqual(g, conf) {
++// 			t.Errorf("#%d: clusterConfig = %+v, want %+v", i, g, conf)
++// 		}
++
++// 		destoryCluster(t, es, hs)
++// 	}
++// }
++
++func TestFiveNodeKillOneAndRecover(t *testing.T) {
+ 	defer afterTest(t)
+-	tests := []int{5}
+-
+-	for i, tt := range tests {
+-		es, hs := buildCluster(tt, false)
+-		waitCluster(t, es)
+-
+-		stop := make(chan bool)
+-		go keepSetting(hs[0].URL, stop)
+-
+-		for j := 0; j < 10; j++ {
+-			idx := rand.Int() % tt
+-			es[idx].Stop()
+-			hs[idx].Close()
+-
+-			c := newTestConfig()
+-			c.DataDir = es[idx].cfg.DataDir
+-			c.Addr = hs[idx].Listener.Addr().String()
+-			id := es[idx].id
+-			e, h := newUnstartedTestServer(c, id, false)
+-			err := startServer(t, e)
+-			if err != nil {
+-				t.Fatalf("#%d.%d: %v", i, j, err)
+-			}
+-			es[idx] = e
+-			hs[idx] = h
+-		}
+-
+-		stop <- true
+-		<-stop
+-
+-		destoryCluster(t, es, hs)
++	cl := testCluster{Size: 5}
++	cl.Start()
++	for n := 0; n < 5; n++ {
++		i := rand.Int() % 5
++		cl.Node(i).Stop()
++		cl.Leader()
++		cl.Node(i).Start()
++		cl.Node(i).WaitMode(participantMode, 3)
++		cl.Leader()
+ 	}
++	cl.Destroy()
+ }
+ 
+-func TestMultiNodeKillAllAndRecovery(t *testing.T) {
++func TestFiveNodeKillAllAndRecover(t *testing.T) {
+ 	defer afterTest(t)
+-	tests := []int{5}
+ 
+-	for i, tt := range tests {
+-		es, hs := buildCluster(tt, false)
+-		waitCluster(t, es)
+-		waitLeader(es)
++	cl := testCluster{Size: 5}
++	cl.Start()
++	defer cl.Destroy()
+ 
+-		c := etcd.NewClient([]string{hs[0].URL})
+-		for i := 0; i < 10; i++ {
+-			if _, err := c.Set("foo", "bar", 0); err != nil {
+-				panic(err)
+-			}
+-		}
+-
+-		for k := range es {
+-			es[k].Stop()
+-			hs[k].Close()
+-		}
+-
+-		for k := range es {
+-			c := newTestConfig()
+-			c.DataDir = es[k].cfg.DataDir
+-			c.Addr = hs[k].Listener.Addr().String()
+-			id := es[k].id
+-			e, h := newUnstartedTestServer(c, id, false)
+-			err := startServer(t, e)
+-			if err != nil {
+-				t.Fatalf("#%d.%d: %v", i, k, err)
+-			}
+-			es[k] = e
+-			hs[k] = h
++	cl.Leader()
++	c := etcd.NewClient([]string{cl.URL(0)})
++	for i := 0; i < 10; i++ {
++		if _, err := c.Set("foo", "bar", 0); err != nil {
++			panic(err)
+ 		}
++	}
+ 
+-		waitLeader(es)
+-		res, err := c.Set("foo", "bar", 0)
+-		if err != nil {
+-			t.Fatalf("#%d: set err after recovery: %v", err)
+-		}
+-		if g := res.Node.ModifiedIndex; g != 16 {
+-			t.Errorf("#%d: modifiedIndex = %d, want %d", i, g, 16)
+-		}
++	cl.Stop()
+ 
+-		destoryCluster(t, es, hs)
++	cl.Restart()
++	cl.Leader()
++	res, err := c.Set("foo", "bar", 0)
++	if err != nil {
++		t.Fatalf("set err after recovery: %v", err)
+ 	}
+-}
+-
+-func BenchmarkEndToEndSet(b *testing.B) {
+-	es, hs := buildCluster(3, false)
+-	waitLeader(es)
+-	b.ResetTimer()
+-	for n := 0; n < b.N; n++ {
+-		_, err := es[0].p.Set("foo", false, "bar", store.Permanent)
+-		if err != nil {
+-			panic("unexpect error")
+-		}
++	if g := res.Node.ModifiedIndex; g != 16 {
++		t.Errorf("modifiedIndex = %d, want %d", g, 16)
+ 	}
+-	b.StopTimer()
+-	destoryCluster(nil, es, hs)
+ }
+ 
+ // TestModeSwitch tests switch mode between standby and peer.
+ func TestModeSwitch(t *testing.T) {
+ 	t.Skip("not implemented")
+ }
+-
+-// Sending set commands
+-func keepSetting(urlStr string, stop chan bool) {
+-	tc := NewTestClient()
+-	i := 0
+-	value := url.Values(map[string][]string{"value": {"bar"}})
+-	for {
+-		resp, err := tc.PutForm(fmt.Sprintf("%s/v2/keys/foo_%v", urlStr, i), value)
+-		if err == nil {
+-			tc.ReadBody(resp)
+-		}
+-		select {
+-		case <-stop:
+-			stop <- true
+-			return
+-		default:
+-		}
+-		i++
+-	}
+-}
+-
+-type leadterm struct {
+-	lead int64
+-	term int64
+-}
+-
+-func waitActiveLeader(es []*Server) (lead, term int64) {
+-	for {
+-		if l, t := waitLeader(es); l >= 0 && es[l].mode.Get() == participantMode {
+-			return l, t
+-		}
+-	}
+-}
+-
+-// waitLeader waits until all alive servers are checked to have the same leader.
+-// WARNING: The lead returned is not guaranteed to be actual leader.
+-func waitLeader(es []*Server) (lead, term int64) {
+-	for {
+-		ls := make([]leadterm, 0, len(es))
+-		for i := range es {
+-			switch es[i].mode.Get() {
+-			case participantMode:
+-				ls = append(ls, getLead(es[i]))
+-			case standbyMode:
+-				//TODO(xiangli) add standby support
+-			case stopMode:
+-			}
+-		}
+-		if isSameLead(ls) {
+-			return ls[0].lead, ls[0].term
+-		}
+-		time.Sleep(es[0].tickDuration * defaultElection)
+-	}
+-}
+-
+-func getLead(s *Server) leadterm {
+-	return leadterm{s.p.node.Leader(), s.p.node.Term()}
+-}
+-
+-func isSameLead(ls []leadterm) bool {
+-	m := make(map[leadterm]int)
+-	for i := range ls {
+-		m[ls[i]] = m[ls[i]] + 1
+-	}
+-	if len(m) == 1 {
+-		if ls[0].lead == -1 {
+-			return false
+-		}
+-		return true
+-	}
+-	// todo(xiangli): printout the current cluster status for debugging....
+-	return false
+-}
+diff --git a/etcd/etcd_start_test.go b/etcd/etcd_start_test.go
+index efabd1e..d47f3ba 100644
+--- a/etcd/etcd_start_test.go
++++ b/etcd/etcd_start_test.go
+@@ -50,13 +50,17 @@ func (g *garbageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ func TestBadDiscoveryService(t *testing.T) {
++	defer afterTest(t)
+ 	g := garbageHandler{t: t}
+-	ts := httptest.NewServer(&g)
++	httpts := httptest.NewServer(&g)
++	defer httpts.Close()
+ 
+ 	c := newTestConfig()
+-	c.Discovery = ts.URL + "/v2/keys/_etcd/registry/1"
+-	e, h := newUnstartedTestServer(c, bootstrapId, false)
+-	err := startServer(t, e)
++	c.Discovery = httpts.URL + "/v2/keys/_etcd/registry/1"
++	ts := testServer{Config: c, Id: bootstrapId}
++	ts.Start()
++
++	err := ts.Destroy()
+ 	w := `discovery service error`
+ 	if err == nil || !strings.HasPrefix(err.Error(), w) {
+ 		t.Errorf("err = %v, want %s prefix", err, w)
+@@ -67,141 +71,97 @@ func TestBadDiscoveryService(t *testing.T) {
+ 	if !g.success {
+ 		t.Fatal("Discovery server never called")
+ 	}
+-	ts.Close()
+-
+-	destroyServer(t, e, h)
+-	afterTest(t)
+ }
+ 
+ func TestBadDiscoveryServiceWithAdvisedPeers(t *testing.T) {
++	defer afterTest(t)
+ 	g := garbageHandler{t: t}
+-	ts := httptest.NewServer(&g)
+-
+-	es, hs := buildCluster(1, false)
+-	waitCluster(t, es)
++	httpts := httptest.NewServer(&g)
++	defer httpts.Close()
+ 
+ 	c := newTestConfig()
+-	c.Discovery = ts.URL + "/v2/keys/_etcd/registry/1"
+-	c.Peers = []string{hs[0].URL}
+-	e, h := newUnstartedTestServer(c, bootstrapId, false)
+-	err := startServer(t, e)
++	c.Discovery = httpts.URL + "/v2/keys/_etcd/registry/1"
++	c.Peers = []string{"a peer"}
++	ts := testServer{Config: c, Id: bootstrapId}
++	ts.Start()
++
++	err := ts.Destroy()
+ 	w := `discovery service error`
+ 	if err == nil || !strings.HasPrefix(err.Error(), w) {
+ 		t.Errorf("err = %v, want %s prefix", err, w)
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	destroyServer(t, e, h)
+-	ts.Close()
+-	afterTest(t)
+ }
+ 
+ func TestBootstrapByEmptyPeers(t *testing.T) {
+-	c := newTestConfig()
++	defer afterTest(t)
+ 	id := genId()
+-	e, h := newUnstartedTestServer(c, id, false)
+-	err := startServer(t, e)
+-
+-	if err != nil {
+-		t.Error(err)
+-	}
+-	if e.p.node.Leader() != id {
+-		t.Errorf("leader = %x, want %x", e.p.node.Leader(), id)
++	ts := testServer{Id: id}
++	ts.Start()
++	defer ts.Destroy()
++	ts.WaitMode(participantMode, 3)
++	if ts.Participant().node.Leader() != id {
++		t.Errorf("leader = %x, want %x", ts.Participant().node.Leader(), id)
+ 	}
+-	destroyServer(t, e, h)
+-	afterTest(t)
+ }
+ 
+ func TestBootstrapByDiscoveryService(t *testing.T) {
+-	de, dh := newUnstartedTestServer(newTestConfig(), genId(), false)
+-	err := startServer(t, de)
++	defer afterTest(t)
++	discoverService := testCluster{Size: 1}
++	discoverService.Start()
++	defer discoverService.Destroy()
+ 
+ 	c := newTestConfig()
+-	c.Discovery = dh.URL + "/v2/keys/_etcd/registry/1"
+-	e, h := newUnstartedTestServer(c, bootstrapId, false)
+-	err = startServer(t, e)
++	c.Discovery = discoverService.URL(0) + "/v2/keys/_etcd/registry/1"
++	ts := testServer{Id: bootstrapId, Config: c}
++	ts.Start()
++	ts.WaitMode(participantMode, 3)
++	err := ts.Destroy()
+ 	if err != nil {
+-		t.Fatalf("build server err = %v, want nil", err)
++		t.Fatalf("server stop err = %v, want nil", err)
+ 	}
+-
+-	destroyServer(t, e, h)
+-	destroyServer(t, de, dh)
+-	afterTest(t)
+ }
+ 
+ func TestRunByAdvisedPeers(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	waitCluster(t, es)
+-
+-	c := newTestConfig()
+-	c.Peers = []string{hs[0].URL}
+-	e, h := newUnstartedTestServer(c, bootstrapId, false)
+-	err := startServer(t, e)
+-	if err != nil {
+-		t.Fatalf("build server err = %v, want nil", err)
+-	}
+-	w := es[0].id
+-	if g, _ := waitLeader(append(es, e)); g != w {
+-		t.Errorf("leader = %d, want %d", g, w)
+-	}
+-
+-	destroyServer(t, e, h)
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
++	t.Skip("test covered by TestMultipleNodes")
+ }
+ 
+ func TestRunByDiscoveryService(t *testing.T) {
+-	de, dh := newUnstartedTestServer(newTestConfig(), genId(), false)
+-	err := startServer(t, de)
++	ds := testCluster{Size: 1}
++	ds.Start()
++	defer ds.Destroy()
+ 
+ 	tc := NewTestClient()
+ 	v := url.Values{}
+ 	v.Set("value", "started")
+-	resp, _ := tc.PutForm(fmt.Sprintf("%s%s", dh.URL, "/v2/keys/_etcd/registry/1/_state"), v)
++	resp, _ := tc.PutForm(fmt.Sprintf("%s%s", ds.URL(0), "/v2/keys/_etcd/registry/1/_state"), v)
+ 	if g := resp.StatusCode; g != http.StatusCreated {
+ 		t.Fatalf("put status = %d, want %d", g, http.StatusCreated)
+ 	}
+ 	resp.Body.Close()
+ 
+-	v.Set("value", dh.URL)
+-	resp, _ = tc.PutForm(fmt.Sprintf("%s%s%d", dh.URL, "/v2/keys/_etcd/registry/1/", de.id), v)
++	v.Set("value", ds.URL(0))
++	resp, _ = tc.PutForm(fmt.Sprintf("%s%s%d", ds.URL(0), "/v2/keys/_etcd/registry/1/", ds.Participant(0).id), v)
+ 	if g := resp.StatusCode; g != http.StatusCreated {
+ 		t.Fatalf("put status = %d, want %d", g, http.StatusCreated)
+ 	}
+ 	resp.Body.Close()
+ 
+ 	c := newTestConfig()
+-	c.Discovery = dh.URL + "/v2/keys/_etcd/registry/1"
+-	e, h := newUnstartedTestServer(c, bootstrapId, false)
+-	err = startServer(t, e)
+-	if err != nil {
+-		t.Fatalf("build server err = %v, want nil", err)
+-	}
+-	w := de.id
+-	if g, _ := waitLeader([]*Server{e, de}); g != w {
++	c.Discovery = ds.URL(0) + "/v2/keys/_etcd/registry/1"
++	ts := testServer{Config: c, Id: bootstrapId}
++	ts.Start()
++	defer ts.Destroy()
++
++	ts.WaitMode(participantMode, 3)
++	// wait for the leader to do a heartbeat
++	// it will update the lead field of the follower
++	time.Sleep(ds.Node(0).e.tickDuration * defaultHeartbeat * 2)
++	w := ds.Participant(0).id
++	if g := ts.Lead().lead; g != w {
+ 		t.Errorf("leader = %d, want %d", g, w)
+ 	}
+-
+-	destroyServer(t, e, h)
+-	destroyServer(t, de, dh)
+-	afterTest(t)
+ }
+ 
+ func TestRunByDataDir(t *testing.T) {
+-	TestSingleNodeRecovery(t)
+-}
+-
+-func startServer(t *testing.T, e *Server) error {
+-	var err error
+-	go func() { err = e.Run() }()
+-	for {
+-		if e.mode.Get() == participantMode {
+-			break
+-		}
+-		if err != nil {
+-			return err
+-		}
+-		time.Sleep(10 * time.Millisecond)
+-	}
+-	return nil
++	t.Skip("test covered by TestSingleNodeRecovery")
+ }
+diff --git a/etcd/etcd_test.go b/etcd/etcd_test.go
+index 13773f6..450cff1 100644
+--- a/etcd/etcd_test.go
++++ b/etcd/etcd_test.go
+@@ -19,7 +19,6 @@ package etcd
+ import (
+ 	"fmt"
+ 	"io/ioutil"
+-	"math/rand"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -34,12 +33,37 @@ import (
+ 	"github.com/coreos/etcd/store"
+ )
+ 
++func TestMultipleNodes(t *testing.T) {
++	defer afterTest(t)
++	tests := []int{1, 3, 5, 9, 11}
++
++	for _, tt := range tests {
++		c := &testCluster{Size: tt}
++		c.Start()
++		c.Destroy()
++	}
++}
++
++func TestMultipleTLSNodes(t *testing.T) {
++	defer afterTest(t)
++	tests := []int{1, 3, 5}
++
++	for _, tt := range tests {
++		c := &testCluster{Size: tt, TLS: true}
++		c.Start()
++		c.Destroy()
++	}
++}
++
+ func TestV2Redirect(t *testing.T) {
+ 	defer afterTest(t)
+-	es, hs := buildCluster(3, false)
+-	waitCluster(t, es)
+-	u := hs[1].URL
+-	ru := fmt.Sprintf("%s%s", hs[0].URL, "/v2/keys/foo")
++
++	c := &testCluster{Size: 3}
++	c.Start()
++	defer c.Destroy()
++
++	u := c.URL(1)
++	ru := fmt.Sprintf("%s%s", c.URL(0), "/v2/keys/foo")
+ 	tc := NewTestClient()
+ 
+ 	v := url.Values{}
+@@ -56,186 +80,66 @@ func TestV2Redirect(t *testing.T) {
+ 	if location.String() != ru {
+ 		t.Errorf("location = %v, want %v", location.String(), ru)
+ 	}
+-
+ 	resp.Body.Close()
+-	destoryCluster(t, es, hs)
+-}
+-
+-func TestAdd(t *testing.T) {
+-	defer afterTest(t)
+-	tests := []int{3, 4, 5, 6}
+-
+-	for _, tt := range tests {
+-		es := make([]*Server, tt)
+-		hs := make([]*httptest.Server, tt)
+-		for i := 0; i < tt; i++ {
+-			c := newTestConfig()
+-			if i > 0 {
+-				c.Peers = []string{hs[0].URL}
+-			}
+-			es[i], hs[i] = newUnstartedTestServer(c, int64(i), false)
+-		}
+-
+-		go es[0].Run()
+-		waitMode(participantMode, es[0])
+-
+-		for i := 1; i < tt; i++ {
+-			id := int64(i)
+-			for {
+-				lead := es[0].p.node.Leader()
+-				if lead == -1 {
+-					time.Sleep(defaultElection * es[0].tickDuration)
+-					continue
+-				}
+-
+-				err := es[lead].p.add(id, es[id].raftPubAddr, es[id].pubAddr)
+-				if err == nil {
+-					break
+-				}
+-				switch err {
+-				case tmpErr:
+-					time.Sleep(defaultElection * es[0].tickDuration)
+-				case raftStopErr, stopErr:
+-					t.Fatalf("#%d on %d: unexpected stop", i, lead)
+-				default:
+-					t.Fatal(err)
+-				}
+-			}
+-			go es[i].Run()
+-			waitMode(participantMode, es[i])
+-
+-			for j := 0; j <= i; j++ {
+-				p := fmt.Sprintf("%s/%d", v2machineKVPrefix, id)
+-				w, err := es[j].p.Watch(p, false, false, 1)
+-				if err != nil {
+-					t.Errorf("#%d on %d: %v", i, j, err)
+-					break
+-				}
+-				<-w.EventChan
+-			}
+-		}
+-
+-		destoryCluster(t, es, hs)
+-	}
+ }
+ 
+ func TestRemove(t *testing.T) {
+ 	defer afterTest(t)
+ 	tests := []int{3, 4, 5, 6}
++	for aa := 0; aa < 1; aa++ {
++		for k, tt := range tests {
++			cl := testCluster{Size: tt}
++			cl.Start()
++
++			lead, _ := cl.Leader()
++			config := conf.NewClusterConfig()
++			config.ActiveSize = 0
++			if err := cl.Participant(int(lead)).setClusterConfig(config); err != nil {
++				t.Fatalf("#%d: setClusterConfig err = %v", k, err)
++			}
+ 
+-	for k, tt := range tests {
+-		es, hs := buildCluster(tt, false)
+-		waitCluster(t, es)
+-
+-		lead, _ := waitLeader(es)
+-		cfg := conf.NewClusterConfig()
+-		cfg.ActiveSize = 0
+-		if err := es[lead].p.setClusterConfig(cfg); err != nil {
+-			t.Fatalf("#%d: setClusterConfig err = %v", k, err)
+-		}
+-
+-		// we don't remove the machine from 2-node cluster because it is
+-		// not 100 percent safe in our raft.
+-		// TODO(yichengq): improve it later.
+-		for i := 0; i < tt-2; i++ {
+-			id := int64(i)
+-			send := id
+-			for {
+-				send++
+-				if send > int64(tt-1) {
+-					send = id
+-				}
+-
+-				lead := es[send].p.node.Leader()
+-				if lead == -1 {
+-					time.Sleep(defaultElection * 5 * time.Millisecond)
+-					continue
+-				}
+-
+-				err := es[lead].p.remove(id)
+-				if err == nil {
+-					break
+-				}
+-				switch err {
+-				case tmpErr:
+-					time.Sleep(defaultElection * 5 * time.Millisecond)
+-				case raftStopErr, stopErr:
+-					if lead == id {
++			// we don't remove the machine from 2-node cluster because it is
++			// not 100 percent safe in our raft.
++			// TODO(yichengq): improve it later.
++			for i := 0; i < tt-2; i++ {
++				id := int64(i)
++				for {
++					n := cl.Node(int(id))
++					if n.e.mode.Get() == standbyMode {
++						break
++					}
++					err := n.Participant().remove(id)
++					if err == nil {
+ 						break
+ 					}
+-				default:
+-					t.Fatal(err)
++					switch err {
++					case tmpErr:
++						time.Sleep(defaultElection * 5 * time.Millisecond)
++					case raftStopErr, stopErr:
++					default:
++						t.Fatal(err)
++					}
+ 				}
+-
++				cl.Node(i).WaitMode(standbyMode, 10)
+ 			}
+-
+-			waitMode(standbyMode, es[i])
++			cl.Destroy()
+ 		}
+-
+-		destoryCluster(t, es, hs)
+ 	}
+ }
+ 
+-func TestBecomeStandby(t *testing.T) {
+-	defer afterTest(t)
+-	size := 5
+-	round := 1
+-
+-	for j := 0; j < round; j++ {
+-		es, hs := buildCluster(size, false)
+-		waitCluster(t, es)
+-
+-		lead, _ := waitActiveLeader(es)
+-		i := rand.Intn(size)
+-		// cluster only demotes follower
+-		if int64(i) == lead {
+-			i = (i + 1) % size
+-		}
+-		id := int64(i)
+-
+-		cfg := conf.NewClusterConfig()
+-		cfg.SyncInterval = 1000
+-
+-		cfg.ActiveSize = size - 1
+-		if err := es[lead].p.setClusterConfig(cfg); err != nil {
+-			t.Fatalf("#%d: setClusterConfig err = %v", i, err)
+-		}
+-		for {
+-			err := es[lead].p.remove(id)
+-			if err == nil {
+-				break
+-			}
+-			switch err {
+-			case tmpErr:
+-				time.Sleep(defaultElection * 5 * time.Millisecond)
+-			default:
+-				t.Fatalf("#%d: remove err = %v", i, err)
+-			}
+-		}
+-
+-		waitMode(standbyMode, es[i])
+-
+-		var leader int64
+-		for k := 0; k < 3; k++ {
+-			leader, _ = es[i].s.leaderInfo()
+-			if leader != noneId {
+-				break
+-			}
+-			time.Sleep(50 * time.Millisecond)
+-		}
+-		if g := leader; g != lead {
+-			t.Errorf("#%d: lead = %d, want %d", i, g, lead)
+-		}
+-
+-		destoryCluster(t, es, hs)
+-	}
+-}
++// TODO(yicheng) Add test for becoming standby
++// maxSize -> standby
++// auto-demote -> standby
++// remove -> standby
+ 
+ func TestReleaseVersion(t *testing.T) {
+ 	defer afterTest(t)
+-	es, hs := buildCluster(1, false)
+ 
+-	resp, err := http.Get(hs[0].URL + "/version")
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	resp, err := http.Get(cl.URL(0) + "/version")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -249,19 +153,16 @@ func TestReleaseVersion(t *testing.T) {
+ 	if gs != w {
+ 		t.Errorf("version = %v, want %v", gs, w)
+ 	}
+-
+-	for i := range hs {
+-		es[len(hs)-i-1].Stop()
+-	}
+-	for i := range hs {
+-		hs[len(hs)-i-1].Close()
+-	}
+ }
+ 
+ func TestVersionCheck(t *testing.T) {
+ 	defer afterTest(t)
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 
+ 	currentVersion := 2
+ 	tests := []struct {
+@@ -283,110 +184,84 @@ func TestVersionCheck(t *testing.T) {
+ 			t.Fatal("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
+ 		}
+ 	}
+-
+-	for i := range hs {
+-		es[len(hs)-i-1].Stop()
+-	}
+-	for i := range hs {
+-		hs[len(hs)-i-1].Close()
+-	}
+ }
+ 
+ func TestSingleNodeRecovery(t *testing.T) {
+ 	defer afterTest(t)
+-	id := genId()
+ 	c := newTestConfig()
+-	e, h := newUnstartedTestServer(c, id, false)
+-	startServer(t, e)
+-	key := "/foo"
++	ts := testServer{Id: genId(), Config: c}
++	ts.Start()
++	defer ts.Destroy()
+ 
+-	ev, err := e.p.Set(key, false, "bar", time.Now().Add(time.Second*100))
+-	if err != nil {
+-		t.Fatal(err)
+-	}
++	ts.WaitMode(participantMode, 1)
+ 
+-	w, err := e.p.Watch(key, false, false, ev.Index())
++	key := "/foo"
++	ev, err := ts.Participant().Set(key, false, "bar", time.Now().Add(time.Second*100))
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	select {
+-	case v := <-w.EventChan:
+-		if v.Node.TTL < 95 {
+-			t.Errorf("ttl = %d, want >= 95", v.Node.TTL)
+-		}
+-	case <-time.After(8 * defaultHeartbeat * e.tickDuration):
+-		t.Fatal("watch timeout")
+-	}
+-
+-	e.Stop()
+-	h.Close()
++	ts.Stop()
+ 
+-	time.Sleep(2 * time.Second)
+-
+-	nc := newTestConfig()
+-	nc.DataDir = c.DataDir
+-	e, h = newUnstartedTestServer(nc, id, false)
+-	startServer(t, e)
+-
+-	waitLeader([]*Server{e})
+-	w, err = e.p.Watch(key, false, false, ev.Index())
++	ts = testServer{Id: ts.Id, Config: c}
++	ts.Start()
++	ts.WaitMode(participantMode, 1)
++	w, err := ts.Participant().Store.Watch(key, false, false, ev.Index())
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	// give testing server time to load the previous WAL file
+ 	select {
+-	case v := <-w.EventChan:
+-		if v.Node.TTL > 99 {
+-			t.Errorf("ttl = %d, want <= 99", v.Node.TTL)
+-		}
+-	case <-time.After(8 * defaultHeartbeat * e.tickDuration):
+-		t.Fatal("2nd watch timeout")
++	case <-w.EventChan:
++	case <-time.After(time.Second):
++		t.Fatal("watch timeout")
+ 	}
+-
+-	destroyServer(t, e, h)
+ }
+ 
+ func TestTakingSnapshot(t *testing.T) {
+ 	defer afterTest(t)
+-	es, hs := buildCluster(1, false)
++
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	// TODO(xiangli): tunable compact; reduce testing time
+ 	for i := 0; i < defaultCompact; i++ {
+-		es[0].p.Set("/foo", false, "bar", store.Permanent)
++		cl.Participant(0).Set("/foo", false, "bar", store.Permanent)
+ 	}
+-	snap := es[0].p.node.GetSnap()
++	snap := cl.Participant(0).node.GetSnap()
+ 	if snap.Index != defaultCompact {
+ 		t.Errorf("snap.Index = %d, want %d", snap.Index, defaultCompact)
+ 	}
+-
+-	for i := range hs {
+-		es[len(hs)-i-1].Stop()
+-	}
+-	for i := range hs {
+-		hs[len(hs)-i-1].Close()
+-	}
+ }
+ 
+ func TestRestoreSnapshotFromLeader(t *testing.T) {
+ 	defer afterTest(t)
+-	es, hs := buildCluster(1, false)
++
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
+ 	// let leader do snapshot
+ 	for i := 0; i < defaultCompact; i++ {
+-		es[0].p.Set(fmt.Sprint("/foo", i), false, fmt.Sprint("bar", i), store.Permanent)
++		cl.Participant(0).Set(fmt.Sprint("/foo", i), false, fmt.Sprint("bar", i), store.Permanent)
+ 	}
+ 
+ 	// create one to join the cluster
+ 	c := newTestConfig()
+-	c.Peers = []string{hs[0].URL}
+-	e, h := newUnstartedTestServer(c, 1, false)
+-	go e.Run()
+-	waitMode(participantMode, e)
++	c.Peers = []string{cl.URL(0)}
++	ts := testServer{Config: c, Id: 1}
++	ts.Start()
++	defer ts.Destroy()
++	ts.WaitMode(participantMode, 1)
+ 
+ 	// check new proposal could be submitted
+-	if _, err := es[0].p.Set("/foo", false, "bar", store.Permanent); err != nil {
++	if _, err := cl.Participant(0).Set("/foo", false, "bar", store.Permanent); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+ 	// check store is recovered
+ 	for i := 0; i < defaultCompact; i++ {
+-		ev, err := e.p.Store.Get(fmt.Sprint("/foo", i), false, false)
++		ev, err := ts.Participant().Store.Get(fmt.Sprint("/foo", i), false, false)
+ 		if err != nil {
+ 			t.Errorf("get err = %v", err)
+ 			continue
+@@ -398,61 +273,192 @@ func TestRestoreSnapshotFromLeader(t *testing.T) {
+ 	}
+ 
+ 	// check new proposal could be committed in the new machine
+-	wch, err := e.p.Watch("/foo", false, false, defaultCompact)
++	wch, err := ts.Participant().Watch("/foo", false, false, defaultCompact)
+ 	if err != nil {
+ 		t.Errorf("watch err = %v", err)
+ 	}
+ 	<-wch.EventChan
+ 
+-	g := e.p.node.Nodes()
+-	w := es[0].p.node.Nodes()
++	g := ts.Participant().node.Nodes()
++	w := cl.Participant(0).node.Nodes()
+ 	if !reflect.DeepEqual(g, w) {
+ 		t.Errorf("nodes = %v, want %v", g, w)
+ 	}
++}
++
++type testCluster struct {
++	Size int
++	TLS  bool
+ 
+-	e.Stop()
+-	es[0].Stop()
+-	h.Close()
+-	hs[0].Close()
++	nodes []*testServer
+ }
+ 
+-func buildCluster(number int, tls bool) ([]*Server, []*httptest.Server) {
+-	bootstrapper := 0
+-	es := make([]*Server, number)
+-	hs := make([]*httptest.Server, number)
+-	var seed string
++func (c *testCluster) Start() {
++	if c.Size <= 0 {
++		panic("cluster size <= 0")
++	}
++
++	nodes := make([]*testServer, c.Size)
++	c.nodes = nodes
++	nodes[0] = &testServer{Id: 0, TLS: c.TLS}
++	nodes[0].Start()
++	if !nodes[0].WaitMode(participantMode, 5) {
++		panic("cannot wait until participantMode")
++	}
+ 
+-	for i := range es {
+-		c := newTestConfig()
+-		if seed != "" {
+-			c.Peers = []string{seed}
++	seed := nodes[0].URL
++	for i := 1; i < c.Size; i++ {
++		cfg := newTestConfig()
++		cfg.Peers = []string{seed}
++		id := int64(i)
++		s := &testServer{Config: cfg, Id: id, TLS: c.TLS}
++		s.Start()
++		nodes[i] = s
++
++		// Wait for the previous configuration change to be committed
++		// or this configuration request might be dropped.
++		// Or it could be a slow join because it needs to retry.
++		// TODO: this might not be true if we add param for retry interval.
++		if !s.WaitMode(participantMode, 3) {
++			panic("cannot wait until participantMode")
++		}
++		w, err := s.Participant().Watch(v2machineKVPrefix, true, false, uint64(i))
++		if err != nil {
++			panic(err)
+ 		}
+-		es[i], hs[i] = newUnstartedTestServer(c, int64(i), tls)
+-
+-		if i == bootstrapper {
+-			seed = hs[i].URL
+-		} else {
+-			// wait for the previous configuration change to be committed
+-			// or this configuration request might be dropped
+-			w, err := es[0].p.Watch(v2machineKVPrefix, true, false, uint64(i))
++		<-w.EventChan
++	}
++	c.wait()
++}
++
++func (c *testCluster) wait() {
++	size := c.Size
++	for i := 0; i < size; i++ {
++		for k := 0; k < size; k++ {
++			s := c.Node(i)
++			wp := v2machineKVPrefix + fmt.Sprintf("/%d", c.Node(k).Id)
++			w, err := s.Participant().Watch(wp, false, false, 1)
+ 			if err != nil {
+ 				panic(err)
+ 			}
+ 			<-w.EventChan
+ 		}
+-		go es[i].Run()
+-		waitMode(participantMode, es[i])
+ 	}
+-	return es, hs
++
++	clusterId := c.Participant(0).node.ClusterId()
++	for i := 0; i < size; i++ {
++		if g := c.Participant(i).node.ClusterId(); g != clusterId {
++			panic(fmt.Sprintf("#%d: clusterId = %x, want %x", i, g, clusterId))
++		}
++	}
++}
++
++func (c *testCluster) Node(i int) *testServer {
++	return c.nodes[i]
++}
++
++func (c *testCluster) Participant(i int) *participant {
++	return c.Node(i).Participant()
++}
++
++func (c *testCluster) Standby(i int) *standby {
++	return c.Node(i).Standby()
++}
++
++func (c *testCluster) URL(i int) string {
++	return c.nodes[i].h.URL
++}
++
++func (c *testCluster) Restart() {
++	for _, s := range c.nodes {
++		s.Start()
++	}
++}
++
++func (c *testCluster) Stop() {
++	for _, s := range c.nodes {
++		s.Stop()
++	}
++}
++
++func (c *testCluster) Destroy() {
++	for _, s := range c.nodes {
++		s.Destroy()
++	}
++}
++
++func (c *testCluster) Leader() (lead, term int64) {
++	for {
++		ls := make([]leadterm, 0, c.Size)
++		for i := range c.nodes {
++			switch c.Node(i).e.mode.Get() {
++			case participantMode:
++				ls = append(ls, c.Node(i).Lead())
++			case standbyMode:
++				//TODO(xiangli) add standby support
++			case stopMode:
++			}
++		}
++		if isSameLead(ls) {
++			return ls[0].lead, ls[0].term
++		}
++		time.Sleep(c.Node(0).e.tickDuration * defaultElection)
++	}
+ }
+ 
+-func newUnstartedTestServer(c *conf.Config, id int64, tls bool) (*Server, *httptest.Server) {
+-	e, err := New(c)
++type leadterm struct {
++	lead int64
++	term int64
++}
++
++func isSameLead(ls []leadterm) bool {
++	m := make(map[leadterm]int)
++	for i := range ls {
++		m[ls[i]] = m[ls[i]] + 1
++	}
++	if len(m) == 1 {
++		if ls[0].lead == -1 {
++			return false
++		}
++		return true
++	}
++	// todo(xiangli): printout the current cluster status for debugging....
++	return false
++}
++
++type testServer struct {
++	Config *conf.Config
++	Id     int64
++	TLS    bool
++
++	// base URL of form http://ipaddr:port with no trailing slash
++	URL string
++
++	e *Server
++	h *httptest.Server
++}
++
++func (s *testServer) Start() {
++	if s.Config == nil {
++		s.Config = newTestConfig()
++	}
++	c := s.Config
++	if !strings.HasPrefix(c.DataDir, os.TempDir()) {
++		panic("dataDir may pollute file system")
++	}
++	if c.Peer.CAFile != "" || c.Peer.CertFile != "" || c.Peer.KeyFile != "" {
++		panic("use TLS field instead")
++	}
++
++	nc := *c
++	e, err := New(&nc)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+-	e.setId(id)
+-	e.SetTick(time.Millisecond * 5)
++	s.e = e
++	e.setId(s.Id)
++	tick := time.Duration(c.Peer.HeartbeatInterval) * time.Millisecond
++	e.SetTick(tick)
+ 
+ 	m := http.NewServeMux()
+ 	m.Handle("/", e)
+@@ -460,14 +466,62 @@ func newUnstartedTestServer(c *conf.Config, id int64, tls bool) (*Server, *httpt
+ 	m.Handle("/raft/", e.RaftHandler())
+ 	m.Handle("/v2/admin/", e.RaftHandler())
+ 
+-	u, err := url.Parse(c.Addr)
+-	if err != nil {
++	addr := c.Addr
++	if s.URL != "" {
++		addr = urlHost(s.URL)
++	}
++	s.h = startServingAddr(addr, m, s.TLS)
++	s.URL = s.h.URL
++
++	e.pubAddr = s.URL
++	e.raftPubAddr = s.URL
++	go e.Run()
++}
++
++func (s *testServer) WaitMode(mode int64, timeout int) bool {
++	for i := 0; i < timeout+1; i++ {
++		if s.e.mode.Get() == mode {
++			return true
++		}
++		time.Sleep(time.Millisecond)
++	}
++	return false
++}
++
++func (s *testServer) Participant() *participant {
++	if s.e.mode.Get() != participantMode {
++		return nil
++	}
++	return s.e.p
++}
++
++func (s *testServer) Standby() *standby {
++	return s.e.s
++}
++
++func (s *testServer) Lead() leadterm {
++	return leadterm{s.Participant().node.Leader(), s.Participant().node.Term()}
++}
++
++func (s *testServer) Stop() error {
++	err := s.e.Stop()
++	s.h.Close()
++	return err
++}
++
++func (s *testServer) Destroy() error {
++	err := s.Stop()
++	if err := os.RemoveAll(s.Config.DataDir); err != nil {
+ 		panic(err)
+ 	}
++	return err
++}
+ 
++func startServingAddr(addr string, h http.Handler, tls bool) *httptest.Server {
+ 	var l net.Listener
+-	for {
+-		l, err = net.Listen("tcp", u.Host)
++	var err error
++	for i := 0; i < 4; i++ {
++		l, err = net.Listen("tcp", addr)
+ 		if err == nil {
+ 			break
+ 		}
+@@ -476,72 +530,39 @@ func newUnstartedTestServer(c *conf.Config, id int64, tls bool) (*Server, *httpt
+ 		}
+ 		time.Sleep(500 * time.Millisecond)
+ 	}
+-	h := &httptest.Server{
++	if l == nil {
++		panic("cannot listen on " + addr)
++	}
++	hs := &httptest.Server{
+ 		Listener: l,
+-		Config:   &http.Server{Handler: m},
++		Config:   &http.Server{Handler: h},
+ 	}
+ 	if tls {
+-		h.StartTLS()
++		hs.StartTLS()
+ 	} else {
+-		h.Start()
+-	}
+-
+-	e.raftPubAddr = h.URL
+-	e.pubAddr = h.URL
+-
+-	return e, h
+-}
+-
+-func destoryCluster(t *testing.T, es []*Server, hs []*httptest.Server) {
+-	for i := range es {
+-		e := es[len(es)-i-1]
+-		e.Stop()
+-		err := os.RemoveAll(e.cfg.DataDir)
+-		if err != nil {
+-			panic(err)
+-			t.Fatal(err)
+-		}
+-	}
+-	for i := range hs {
+-		hs[len(hs)-i-1].Close()
++		hs.Start()
+ 	}
++	return hs
+ }
+ 
+-func destroyServer(t *testing.T, e *Server, h *httptest.Server) {
+-	e.Stop()
+-	h.Close()
+-	err := os.RemoveAll(e.cfg.DataDir)
++func newTestConfig() *conf.Config {
++	c := conf.New()
++	c.Addr = "127.0.0.1:0"
++	c.Peer.Addr = "127.0.0.1:0"
++	c.Peer.HeartbeatInterval = 5
++	c.Peer.ElectionTimeout = 25
++	dataDir, err := ioutil.TempDir(os.TempDir(), "etcd")
+ 	if err != nil {
+ 		panic(err)
+-		t.Fatal(err)
+ 	}
++	c.DataDir = dataDir
++	return c
+ }
+ 
+-func waitCluster(t *testing.T, es []*Server) {
+-	n := len(es)
+-	for _, e := range es {
+-		for k := 0; k < n; k++ {
+-			w, err := e.p.Watch(v2machineKVPrefix+fmt.Sprintf("/%d", es[k].id), true, false, 1)
+-			if err != nil {
+-				panic(err)
+-			}
+-			<-w.EventChan
+-		}
+-	}
+-
+-	clusterId := es[0].p.node.ClusterId()
+-	for i, e := range es {
+-		if e.p.node.ClusterId() != clusterId {
+-			t.Errorf("#%d: clusterId = %x, want %x", i, e.p.node.ClusterId(), clusterId)
+-		}
+-	}
+-}
+-
+-func waitMode(mode int64, e *Server) {
+-	for {
+-		if e.mode.Get() == mode {
+-			return
+-		}
+-		time.Sleep(10 * time.Millisecond)
++func urlHost(urlStr string) string {
++	u, err := url.Parse(urlStr)
++	if err != nil {
++		panic(err)
+ 	}
++	return u.Host
+ }
+diff --git a/etcd/standby.go b/etcd/standby.go
+index 61a84e8..865c089 100644
+--- a/etcd/standby.go
++++ b/etcd/standby.go
+@@ -70,7 +70,7 @@ func (s *standby) run(stop chan struct{}) {
+ 		}
+ 
+ 		if update, err := s.syncCluster(nodes); err != nil {
+-			log.Println("standby.run syncErr=\"%v\"", err)
++			log.Printf("standby.run syncErr=\"%v\"", err)
+ 			continue
+ 		} else {
+ 			nodes = update
+diff --git a/etcd/util_test.go b/etcd/util_test.go
+deleted file mode 100644
+index 3bc2c77..0000000
+--- a/etcd/util_test.go
++++ /dev/null
+@@ -1,267 +0,0 @@
+-/*
+-Copyright 2014 CoreOS Inc.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+- http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-*/
+-
+-package etcd
+-
+-import (
+-	"fmt"
+-	"io/ioutil"
+-	"net"
+-	"net/http"
+-	"net/http/httptest"
+-	"net/url"
+-	"os"
+-	"strings"
+-	"testing"
+-	"time"
+-
+-	"github.com/coreos/etcd/conf"
+-)
+-
+-func TestMultipleNodes(t *testing.T) {
+-	defer afterTest(t)
+-	tests := []int{1, 3, 5, 9, 11}
+-
+-	for _, tt := range tests {
+-		c := &testCluster{Size: tt}
+-		c.Start()
+-		c.Destroy()
+-	}
+-}
+-
+-func TestMultipleTLSNodes(t *testing.T) {
+-	defer afterTest(t)
+-	tests := []int{1, 3, 5}
+-
+-	for _, tt := range tests {
+-		c := &testCluster{Size: tt, TLS: true}
+-		c.Start()
+-		c.Destroy()
+-	}
+-}
+-
+-type testCluster struct {
+-	Size int
+-	TLS  bool
+-
+-	nodes []*testServer
+-}
+-
+-func (c *testCluster) Start() {
+-	if c.Size <= 0 {
+-		panic("cluster size <= 0")
+-	}
+-
+-	nodes := make([]*testServer, c.Size)
+-	c.nodes = nodes
+-	nodes[0] = &testServer{Id: 0, TLS: c.TLS}
+-	nodes[0].Start()
+-	if !nodes[0].WaitMode(participantMode, 1) {
+-		panic("cannot wait until participantMode")
+-	}
+-
+-	seed := nodes[0].URL
+-	for i := 1; i < c.Size; i++ {
+-		conf := newTestConfig()
+-		conf.Peers = []string{seed}
+-		id := int64(i)
+-		s := &testServer{Config: conf, Id: id, TLS: c.TLS}
+-		s.Start()
+-		nodes[i] = s
+-
+-		// Wait for the previous configuration change to be committed
+-		// or this configuration request might be dropped.
+-		// Or it could be a slow join because it needs to retry.
+-		// TODO: this might not be true if we add param for retry interval.
+-		if !s.WaitMode(participantMode, 3) {
+-			panic("cannot wait until participantMode")
+-		}
+-		w, err := s.P().Watch(v2machineKVPrefix, true, false, uint64(i))
+-		if err != nil {
+-			panic(err)
+-		}
+-		<-w.EventChan
+-	}
+-	c.wait()
+-}
+-
+-func (c *testCluster) wait() {
+-	size := c.Size
+-	for i := 0; i < size; i++ {
+-		for k := 0; k < size; k++ {
+-			s := c.At(i)
+-			w, err := s.P().Watch(v2machineKVPrefix+fmt.Sprintf("/%d", c.At(k).Id), false, false, 1)
+-			if err != nil {
+-				panic(err)
+-			}
+-			<-w.EventChan
+-		}
+-	}
+-
+-	clusterId := c.P(0).node.ClusterId()
+-	for i := 0; i < size; i++ {
+-		if g := c.P(i).node.ClusterId(); g != clusterId {
+-			panic(fmt.Sprintf("#%d: clusterId = %x, want %x", i, g, clusterId))
+-		}
+-	}
+-}
+-
+-func (c *testCluster) At(i int) *testServer {
+-	return c.nodes[i]
+-}
+-
+-func (c *testCluster) P(i int) *participant {
+-	return c.At(i).P()
+-}
+-
+-func (c *testCluster) Destroy() {
+-	for _, s := range c.nodes {
+-		s.Destroy()
+-	}
+-}
+-
+-type testServer struct {
+-	Config *conf.Config
+-	Id     int64
+-	TLS    bool
+-
+-	// base URL of form http://ipaddr:port with no trailing slash
+-	URL string
+-
+-	e *Server
+-	h *httptest.Server
+-}
+-
+-func (s *testServer) Start() {
+-	if s.Config == nil {
+-		s.Config = newTestConfig()
+-	}
+-	c := s.Config
+-	if !strings.HasPrefix(c.DataDir, os.TempDir()) {
+-		panic("dataDir may pollute file system")
+-	}
+-	if c.Peer.CAFile != "" || c.Peer.CertFile != "" || c.Peer.KeyFile != "" {
+-		panic("use TLS field instead")
+-	}
+-
+-	nc := new(conf.Config)
+-	*nc = *c
+-	e, err := New(nc)
+-	if err != nil {
+-		panic(err)
+-	}
+-	s.e = e
+-	e.setId(s.Id)
+-	tick := time.Duration(c.Peer.HeartbeatInterval) * time.Millisecond
+-	e.SetTick(tick)
+-
+-	m := http.NewServeMux()
+-	m.Handle("/", e)
+-	m.Handle("/raft", e.RaftHandler())
+-	m.Handle("/raft/", e.RaftHandler())
+-	m.Handle("/v2/admin/", e.RaftHandler())
+-
+-	addr := c.Addr
+-	if s.URL != "" {
+-		addr = urlHost(s.URL)
+-	}
+-	s.h = startServingAddr(addr, m, s.TLS)
+-	s.URL = s.h.URL
+-
+-	e.pubAddr = s.URL
+-	e.raftPubAddr = s.URL
+-	go e.Run()
+-}
+-
+-func (s *testServer) WaitMode(mode int64, ms int) bool {
+-	for i := 0; i < ms+1; i++ {
+-		if s.e.mode.Get() == mode {
+-			return true
+-		}
+-		time.Sleep(time.Millisecond)
+-	}
+-	return false
+-}
+-
+-func (s *testServer) P() *participant {
+-	if s.e.mode.Get() != participantMode {
+-		panic("cannot get P if not in participant mode")
+-	}
+-	return s.e.p
+-}
+-
+-func (s *testServer) Stop() error {
+-	err := s.e.Stop()
+-	s.h.Close()
+-	return err
+-}
+-
+-func (s *testServer) Destroy() {
+-	s.Stop()
+-	if err := os.RemoveAll(s.Config.DataDir); err != nil {
+-		panic(err)
+-	}
+-}
+-
+-func startServingAddr(addr string, h http.Handler, tls bool) *httptest.Server {
+-	var l net.Listener
+-	var err error
+-	for i := 0; i < 4; i++ {
+-		l, err = net.Listen("tcp", addr)
+-		if err == nil {
+-			break
+-		}
+-		if !strings.Contains(err.Error(), "address already in use") {
+-			panic(err)
+-		}
+-		time.Sleep(500 * time.Millisecond)
+-	}
+-	if l == nil {
+-		panic("cannot listen on " + addr)
+-	}
+-	hs := &httptest.Server{
+-		Listener: l,
+-		Config:   &http.Server{Handler: h},
+-	}
+-	if tls {
+-		hs.StartTLS()
+-	} else {
+-		hs.Start()
+-	}
+-	return hs
+-}
+-
+-func newTestConfig() *conf.Config {
+-	c := conf.New()
+-	c.Addr = "127.0.0.1:0"
+-	c.Peer.Addr = "127.0.0.1:0"
+-	c.Peer.HeartbeatInterval = 5
+-	c.Peer.ElectionTimeout = 25
+-	dataDir, err := ioutil.TempDir(os.TempDir(), "etcd")
+-	if err != nil {
+-		panic(err)
+-	}
+-	c.DataDir = dataDir
+-	return c
+-}
+-
+-func urlHost(urlStr string) string {
+-	u, err := url.Parse(urlStr)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return u.Host
+-}
+diff --git a/etcd/v2_http_endpoint_test.go b/etcd/v2_http_endpoint_test.go
+index c0bf625..0ff6526 100644
+--- a/etcd/v2_http_endpoint_test.go
++++ b/etcd/v2_http_endpoint_test.go
+@@ -16,291 +16,276 @@ limitations under the License.
+ 
+ package etcd
+ 
+-import (
+-	"bytes"
+-	"encoding/json"
+-	"fmt"
+-	"io/ioutil"
+-	"net/http"
+-	"reflect"
+-	"sort"
+-	"strings"
+-	"testing"
+-
+-	"github.com/coreos/etcd/conf"
+-	"github.com/coreos/etcd/store"
+-)
+-
+-func TestMachinesEndPoint(t *testing.T) {
+-	es, hs := buildCluster(3, false)
+-	waitCluster(t, es)
+-
+-	w := make([]string, len(hs))
+-	for i := range hs {
+-		w[i] = hs[i].URL
+-	}
+-
+-	for i := range hs {
+-		r, err := http.Get(hs[i].URL + v2machinePrefix)
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			break
+-		}
+-		b, err := ioutil.ReadAll(r.Body)
+-		r.Body.Close()
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			break
+-		}
+-		g := strings.Split(string(b), ",")
+-		sort.Strings(g)
+-		if !reflect.DeepEqual(w, g) {
+-			t.Errorf("machines = %v, want %v", g, w)
+-		}
+-	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+-}
+-
+-func TestLeaderEndPoint(t *testing.T) {
+-	es, hs := buildCluster(3, false)
+-	waitCluster(t, es)
+-
+-	us := make([]string, len(hs))
+-	for i := range hs {
+-		us[i] = hs[i].URL
+-	}
+-	// todo(xiangli) change this to raft port...
+-	w := hs[0].URL + "/raft"
+-
+-	for i := range hs {
+-		r, err := http.Get(hs[i].URL + v2LeaderPrefix)
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			break
+-		}
+-		b, err := ioutil.ReadAll(r.Body)
+-		r.Body.Close()
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			break
+-		}
+-		if string(b) != w {
+-			t.Errorf("leader = %v, want %v", string(b), w)
+-		}
+-	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+-}
+-
+-func TestStoreStatsEndPoint(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	waitCluster(t, es)
+-
+-	resp, err := http.Get(hs[0].URL + v2StoreStatsPrefix)
+-	if err != nil {
+-		t.Errorf("%v", err)
+-	}
+-	stats := new(store.Stats)
+-	d := json.NewDecoder(resp.Body)
+-	err = d.Decode(stats)
+-	resp.Body.Close()
+-	if err != nil {
+-		t.Errorf("%v", err)
+-	}
+-
+-	if stats.SetSuccess != 1 {
+-		t.Errorf("setSuccess = %d, want 1", stats.SetSuccess)
+-	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+-}
+-
+-func TestGetAdminConfigEndPoint(t *testing.T) {
+-	es, hs := buildCluster(3, false)
+-	waitCluster(t, es)
+-
+-	for i := range hs {
+-		r, err := http.Get(hs[i].URL + v2adminConfigPrefix)
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			continue
+-		}
+-		if g := r.StatusCode; g != 200 {
+-			t.Errorf("#%d: status = %d, want %d", i, g, 200)
+-		}
+-		if g := r.Header.Get("Content-Type"); g != "application/json" {
+-			t.Errorf("#%d: ContentType = %d, want application/json", i, g)
+-		}
+-
+-		cc := new(conf.ClusterConfig)
+-		err = json.NewDecoder(r.Body).Decode(cc)
+-		r.Body.Close()
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			continue
+-		}
+-		w := conf.NewClusterConfig()
+-		if !reflect.DeepEqual(cc, w) {
+-			t.Errorf("#%d: config = %+v, want %+v", i, cc, w)
+-		}
+-	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+-}
+-
+-func TestPutAdminConfigEndPoint(t *testing.T) {
+-	tests := []struct {
+-		c, wc string
+-	}{
+-		{
+-			`{"activeSize":1,"removeDelay":1,"syncInterval":1}`,
+-			`{"activeSize":3,"removeDelay":2,"syncInterval":1}`,
+-		},
+-		{
+-			`{"activeSize":5,"removeDelay":20.5,"syncInterval":1.5}`,
+-			`{"activeSize":5,"removeDelay":20.5,"syncInterval":1.5}`,
+-		},
+-		{
+-			`{"activeSize":5 ,  "removeDelay":20 ,  "syncInterval": 2 }`,
+-			`{"activeSize":5,"removeDelay":20,"syncInterval":2}`,
+-		},
+-		{
+-			`{"activeSize":3, "removeDelay":60}`,
+-			`{"activeSize":3,"removeDelay":60,"syncInterval":5}`,
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		es, hs := buildCluster(3, false)
+-		waitCluster(t, es)
+-		index := es[0].p.Index()
+-
+-		r, err := NewTestClient().Put(hs[0].URL+v2adminConfigPrefix, "application/json", bytes.NewBufferString(tt.c))
+-		if err != nil {
+-			t.Fatalf("%v", err)
+-		}
+-		b, err := ioutil.ReadAll(r.Body)
+-		r.Body.Close()
+-		if err != nil {
+-			t.Fatalf("%v", err)
+-		}
+-		if wbody := append([]byte(tt.wc), '\n'); !reflect.DeepEqual(b, wbody) {
+-			t.Errorf("#%d: put result = %s, want %s", i, b, wbody)
+-		}
+-
+-		for j := range es {
+-			w, err := es[j].p.Watch(v2configKVPrefix, false, false, index)
+-			if err != nil {
+-				t.Errorf("%v", err)
+-				continue
+-			}
+-			e := <-w.EventChan
+-			if g := *e.Node.Value; g != tt.wc {
+-				t.Errorf("#%d.%d: %s = %s, want %s", i, j, v2configKVPrefix, g, tt.wc)
+-			}
+-		}
+-
+-		destoryCluster(t, es, hs)
+-	}
+-	afterTest(t)
+-}
+-
+-func TestGetAdminMachineEndPoint(t *testing.T) {
+-	es, hs := buildCluster(3, false)
+-	waitCluster(t, es)
+-
+-	for i := range es {
+-		for j := range hs {
+-			name := fmt.Sprint(es[i].id)
+-			r, err := http.Get(hs[j].URL + v2adminMachinesPrefix + name)
+-			if err != nil {
+-				t.Errorf("%v", err)
+-				continue
+-			}
+-			if g := r.StatusCode; g != 200 {
+-				t.Errorf("#%d on %d: status = %d, want %d", i, j, g, 200)
+-			}
+-			if g := r.Header.Get("Content-Type"); g != "application/json" {
+-				t.Errorf("#%d on %d: ContentType = %d, want application/json", i, j, g)
+-			}
+-
+-			m := new(machineMessage)
+-			err = json.NewDecoder(r.Body).Decode(m)
+-			r.Body.Close()
+-			if err != nil {
+-				t.Errorf("%v", err)
+-				continue
+-			}
+-			wm := &machineMessage{
+-				Name:      name,
+-				State:     stateFollower,
+-				ClientURL: hs[i].URL,
+-				PeerURL:   hs[i].URL,
+-			}
+-			if i == 0 {
+-				wm.State = stateLeader
+-			}
+-			if !reflect.DeepEqual(m, wm) {
+-				t.Errorf("#%d on %d: body = %+v, want %+v", i, j, m, wm)
+-			}
+-		}
+-	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+-}
+-
+-func TestGetAdminMachinesEndPoint(t *testing.T) {
+-	es, hs := buildCluster(3, false)
+-	waitCluster(t, es)
+-
+-	w := make([]*machineMessage, len(hs))
+-	for i := range hs {
+-		w[i] = &machineMessage{
+-			Name:      fmt.Sprint(es[i].id),
+-			State:     stateFollower,
+-			ClientURL: hs[i].URL,
+-			PeerURL:   hs[i].URL,
+-		}
+-	}
+-	w[0].State = stateLeader
+-
+-	for i := range hs {
+-		r, err := http.Get(hs[i].URL + v2adminMachinesPrefix)
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			continue
+-		}
+-		m := make([]*machineMessage, 0)
+-		err = json.NewDecoder(r.Body).Decode(&m)
+-		r.Body.Close()
+-		if err != nil {
+-			t.Errorf("%v", err)
+-			continue
+-		}
+-
+-		sm := machineSlice(m)
+-		sw := machineSlice(w)
+-		sort.Sort(sm)
+-		sort.Sort(sw)
+-
+-		if !reflect.DeepEqual(sm, sw) {
+-			t.Errorf("on %d: machines = %+v, want %+v", i, sm, sw)
+-		}
+-	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+-}
+-
+-// int64Slice implements sort interface
+-type machineSlice []*machineMessage
+-
+-func (s machineSlice) Len() int           { return len(s) }
+-func (s machineSlice) Less(i, j int) bool { return s[i].Name < s[j].Name }
+-func (s machineSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
++// func TestMachinesEndPoint(t *testing.T) {
++// 	es, hs := buildCluster(3, false)
++// 	waitCluster(t, es)
++
++// 	w := make([]string, len(hs))
++// 	for i := range hs {
++// 		w[i] = hs[i].URL
++// 	}
++
++// 	for i := range hs {
++// 		r, err := http.Get(hs[i].URL + v2machinePrefix)
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			break
++// 		}
++// 		b, err := ioutil.ReadAll(r.Body)
++// 		r.Body.Close()
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			break
++// 		}
++// 		g := strings.Split(string(b), ",")
++// 		sort.Strings(g)
++// 		if !reflect.DeepEqual(w, g) {
++// 			t.Errorf("machines = %v, want %v", g, w)
++// 		}
++// 	}
++
++// 	destoryCluster(t, es, hs)
++// 	afterTest(t)
++// }
++
++// func TestLeaderEndPoint(t *testing.T) {
++// 	es, hs := buildCluster(3, false)
++// 	waitCluster(t, es)
++
++// 	us := make([]string, len(hs))
++// 	for i := range hs {
++// 		us[i] = hs[i].URL
++// 	}
++// 	// todo(xiangli) change this to raft port...
++// 	w := hs[0].URL + "/raft"
++
++// 	for i := range hs {
++// 		r, err := http.Get(hs[i].URL + v2LeaderPrefix)
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			break
++// 		}
++// 		b, err := ioutil.ReadAll(r.Body)
++// 		r.Body.Close()
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			break
++// 		}
++// 		if string(b) != w {
++// 			t.Errorf("leader = %v, want %v", string(b), w)
++// 		}
++// 	}
++
++// 	destoryCluster(t, es, hs)
++// 	afterTest(t)
++// }
++
++// func TestStoreStatsEndPoint(t *testing.T) {
++// 	es, hs := buildCluster(1, false)
++// 	waitCluster(t, es)
++
++// 	resp, err := http.Get(hs[0].URL + v2StoreStatsPrefix)
++// 	if err != nil {
++// 		t.Errorf("%v", err)
++// 	}
++// 	stats := new(store.Stats)
++// 	d := json.NewDecoder(resp.Body)
++// 	err = d.Decode(stats)
++// 	resp.Body.Close()
++// 	if err != nil {
++// 		t.Errorf("%v", err)
++// 	}
++
++// 	if stats.SetSuccess != 1 {
++// 		t.Errorf("setSuccess = %d, want 1", stats.SetSuccess)
++// 	}
++
++// 	destoryCluster(t, es, hs)
++// 	afterTest(t)
++// }
++
++// func TestGetAdminConfigEndPoint(t *testing.T) {
++// 	es, hs := buildCluster(3, false)
++// 	waitCluster(t, es)
++
++// 	for i := range hs {
++// 		r, err := http.Get(hs[i].URL + v2adminConfigPrefix)
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			continue
++// 		}
++// 		if g := r.StatusCode; g != 200 {
++// 			t.Errorf("#%d: status = %d, want %d", i, g, 200)
++// 		}
++// 		if g := r.Header.Get("Content-Type"); g != "application/json" {
++// 			t.Errorf("#%d: ContentType = %d, want application/json", i, g)
++// 		}
++
++// 		conf := new(config.ClusterConfig)
++// 		err = json.NewDecoder(r.Body).Decode(conf)
++// 		r.Body.Close()
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			continue
++// 		}
++// 		w := config.NewClusterConfig()
++// 		if !reflect.DeepEqual(conf, w) {
++// 			t.Errorf("#%d: config = %+v, want %+v", i, conf, w)
++// 		}
++// 	}
++
++// 	destoryCluster(t, es, hs)
++// 	afterTest(t)
++// }
++
++// func TestPutAdminConfigEndPoint(t *testing.T) {
++// 	tests := []struct {
++// 		c, wc string
++// 	}{
++// 		{
++// 			`{"activeSize":1,"removeDelay":1,"syncInterval":1}`,
++// 			`{"activeSize":3,"removeDelay":2,"syncInterval":1}`,
++// 		},
++// 		{
++// 			`{"activeSize":5,"removeDelay":20.5,"syncInterval":1.5}`,
++// 			`{"activeSize":5,"removeDelay":20.5,"syncInterval":1.5}`,
++// 		},
++// 		{
++// 			`{"activeSize":5 ,  "removeDelay":20 ,  "syncInterval": 2 }`,
++// 			`{"activeSize":5,"removeDelay":20,"syncInterval":2}`,
++// 		},
++// 		{
++// 			`{"activeSize":3, "removeDelay":60}`,
++// 			`{"activeSize":3,"removeDelay":60,"syncInterval":5}`,
++// 		},
++// 	}
++
++// 	for i, tt := range tests {
++// 		es, hs := buildCluster(3, false)
++// 		waitCluster(t, es)
++// 		index := es[0].p.Index()
++
++// 		r, err := NewTestClient().Put(hs[0].URL+v2adminConfigPrefix, "application/json", bytes.NewBufferString(tt.c))
++// 		if err != nil {
++// 			t.Fatalf("%v", err)
++// 		}
++// 		b, err := ioutil.ReadAll(r.Body)
++// 		r.Body.Close()
++// 		if err != nil {
++// 			t.Fatalf("%v", err)
++// 		}
++// 		if wbody := append([]byte(tt.wc), '\n'); !reflect.DeepEqual(b, wbody) {
++// 			t.Errorf("#%d: put result = %s, want %s", i, b, wbody)
++// 		}
++
++// 		for j := range es {
++// 			w, err := es[j].p.Watch(v2configKVPrefix, false, false, index)
++// 			if err != nil {
++// 				t.Errorf("%v", err)
++// 				continue
++// 			}
++// 			e := <-w.EventChan
++// 			if g := *e.Node.Value; g != tt.wc {
++// 				t.Errorf("#%d.%d: %s = %s, want %s", i, j, v2configKVPrefix, g, tt.wc)
++// 			}
++// 		}
++
++// 		destoryCluster(t, es, hs)
++// 	}
++// 	afterTest(t)
++// }
++
++// func TestGetAdminMachineEndPoint(t *testing.T) {
++// 	es, hs := buildCluster(3, false)
++// 	waitCluster(t, es)
++
++// 	for i := range es {
++// 		for j := range hs {
++// 			name := fmt.Sprint(es[i].id)
++// 			r, err := http.Get(hs[j].URL + v2adminMachinesPrefix + name)
++// 			if err != nil {
++// 				t.Errorf("%v", err)
++// 				continue
++// 			}
++// 			if g := r.StatusCode; g != 200 {
++// 				t.Errorf("#%d on %d: status = %d, want %d", i, j, g, 200)
++// 			}
++// 			if g := r.Header.Get("Content-Type"); g != "application/json" {
++// 				t.Errorf("#%d on %d: ContentType = %d, want application/json", i, j, g)
++// 			}
++
++// 			m := new(machineMessage)
++// 			err = json.NewDecoder(r.Body).Decode(m)
++// 			r.Body.Close()
++// 			if err != nil {
++// 				t.Errorf("%v", err)
++// 				continue
++// 			}
++// 			wm := &machineMessage{
++// 				Name:      name,
++// 				State:     stateFollower,
++// 				ClientURL: hs[i].URL,
++// 				PeerURL:   hs[i].URL,
++// 			}
++// 			if i == 0 {
++// 				wm.State = stateLeader
++// 			}
++// 			if !reflect.DeepEqual(m, wm) {
++// 				t.Errorf("#%d on %d: body = %+v, want %+v", i, j, m, wm)
++// 			}
++// 		}
++// 	}
++
++// 	destoryCluster(t, es, hs)
++// 	afterTest(t)
++// }
++
++// func TestGetAdminMachinesEndPoint(t *testing.T) {
++// 	es, hs := buildCluster(3, false)
++// 	waitCluster(t, es)
++
++// 	w := make([]*machineMessage, len(hs))
++// 	for i := range hs {
++// 		w[i] = &machineMessage{
++// 			Name:      fmt.Sprint(es[i].id),
++// 			State:     stateFollower,
++// 			ClientURL: hs[i].URL,
++// 			PeerURL:   hs[i].URL,
++// 		}
++// 	}
++// 	w[0].State = stateLeader
++
++// 	for i := range hs {
++// 		r, err := http.Get(hs[i].URL + v2adminMachinesPrefix)
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			continue
++// 		}
++// 		m := make([]*machineMessage, 0)
++// 		err = json.NewDecoder(r.Body).Decode(&m)
++// 		r.Body.Close()
++// 		if err != nil {
++// 			t.Errorf("%v", err)
++// 			continue
++// 		}
++
++// 		sm := machineSlice(m)
++// 		sw := machineSlice(w)
++// 		sort.Sort(sm)
++// 		sort.Sort(sw)
++
++// 		if !reflect.DeepEqual(sm, sw) {
++// 			t.Errorf("on %d: machines = %+v, want %+v", i, sm, sw)
++// 		}
++// 	}
++
++// 	destoryCluster(t, es, hs)
++// 	afterTest(t)
++// }
++
++// // int64Slice implements sort interface
++// type machineSlice []*machineMessage
++
++// func (s machineSlice) Len() int           { return len(s) }
++// func (s machineSlice) Less(i, j int) bool { return s[i].Name < s[j].Name }
++// func (s machineSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+diff --git a/etcd/v2_http_kv_test.go b/etcd/v2_http_kv_test.go
+index a33740b..e97a05b 100644
+--- a/etcd/v2_http_kv_test.go
++++ b/etcd/v2_http_kv_test.go
+@@ -31,8 +31,11 @@ import (
+ )
+ 
+ func TestV2Set(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 	v := url.Values{}
+ 	v.Set("value", "bar")
+@@ -76,14 +79,14 @@ func TestV2Set(t *testing.T) {
+ 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2CreateUpdate(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	tests := []struct {
+@@ -184,14 +187,14 @@ func TestV2CreateUpdate(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2CAS(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	tests := []struct {
+@@ -312,14 +315,14 @@ func TestV2CAS(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2Delete(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	v := url.Values{}
+@@ -408,14 +411,14 @@ func TestV2Delete(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2CAD(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	v := url.Values{}
+@@ -506,14 +509,14 @@ func TestV2CAD(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2Unique(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	tests := []struct {
+@@ -569,14 +572,14 @@ func TestV2Unique(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2Get(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	v := url.Values{}
+@@ -663,14 +666,14 @@ func TestV2Get(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2QuorumGet(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	v := url.Values{}
+@@ -757,14 +760,14 @@ func TestV2QuorumGet(t *testing.T) {
+ 			t.Errorf("#%d: %v", i, err)
+ 		}
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2Watch(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	var watchResp *http.Response
+@@ -802,14 +805,14 @@ func TestV2Watch(t *testing.T) {
+ 	if err := checkBody(body, w); err != nil {
+ 		t.Error(err)
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2WatchWithIndex(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	var body map[string]interface{}
+@@ -859,14 +862,14 @@ func TestV2WatchWithIndex(t *testing.T) {
+ 	if err := checkBody(body, w); err != nil {
+ 		t.Error(err)
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2WatchKeyInDir(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	var body map[string]interface{}
+@@ -906,14 +909,14 @@ func TestV2WatchKeyInDir(t *testing.T) {
+ 	if err := checkBody(body, w); err != nil {
+ 		t.Error(err)
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func TestV2Head(t *testing.T) {
+-	es, hs := buildCluster(1, false)
+-	u := hs[0].URL
++	cl := testCluster{Size: 1}
++	cl.Start()
++	defer cl.Destroy()
++
++	u := cl.URL(0)
+ 	tc := NewTestClient()
+ 
+ 	v := url.Values{}
+@@ -939,9 +942,6 @@ func TestV2Head(t *testing.T) {
+ 	if resp.ContentLength != -1 {
+ 		t.Errorf("ContentLength = %d, want -1", resp.ContentLength)
+ 	}
+-
+-	destoryCluster(t, es, hs)
+-	afterTest(t)
+ }
+ 
+ func checkBody(body map[string]interface{}, w map[string]interface{}) error {

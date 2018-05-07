@@ -1,0 +1,89 @@
+commit 37796ed84cec2fa55d2bcbdb0b5125885a3dc91e
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Fri May 30 18:37:36 2014 -0700
+
+    tests: add TestMultiNodeKillAllAndRecorveryAndRemoveLeader
+    
+    This one breaks because it doesn't set joinIndex correctly.
+
+diff --git a/tests/functional/multi_node_kill_all_and_recovery_test.go b/tests/functional/multi_node_kill_all_and_recovery_test.go
+index 42b54b4..4ea6a8b 100644
+--- a/tests/functional/multi_node_kill_all_and_recovery_test.go
++++ b/tests/functional/multi_node_kill_all_and_recovery_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"os"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -239,3 +240,68 @@ func TestMultiNodeKillAllAndRecoveryWithStandbys(t *testing.T) {
+ 	assert.NoError(t, err)
+ 	assert.Equal(t, len(result.Node.Nodes), 7)
+ }
++
++// Create a five nodes
++// Kill all the nodes and restart, then remove the leader
++func TestMultiNodeKillAllAndRecoveryAndRemoveLeader(t *testing.T) {
++	procAttr := new(os.ProcAttr)
++	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
++
++	stop := make(chan bool)
++	leaderChan := make(chan string, 1)
++	all := make(chan bool, 1)
++
++	clusterSize := 5
++	argGroup, etcds, err := CreateCluster(clusterSize, procAttr, false)
++	defer DestroyCluster(etcds)
++
++	if err != nil {
++		t.Fatal("cannot create cluster")
++	}
++
++	c := etcd.NewClient(nil)
++
++	go Monitor(clusterSize, clusterSize, leaderChan, all, stop)
++	<-all
++	<-leaderChan
++	stop <- true
++
++	c.SyncCluster()
++
++	// kill all
++	DestroyCluster(etcds)
++
++	time.Sleep(time.Second)
++
++	stop = make(chan bool)
++	leaderChan = make(chan string, 1)
++	all = make(chan bool, 1)
++
++	time.Sleep(time.Second)
++
++	for i := 0; i < clusterSize; i++ {
++		etcds[i], err = os.StartProcess(EtcdBinPath, argGroup[i], procAttr)
++	}
++
++	go Monitor(clusterSize, 1, leaderChan, all, stop)
++
++	<-all
++	leader := <-leaderChan
++
++	_, err = c.Set("foo", "bar", 0)
++	if err != nil {
++		t.Fatalf("Recovery error: %s", err)
++	}
++
++	port, _ := strconv.Atoi(strings.Split(leader, ":")[2])
++	num := port - 7000
++	resp, _ := tests.Delete(leader+"/v2/admin/machines/node"+strconv.Itoa(num), "application/json", nil)
++	if !assert.Equal(t, resp.StatusCode, 200) {
++		t.FailNow()
++	}
++
++	// check the old leader is in standby mode now
++	time.Sleep(time.Second)
++	resp, _ = tests.Get(leader + "/name")
++	assert.Equal(t, resp.StatusCode, 404)
++}

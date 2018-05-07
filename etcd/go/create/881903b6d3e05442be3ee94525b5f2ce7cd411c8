@@ -1,0 +1,154 @@
+commit 881903b6d3e05442be3ee94525b5f2ce7cd411c8
+Author: Hitoshi Mitake <mitake.hitoshi@lab.ntt.co.jp>
+Date:   Tue Apr 25 14:49:55 2017 +0900
+
+    e2e: add a new test case for protecting watch with auth
+
+diff --git a/e2e/ctl_v3_auth_test.go b/e2e/ctl_v3_auth_test.go
+index 42d8ac0..1028cfd 100644
+--- a/e2e/ctl_v3_auth_test.go
++++ b/e2e/ctl_v3_auth_test.go
+@@ -38,6 +38,7 @@ func TestCtlV3AuthCertCN(t *testing.T)           { testCtl(t, authTestCertCN, wi
+ func TestCtlV3AuthRevokeWithDelete(t *testing.T) { testCtl(t, authTestRevokeWithDelete) }
+ func TestCtlV3AuthInvalidMgmt(t *testing.T)      { testCtl(t, authTestInvalidMgmt) }
+ func TestCtlV3AuthFromKeyPerm(t *testing.T)      { testCtl(t, authTestFromKeyPerm) }
++func TestCtlV3AuthAndWatch(t *testing.T)         { testCtl(t, authTestWatch) }
+ 
+ func authEnableTest(cx ctlCtx) {
+ 	if err := authEnable(cx); err != nil {
+@@ -661,3 +662,80 @@ func authTestFromKeyPerm(cx ctlCtx) {
+ 		}
+ 	}
+ }
++
++func authTestWatch(cx ctlCtx) {
++	if err := authEnable(cx); err != nil {
++		cx.t.Fatal(err)
++	}
++
++	cx.user, cx.pass = "root", "root"
++	authSetupTestUser(cx)
++
++	// grant a key range
++	if err := ctlV3RoleGrantPermission(cx, "test-role", grantingPerm{true, true, "key", "key4", false}); err != nil {
++		cx.t.Fatal(err)
++	}
++
++	tests := []struct {
++		puts []kv
++		args []string
++
++		wkv  []kv
++		want bool
++	}{
++		{ // watch 1 key, should be successful
++			[]kv{{"key", "value"}},
++			[]string{"key", "--rev", "1"},
++			[]kv{{"key", "value"}},
++			true,
++		},
++		{ // watch 3 keys by range, should be successful
++			[]kv{{"key1", "val1"}, {"key3", "val3"}, {"key2", "val2"}},
++			[]string{"key", "key3", "--rev", "1"},
++			[]kv{{"key1", "val1"}, {"key2", "val2"}},
++			true,
++		},
++
++		{ // watch 1 key, should not be successful
++			[]kv{},
++			[]string{"key5", "--rev", "1"},
++			[]kv{},
++			false,
++		},
++		{ // watch 3 keys by range, should not be successful
++			[]kv{},
++			[]string{"key", "key6", "--rev", "1"},
++			[]kv{},
++			false,
++		},
++	}
++
++	cx.user, cx.pass = "test-user", "pass"
++	for i, tt := range tests {
++		donec := make(chan struct{})
++		go func(i int, puts []kv) {
++			defer close(donec)
++			for j := range puts {
++				if err := ctlV3Put(cx, puts[j].key, puts[j].val, ""); err != nil {
++					cx.t.Fatalf("watchTest #%d-%d: ctlV3Put error (%v)", i, j, err)
++				}
++			}
++		}(i, tt.puts)
++
++		var err error
++		if tt.want {
++			err = ctlV3Watch(cx, tt.args, tt.wkv...)
++		} else {
++			err = ctlV3WatchFailPerm(cx, tt.args)
++		}
++
++		if err != nil {
++			if cx.dialTimeout > 0 && !isGRPCTimedout(err) {
++				cx.t.Errorf("watchTest #%d: ctlV3Watch error (%v)", i, err)
++			}
++		}
++
++		<-donec
++	}
++
++}
+diff --git a/e2e/ctl_v3_watch_test.go b/e2e/ctl_v3_watch_test.go
+index e8a892e..bc9d64a 100644
+--- a/e2e/ctl_v3_watch_test.go
++++ b/e2e/ctl_v3_watch_test.go
+@@ -86,7 +86,7 @@ func watchTest(cx ctlCtx) {
+ 	}
+ }
+ 
+-func ctlV3Watch(cx ctlCtx, args []string, kvs ...kv) error {
++func setupWatchArgs(cx ctlCtx, args []string) []string {
+ 	cmdArgs := append(cx.PrefixArgs(), "watch")
+ 	if cx.interactive {
+ 		cmdArgs = append(cmdArgs, "--interactive")
+@@ -94,6 +94,12 @@ func ctlV3Watch(cx ctlCtx, args []string, kvs ...kv) error {
+ 		cmdArgs = append(cmdArgs, args...)
+ 	}
+ 
++	return cmdArgs
++}
++
++func ctlV3Watch(cx ctlCtx, args []string, kvs ...kv) error {
++	cmdArgs := setupWatchArgs(cx, args)
++
+ 	proc, err := spawnCmd(cmdArgs)
+ 	if err != nil {
+ 		return err
+@@ -116,3 +122,28 @@ func ctlV3Watch(cx ctlCtx, args []string, kvs ...kv) error {
+ 	}
+ 	return proc.Stop()
+ }
++
++func ctlV3WatchFailPerm(cx ctlCtx, args []string) error {
++	cmdArgs := setupWatchArgs(cx, args)
++
++	proc, err := spawnCmd(cmdArgs)
++	if err != nil {
++		return err
++	}
++
++	if cx.interactive {
++		wl := strings.Join(append([]string{"watch"}, args...), " ") + "\r"
++		if err = proc.Send(wl); err != nil {
++			return err
++		}
++	}
++
++	// TODO(mitake): after printing accurate error message that includes
++	// "permission denied", the above string argument of proc.Expect()
++	// should be updated.
++	_, err = proc.Expect("watch is canceled by the server")
++	if err != nil {
++		return err
++	}
++	return proc.Close()
++}

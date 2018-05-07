@@ -1,0 +1,284 @@
+commit dfe853ebff3cf4d9f1ab99bd94ea84ff25ccfd7c
+Author: Vimal Kumar <vimal78@gmail.com>
+Date:   Tue Nov 15 00:47:55 2016 +0530
+
+    auth: add a timeout mechanism to simple token
+
+diff --git a/auth/simple_token.go b/auth/simple_token.go
+index ddbe8c3..240defe 100644
+--- a/auth/simple_token.go
++++ b/auth/simple_token.go
+@@ -21,13 +21,85 @@ import (
+ 	"crypto/rand"
+ 	"math/big"
+ 	"strings"
++	"time"
+ )
+ 
+ const (
+ 	letters                  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+ 	defaultSimpleTokenLength = 16
++	simpleTokenTTL           = 5 * time.Minute
++	simpleTokenTTLResolution = 1 * time.Second
+ )
+ 
++type simpleTokenTTLKeeper struct {
++	tokens              map[string]time.Time
++	addSimpleTokenCh    chan string
++	resetSimpleTokenCh  chan string
++	deleteSimpleTokenCh chan string
++	stopCh              chan chan struct{}
++	deleteTokenFunc     func(string)
++}
++
++func NewSimpleTokenTTLKeeper(deletefunc func(string)) *simpleTokenTTLKeeper {
++	stk := &simpleTokenTTLKeeper{
++		tokens:              make(map[string]time.Time),
++		addSimpleTokenCh:    make(chan string, 1),
++		resetSimpleTokenCh:  make(chan string, 1),
++		deleteSimpleTokenCh: make(chan string, 1),
++		stopCh:              make(chan chan struct{}),
++		deleteTokenFunc:     deletefunc,
++	}
++	go stk.run()
++	return stk
++}
++
++func (tm *simpleTokenTTLKeeper) stop() {
++	waitCh := make(chan struct{})
++	tm.stopCh <- waitCh
++	<-waitCh
++	close(tm.stopCh)
++}
++
++func (tm *simpleTokenTTLKeeper) addSimpleToken(token string) {
++	tm.addSimpleTokenCh <- token
++}
++
++func (tm *simpleTokenTTLKeeper) resetSimpleToken(token string) {
++	tm.resetSimpleTokenCh <- token
++}
++
++func (tm *simpleTokenTTLKeeper) deleteSimpleToken(token string) {
++	tm.deleteSimpleTokenCh <- token
++}
++func (tm *simpleTokenTTLKeeper) run() {
++	tokenTicker := time.NewTicker(simpleTokenTTLResolution)
++	defer tokenTicker.Stop()
++	for {
++		select {
++		case t := <-tm.addSimpleTokenCh:
++			tm.tokens[t] = time.Now().Add(simpleTokenTTL)
++		case t := <-tm.resetSimpleTokenCh:
++			if _, ok := tm.tokens[t]; ok {
++				tm.tokens[t] = time.Now().Add(simpleTokenTTL)
++			}
++		case t := <-tm.deleteSimpleTokenCh:
++			delete(tm.tokens, t)
++		case <-tokenTicker.C:
++			nowtime := time.Now()
++			for t, tokenendtime := range tm.tokens {
++				if nowtime.After(tokenendtime) {
++					tm.deleteTokenFunc(t)
++					delete(tm.tokens, t)
++				}
++			}
++		case waitCh := <-tm.stopCh:
++			tm.tokens = make(map[string]time.Time)
++			waitCh <- struct{}{}
++			return
++		}
++	}
++}
++
+ func (as *authStore) GenSimpleToken() (string, error) {
+ 	ret := make([]byte, defaultSimpleTokenLength)
+ 
+@@ -52,6 +124,7 @@ func (as *authStore) assignSimpleTokenToUser(username, token string) {
+ 	}
+ 
+ 	as.simpleTokens[token] = username
++	as.simpleTokenKeeper.addSimpleToken(token)
+ 	as.simpleTokensMu.Unlock()
+ }
+ 
+@@ -62,6 +135,7 @@ func (as *authStore) invalidateUser(username string) {
+ 	for token, name := range as.simpleTokens {
+ 		if strings.Compare(name, username) == 0 {
+ 			delete(as.simpleTokens, token)
++			as.simpleTokenKeeper.deleteSimpleToken(token)
+ 		}
+ 	}
+ }
+diff --git a/auth/store.go b/auth/store.go
+index fd821e2..9e17018 100644
+--- a/auth/store.go
++++ b/auth/store.go
+@@ -150,6 +150,9 @@ type AuthStore interface {
+ 
+ 	// CheckPassword checks a given pair of username and password is correct
+ 	CheckPassword(username, password string) (uint64, error)
++
++	// Close does cleanup of AuthStore
++	Close() error
+ }
+ 
+ type authStore struct {
+@@ -159,13 +162,20 @@ type authStore struct {
+ 
+ 	rangePermCache map[string]*unifiedRangePermissions // username -> unifiedRangePermissions
+ 
+-	simpleTokensMu sync.RWMutex
+-	simpleTokens   map[string]string // token -> username
++	simpleTokensMu    sync.RWMutex
++	simpleTokens      map[string]string // token -> username
++	simpleTokenKeeper *simpleTokenTTLKeeper
+ 
+ 	revision uint64
+ }
+ 
+ func (as *authStore) AuthEnable() error {
++	as.enabledMu.Lock()
++	defer as.enabledMu.Unlock()
++	if as.enabled {
++		plog.Noticef("Authentication already enabled")
++		return nil
++	}
+ 	b := as.be
+ 	tx := b.BatchTx()
+ 	tx.Lock()
+@@ -185,9 +195,17 @@ func (as *authStore) AuthEnable() error {
+ 
+ 	tx.UnsafePut(authBucketName, enableFlagKey, authEnabled)
+ 
+-	as.enabledMu.Lock()
+ 	as.enabled = true
+-	as.enabledMu.Unlock()
++
++	tokenDeleteFunc := func(t string) {
++		as.simpleTokensMu.Lock()
++		defer as.simpleTokensMu.Unlock()
++		if username, ok := as.simpleTokens[t]; ok {
++			plog.Infof("deleting token %s for user %s", t, username)
++			delete(as.simpleTokens, t)
++		}
++	}
++	as.simpleTokenKeeper = NewSimpleTokenTTLKeeper(tokenDeleteFunc)
+ 
+ 	as.rangePermCache = make(map[string]*unifiedRangePermissions)
+ 
+@@ -199,6 +217,11 @@ func (as *authStore) AuthEnable() error {
+ }
+ 
+ func (as *authStore) AuthDisable() {
++	as.enabledMu.Lock()
++	defer as.enabledMu.Unlock()
++	if !as.enabled {
++		return
++	}
+ 	b := as.be
+ 	tx := b.BatchTx()
+ 	tx.Lock()
+@@ -207,17 +230,32 @@ func (as *authStore) AuthDisable() {
+ 	tx.Unlock()
+ 	b.ForceCommit()
+ 
+-	as.enabledMu.Lock()
+ 	as.enabled = false
+-	as.enabledMu.Unlock()
+ 
+ 	as.simpleTokensMu.Lock()
+ 	as.simpleTokens = make(map[string]string) // invalidate all tokens
+ 	as.simpleTokensMu.Unlock()
++	if as.simpleTokenKeeper != nil {
++		as.simpleTokenKeeper.stop()
++		as.simpleTokenKeeper = nil
++	}
+ 
+ 	plog.Noticef("Authentication disabled")
+ }
+ 
++func (as *authStore) Close() error {
++	as.enabledMu.Lock()
++	defer as.enabledMu.Unlock()
++	if !as.enabled {
++		return nil
++	}
++	if as.simpleTokenKeeper != nil {
++		as.simpleTokenKeeper.stop()
++		as.simpleTokenKeeper = nil
++	}
++	return nil
++}
++
+ func (as *authStore) Authenticate(ctx context.Context, username, password string) (*pb.AuthenticateResponse, error) {
+ 	if !as.isAuthEnabled() {
+ 		return nil, ErrAuthNotEnabled
+@@ -608,6 +646,9 @@ func (as *authStore) AuthInfoFromToken(token string) (*AuthInfo, bool) {
+ 	as.simpleTokensMu.RLock()
+ 	defer as.simpleTokensMu.RUnlock()
+ 	t, ok := as.simpleTokens[token]
++	if ok {
++		as.simpleTokenKeeper.resetSimpleToken(token)
++	}
+ 	return &AuthInfo{Username: t, Revision: as.revision}, ok
+ }
+ 
+diff --git a/auth/store_test.go b/auth/store_test.go
+index ab01d99..ad3a94e 100644
+--- a/auth/store_test.go
++++ b/auth/store_test.go
+@@ -81,6 +81,7 @@ func TestCheckPassword(t *testing.T) {
+ 	}()
+ 
+ 	as := NewAuthStore(b)
++	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -125,6 +126,7 @@ func TestUserDelete(t *testing.T) {
+ 	}()
+ 
+ 	as := NewAuthStore(b)
++	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -161,6 +163,7 @@ func TestUserChangePassword(t *testing.T) {
+ 	}()
+ 
+ 	as := NewAuthStore(b)
++	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -206,6 +209,7 @@ func TestRoleAdd(t *testing.T) {
+ 	}()
+ 
+ 	as := NewAuthStore(b)
++	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -226,6 +230,7 @@ func TestUserGrant(t *testing.T) {
+ 	}()
+ 
+ 	as := NewAuthStore(b)
++	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+ 		t.Fatal(err)
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index e34fafb..1b288d8 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -679,6 +679,9 @@ func (s *EtcdServer) run() {
+ 		if s.kv != nil {
+ 			s.kv.Close()
+ 		}
++		if s.authStore != nil {
++			s.authStore.Close()
++		}
+ 		if s.be != nil {
+ 			s.be.Close()
+ 		}

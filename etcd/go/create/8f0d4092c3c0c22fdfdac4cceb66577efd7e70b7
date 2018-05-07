@@ -1,0 +1,82 @@
+commit 8f0d4092c3c0c22fdfdac4cceb66577efd7e70b7
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Tue May 16 11:31:23 2017 -0700
+
+    e2e: Stop() lock/elect etcdctl process if Close times out
+    
+    Gets backtrace by sending SIGQUIT if Close hangs after sending a SIGINT.
+
+diff --git a/e2e/ctl_v3_elect_test.go b/e2e/ctl_v3_elect_test.go
+index 5853901..e44d6de 100644
+--- a/e2e/ctl_v3_elect_test.go
++++ b/e2e/ctl_v3_elect_test.go
+@@ -80,7 +80,7 @@ func testElect(cx ctlCtx) {
+ 	if err = blocked.Signal(os.Interrupt); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+-	if err = blocked.Close(); err != nil {
++	if err := closeWithTimeout(blocked, time.Second); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+ 
+@@ -88,7 +88,7 @@ func testElect(cx ctlCtx) {
+ 	if err = holder.Signal(os.Interrupt); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+-	if err = holder.Close(); err != nil {
++	if err = closeWithTimeout(holder, time.Second); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+ 
+diff --git a/e2e/ctl_v3_lock_test.go b/e2e/ctl_v3_lock_test.go
+index 450805f..416f26d 100644
+--- a/e2e/ctl_v3_lock_test.go
++++ b/e2e/ctl_v3_lock_test.go
+@@ -103,7 +103,7 @@ func testLock(cx ctlCtx) {
+ 	if err = blocked.Signal(os.Interrupt); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+-	if err = blocked.Close(); err != nil {
++	if err = closeWithTimeout(blocked, time.Second); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+ 
+@@ -111,7 +111,7 @@ func testLock(cx ctlCtx) {
+ 	if err = holder.Signal(os.Interrupt); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+-	if err = holder.Close(); err != nil {
++	if err = closeWithTimeout(holder, time.Second); err != nil {
+ 		cx.t.Fatal(err)
+ 	}
+ 
+diff --git a/e2e/etcd_test.go b/e2e/etcd_test.go
+index eedb80a..c15f95d 100644
+--- a/e2e/etcd_test.go
++++ b/e2e/etcd_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/coreos/etcd/etcdserver"
+ 	"github.com/coreos/etcd/pkg/expect"
+@@ -561,3 +562,17 @@ func (epc *etcdProcessCluster) withStopSignal(sig os.Signal) os.Signal {
+ 	}
+ 	return ret
+ }
++
++func closeWithTimeout(p *expect.ExpectProcess, d time.Duration) error {
++	errc := make(chan error, 1)
++	go func() { errc <- p.Close() }()
++	select {
++	case err := <-errc:
++		return err
++	case <-time.After(d):
++		p.Stop()
++		// retry close after stopping to collect SIGQUIT data, if any
++		closeWithTimeout(p, time.Second)
++	}
++	return fmt.Errorf("took longer than %v to Close process %+v", d, p)
++}

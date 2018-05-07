@@ -1,0 +1,80 @@
+commit 25cf916a805f91bcb96549bb6e734b860bcfd27a
+Author: Brian Waldon <brian@waldon.cc>
+Date:   Tue Feb 3 10:56:22 2015 -0800
+
+    client: ensure Response closed on cancel
+
+diff --git a/client/client.go b/client/client.go
+index ee0be93..424b775 100644
+--- a/client/client.go
++++ b/client/client.go
+@@ -270,9 +270,10 @@ func (c *simpleHTTPClient) Do(ctx context.Context, act httpAction) (*http.Respon
+ 	case rtresp := <-rtchan:
+ 		resp, err = rtresp.resp, rtresp.err
+ 	case <-ctx.Done():
++		// cancel and wait for request to actually exit before continuing
+ 		c.transport.CancelRequest(req)
+-		// wait for request to actually exit before continuing
+-		<-rtchan
++		rtresp := <-rtchan
++		resp = rtresp.resp
+ 		err = ctx.Err()
+ 	}
+ 
+diff --git a/client/client_test.go b/client/client_test.go
+index 4befb34..13245ba 100644
+--- a/client/client_test.go
++++ b/client/client_test.go
+@@ -16,6 +16,7 @@ package client
+ 
+ import (
+ 	"errors"
++	"io"
+ 	"io/ioutil"
+ 	"net/http"
+ 	"net/url"
+@@ -179,6 +180,44 @@ func TestSimpleHTTPClientDoCancelContext(t *testing.T) {
+ 	}
+ }
+ 
++type checkableReadCloser struct {
++	io.ReadCloser
++	closed bool
++}
++
++func (c *checkableReadCloser) Close() error {
++	c.closed = true
++	return c.ReadCloser.Close()
++}
++
++func TestSimpleHTTPClientDoCancelContextResponseBodyClosed(t *testing.T) {
++	tr := newFakeTransport()
++	c := &simpleHTTPClient{transport: tr}
++
++	// create an already-cancelled context
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	body := &checkableReadCloser{ReadCloser: ioutil.NopCloser(strings.NewReader("foo"))}
++	go func() {
++		// wait for CancelRequest to be called, informing us that simpleHTTPClient
++		// knows the context is already timed out
++		<-tr.startCancel
++
++		tr.respchan <- &http.Response{Body: body}
++		tr.finishCancel <- struct{}{}
++	}()
++
++	_, _, err := c.Do(ctx, &fakeAction{})
++	if err == nil {
++		t.Fatalf("expected non-nil error, got nil")
++	}
++
++	if !body.closed {
++		t.Fatalf("expected closed body")
++	}
++}
++
+ func TestSimpleHTTPClientDoCancelContextWaitForRoundTrip(t *testing.T) {
+ 	tr := newFakeTransport()
+ 	c := &simpleHTTPClient{transport: tr}

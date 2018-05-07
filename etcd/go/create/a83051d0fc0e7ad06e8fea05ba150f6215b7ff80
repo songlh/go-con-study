@@ -1,0 +1,57 @@
+commit a83051d0fc0e7ad06e8fea05ba150f6215b7ff80
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Tue May 31 14:06:05 2016 -0700
+
+    clientv3: don't panic on Get if NewKV is created with a closed client
+
+diff --git a/clientv3/integration/kv_test.go b/clientv3/integration/kv_test.go
+index cf89247..24252c4 100644
+--- a/clientv3/integration/kv_test.go
++++ b/clientv3/integration/kv_test.go
+@@ -309,6 +309,33 @@ func TestKVGetErrConnClosed(t *testing.T) {
+ 	}
+ }
+ 
++func TestKVNewAfterClose(t *testing.T) {
++	defer testutil.AfterTest(t)
++
++	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	cli := clus.Client(0)
++	clus.TakeClient(0)
++	if err := cli.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	donec := make(chan struct{})
++	go func() {
++		kv := clientv3.NewKV(cli)
++		if _, err := kv.Get(context.TODO(), "foo"); err != rpctypes.ErrConnClosed {
++			t.Fatalf("expected %v, got %v", rpctypes.ErrConnClosed, err)
++		}
++		close(donec)
++	}()
++	select {
++	case <-time.After(3 * time.Second):
++		t.Fatal("kv.Get took too long")
++	case <-donec:
++	}
++}
++
+ func TestKVDeleteRange(t *testing.T) {
+ 	defer testutil.AfterTest(t)
+ 
+diff --git a/clientv3/remote_client.go b/clientv3/remote_client.go
+index 9fd046d..b511163 100644
+--- a/clientv3/remote_client.go
++++ b/clientv3/remote_client.go
+@@ -90,7 +90,7 @@ func (r *remoteClient) acquire(ctx context.Context) error {
+ 		c := r.client.conn
+ 		match := r.conn == c
+ 		r.mu.Unlock()
+-		if match {
++		if c != nil && match {
+ 			return nil
+ 		}
+ 		r.client.mu.RUnlock()

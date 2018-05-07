@@ -1,0 +1,155 @@
+commit ed44bb00f8745e1fade98dac74bb597c477f3909
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Tue Feb 23 22:50:26 2016 -0800
+
+    etcdctlv3: lock command
+
+diff --git a/clientv3/concurrency/mutex.go b/clientv3/concurrency/mutex.go
+index f80f2e4..6c18d99 100644
+--- a/clientv3/concurrency/mutex.go
++++ b/clientv3/concurrency/mutex.go
+@@ -92,6 +92,8 @@ func (m *Mutex) IsOwner() v3.Cmp {
+ 	return v3.Compare(v3.CreatedRevision(m.myKey), "=", m.myRev)
+ }
+ 
++func (m *Mutex) Key() string { return m.myKey }
++
+ type lockerMutex struct{ *Mutex }
+ 
+ func (lm *lockerMutex) Lock() {
+diff --git a/etcdctlv3/README.md b/etcdctlv3/README.md
+index f560d27..89e0684 100644
+--- a/etcdctlv3/README.md
++++ b/etcdctlv3/README.md
+@@ -264,6 +264,25 @@ bar
+ 
+ ## Utility Commands
+ 
++### LOCK \<lockname\>
++
++LOCK acquires a distributed named mutex with a given name. Once the lock is acquired, it will be held until etcdctlv3 is terminated.
++
++#### Return value
++
++- Once the lock is acquired, the result for the GET on the unique lock holder key is displayed.
++
++- LOCK returns a zero exit code only if it is terminated by a signal and can release the lock.
++
++#### Example
++```bash
++./etcdctl lock mylock
++mylock/1234534535445
++
++
++```
++
++
+ ### MAKE-MIRROR [options] \<destination\>
+ 
+ [make-mirror][mirror] mirrors a key prefix in an etcd cluster to a destination etcd cluster.
+diff --git a/etcdctlv3/command/lock_command.go b/etcdctlv3/command/lock_command.go
+new file mode 100644
+index 0000000..b688414
+--- /dev/null
++++ b/etcdctlv3/command/lock_command.go
+@@ -0,0 +1,88 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"errors"
++	"os"
++	"os/signal"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
++	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/clientv3"
++	"github.com/coreos/etcd/clientv3/concurrency"
++)
++
++// NewLockCommand returns the cobra command for "lock".
++func NewLockCommand() *cobra.Command {
++	c := &cobra.Command{
++		Use:   "lock <lockname>",
++		Short: "lock acquires a named lock",
++		Run:   lockCommandFunc,
++	}
++	return c
++}
++
++func lockCommandFunc(cmd *cobra.Command, args []string) {
++	if len(args) != 1 {
++		ExitWithError(ExitBadArgs, errors.New("lock takes one lock name arguement."))
++	}
++	c := mustClientFromCmd(cmd)
++	if err := lockUntilSignal(c, args[0]); err != nil {
++		ExitWithError(ExitError, err)
++	}
++}
++
++func lockUntilSignal(c *clientv3.Client, lockname string) error {
++	m := concurrency.NewMutex(context.TODO(), c, lockname)
++	ctx, cancel := context.WithCancel(context.TODO())
++
++	// unlock in case of ordinary shutdown
++	donec := make(chan struct{})
++	sigc := make(chan os.Signal, 1)
++	signal.Notify(sigc, os.Interrupt, os.Kill)
++	go func() {
++		<-sigc
++		cancel()
++		close(donec)
++	}()
++
++	s, serr := concurrency.NewSession(c)
++	if serr != nil {
++		return serr
++	}
++
++	if err := m.Lock(ctx); err != nil {
++		return err
++	}
++
++	k, kerr := clientv3.NewKV(c).Get(ctx, m.Key())
++	if kerr != nil {
++		return kerr
++	}
++	if len(k.Kvs) == 0 {
++		return errors.New("lock lost on init")
++	}
++
++	display.Get(*k)
++
++	select {
++	case <-donec:
++		return m.Unlock()
++	case <-s.Done():
++	}
++
++	return errors.New("session expired")
++}
+diff --git a/etcdctlv3/main.go b/etcdctlv3/main.go
+index 3106a7a..2400349 100644
+--- a/etcdctlv3/main.go
++++ b/etcdctlv3/main.go
+@@ -62,6 +62,7 @@ func init() {
+ 		command.NewMemberCommand(),
+ 		command.NewSnapshotCommand(),
+ 		command.NewMakeMirrorCommand(),
++		command.NewLockCommand(),
+ 	)
+ }
+ 

@@ -1,0 +1,53 @@
+commit 735647e6a3b1140b28406131f69655de4bd08919
+Author: Blake Mizerany <blake.mizerany@gmail.com>
+Date:   Wed Aug 27 14:57:29 2014 -0700
+
+    etcdserver/etcdhttp: cancel long requests on conn close
+
+diff --git a/etcdserver2/etcdhttp/http.go b/etcdserver2/etcdhttp/http.go
+index a3f2073..02ac3d9 100644
+--- a/etcdserver2/etcdhttp/http.go
++++ b/etcdserver2/etcdhttp/http.go
+@@ -26,10 +26,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		timeout = DefaultTimeout
+ 	}
+ 
+-	ctx, _ := context.WithTimeout(context.Background(), timeout)
+-	// TODO(bmizerany): watch the closenotify chan in another goroutine can
+-	// call cancel when it closes. be sure to watch ctx.Done() too so we
+-	// don't leak a ton of these goroutines.
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
+ 
+ 	rr, err := parseRequest(r)
+ 	if err != nil {
+@@ -37,6 +35,21 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// avoid spawing goroutines for requests that are short lived.
++	if canBlock(rr) {
++		// cancel the request and release resources associated with it if the
++		// client closes their connection before we get a response.
++		if nf, ok := w.(http.CloseNotifier); ok {
++			go func() {
++				select {
++				case <-nf.CloseNotify():
++					cancel()
++				case <-ctx.Done():
++				}
++			}()
++		}
++	}
++
+ 	resp, err := h.Server.Do(ctx, rr)
+ 	if err != nil {
+ 		// TODO(bmizerany): switch on store errors and etcdserver.ErrUnknownMethod
+@@ -78,3 +91,7 @@ func encodeResponse(ctx context.Context, w http.ResponseWriter, resp etcdserver.
+ 
+ 	return json.NewEncoder(w).Encode(ev)
+ }
++
++func canBlock(r etcdserver.Request) bool {
++	return r.Method != "GET" || (r.Method == "GET" && r.Wait)
++}

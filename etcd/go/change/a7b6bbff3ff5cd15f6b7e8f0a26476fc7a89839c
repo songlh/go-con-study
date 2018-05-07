@@ -1,0 +1,178 @@
+commit a7b6bbff3ff5cd15f6b7e8f0a26476fc7a89839c
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Wed Jan 27 12:11:16 2016 -0800
+
+    tools/benchmark: use clientv3
+
+diff --git a/tools/benchmark/cmd/put.go b/tools/benchmark/cmd/put.go
+index 29d9b11..aa0904e 100644
+--- a/tools/benchmark/cmd/put.go
++++ b/tools/benchmark/cmd/put.go
+@@ -24,7 +24,6 @@ import (
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/cheggaaa/pb"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+ 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
+ )
+ 
+@@ -67,22 +66,14 @@ func putFunc(cmd *cobra.Command, args []string) {
+ 
+ 	k, v := make([]byte, keySize), mustRandBytes(valSize)
+ 
+-	conns := make([]*grpc.ClientConn, totalConns)
+-	for i := range conns {
+-		conns[i] = mustCreateConn()
+-	}
+-
+-	clients := make([]etcdserverpb.KVClient, totalClients)
+-	for i := range clients {
+-		clients[i] = etcdserverpb.NewKVClient(conns[i%int(totalConns)])
+-	}
++	clients := mustCreateClients(totalClients, totalConns)
+ 
+ 	bar.Format("Bom !")
+ 	bar.Start()
+ 
+ 	for i := range clients {
+ 		wg.Add(1)
+-		go doPut(context.Background(), clients[i], requests)
++		go doPut(context.Background(), clients[i].KV, requests)
+ 	}
+ 
+ 	pdoneC := printReport(results)
+diff --git a/tools/benchmark/cmd/range.go b/tools/benchmark/cmd/range.go
+index fd6d150..eb7a839 100644
+--- a/tools/benchmark/cmd/range.go
++++ b/tools/benchmark/cmd/range.go
+@@ -22,7 +22,6 @@ import (
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/cheggaaa/pb"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+ 	"github.com/coreos/etcd/etcdserver/etcdserverpb"
+ )
+ 
+@@ -59,22 +58,14 @@ func rangeFunc(cmd *cobra.Command, args []string) {
+ 	requests := make(chan etcdserverpb.RangeRequest, totalClients)
+ 	bar = pb.New(rangeTotal)
+ 
+-	conns := make([]*grpc.ClientConn, totalConns)
+-	for i := range conns {
+-		conns[i] = mustCreateConn()
+-	}
+-
+-	clients := make([]etcdserverpb.KVClient, totalClients)
+-	for i := range clients {
+-		clients[i] = etcdserverpb.NewKVClient(conns[i%int(totalConns)])
+-	}
++	clients := mustCreateClients(totalClients, totalConns)
+ 
+ 	bar.Format("Bom !")
+ 	bar.Start()
+ 
+ 	for i := range clients {
+ 		wg.Add(1)
+-		go doRange(clients[i], requests)
++		go doRange(clients[i].KV, requests)
+ 	}
+ 
+ 	pdoneC := printReport(results)
+diff --git a/tools/benchmark/cmd/util.go b/tools/benchmark/cmd/util.go
+index 163289e..13de08f 100644
+--- a/tools/benchmark/cmd/util.go
++++ b/tools/benchmark/cmd/util.go
+@@ -20,7 +20,7 @@ import (
+ 	"os"
+ 	"strings"
+ 
+-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
++	"github.com/coreos/etcd/clientv3"
+ )
+ 
+ var (
+@@ -29,16 +29,29 @@ var (
+ 	dialTotal int
+ )
+ 
+-func mustCreateConn() *grpc.ClientConn {
++func mustCreateConn() *clientv3.Client {
+ 	eps := strings.Split(endpoints, ",")
+ 	endpoint := eps[dialTotal%len(eps)]
+ 	dialTotal++
+-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
++	client, err := clientv3.NewFromURL(endpoint)
+ 	if err != nil {
+ 		fmt.Fprintf(os.Stderr, "dial error: %v\n", err)
+ 		os.Exit(1)
+ 	}
+-	return conn
++	return client
++}
++
++func mustCreateClients(totalClients, totalConns uint) []*clientv3.Client {
++	conns := make([]*clientv3.Client, totalConns)
++	for i := range conns {
++		conns[i] = mustCreateConn()
++	}
++
++	clients := make([]*clientv3.Client, totalClients)
++	for i := range clients {
++		clients[i] = conns[i%int(totalConns)].Clone()
++	}
++	return clients
+ }
+ 
+ func mustRandBytes(n int) []byte {
+diff --git a/tools/benchmark/cmd/watch.go b/tools/benchmark/cmd/watch.go
+index 98da8b2..3f3ec0a 100644
+--- a/tools/benchmark/cmd/watch.go
++++ b/tools/benchmark/cmd/watch.go
+@@ -24,7 +24,6 @@ import (
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/cheggaaa/pb"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+ )
+ 
+ // watchCmd represents the watch command
+@@ -72,20 +71,12 @@ func watchFunc(cmd *cobra.Command, args []string) {
+ 
+ 	requests := make(chan etcdserverpb.WatchRequest, totalClients)
+ 
+-	conns := make([]*grpc.ClientConn, totalConns)
+-	for i := range conns {
+-		conns[i] = mustCreateConn()
+-	}
+-
+-	clients := make([]etcdserverpb.WatchClient, totalClients)
+-	for i := range clients {
+-		clients[i] = etcdserverpb.NewWatchClient(conns[i%int(totalConns)])
+-	}
++	clients := mustCreateClients(totalClients, totalConns)
+ 
+ 	streams := make([]etcdserverpb.Watch_WatchClient, watchTotalStreams)
+ 	var err error
+ 	for i := range streams {
+-		streams[i], err = clients[i%int(totalClients)].Watch(context.TODO())
++		streams[i], err = clients[i%len(clients)].Watch.Watch(context.TODO())
+ 		if err != nil {
+ 			fmt.Fprintln(os.Stderr, "Failed to create watch stream:", err)
+ 			os.Exit(1)
+@@ -124,7 +115,6 @@ func watchFunc(cmd *cobra.Command, args []string) {
+ 	<-pdoneC
+ 
+ 	// put phase
+-	kv := etcdserverpb.NewKVClient(conns[0])
+ 	// total number of puts * number of watchers on each key
+ 	eventsTotal := watchPutTotal * (watchTotal / watchedKeyTotal)
+ 
+@@ -138,7 +128,7 @@ func watchFunc(cmd *cobra.Command, args []string) {
+ 
+ 	for i := 0; i < watchPutTotal; i++ {
+ 		wg.Add(1)
+-		go doPut(context.TODO(), kv, putreqc)
++		go doPut(context.TODO(), clients[i%len(clients)].KV, putreqc)
+ 	}
+ 
+ 	pdoneC = printRate(results)

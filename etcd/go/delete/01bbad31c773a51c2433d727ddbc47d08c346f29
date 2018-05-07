@@ -1,0 +1,287 @@
+commit 01bbad31c773a51c2433d727ddbc47d08c346f29
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Mon Oct 14 23:16:48 2013 -0700
+
+    refactor remove web pacakge
+
+diff --git a/web/conn.go b/web/conn.go
+deleted file mode 100644
+index 25e8716..0000000
+--- a/web/conn.go
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package web
+-
+-import (
+-	"code.google.com/p/go.net/websocket"
+-)
+-
+-type connection struct {
+-	// The websocket connection.
+-	ws *websocket.Conn
+-
+-	// Buffered channel of outbound messages.
+-	send chan string
+-}
+-
+-func (c *connection) writer() {
+-	for message := range c.send {
+-		err := websocket.Message.Send(c.ws, message)
+-		if err != nil {
+-			break
+-		}
+-	}
+-	c.ws.Close()
+-}
+-
+-func wsHandler(ws *websocket.Conn) {
+-	c := &connection{send: make(chan string, 256), ws: ws}
+-	h.register <- c
+-	defer func() { h.unregister <- c }()
+-	c.writer()
+-}
+diff --git a/web/file2gostring.sh b/web/file2gostring.sh
+deleted file mode 100755
+index 483b5fd..0000000
+--- a/web/file2gostring.sh
++++ /dev/null
+@@ -1,28 +0,0 @@
+-#!/bin/sh
+-
+-# this file is copied from doozerd. 
+-
+-set -e
+-
+-munge() {
+-    printf %s "$1" | tr . _ | tr -d -c '[:alnum:]_'
+-}
+-
+-quote() {
+-    sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n'
+-}
+-
+-pkg_path=$1 ; shift
+-file=$1     ; shift
+-
+-pkg=`basename $pkg_path`
+-
+-printf 'package %s\n' "$pkg"
+-printf '\n'
+-printf '// This file was generated from %s.\n' "$file"
+-printf '\n'
+-printf 'var '
+-munge "`basename $file`"
+-printf ' string = "'
+-quote
+-printf '"\n'
+\ No newline at end of file
+diff --git a/web/hub.go b/web/hub.go
+deleted file mode 100644
+index 47f203f..0000000
+--- a/web/hub.go
++++ /dev/null
+@@ -1,61 +0,0 @@
+-package web
+-
+-type hub struct {
+-	// status
+-	open bool
+-
+-	// Registered connections.
+-	connections map[*connection]bool
+-
+-	// Inbound messages from the connections.
+-	broadcast chan string
+-
+-	// Register requests from the connections.
+-	register chan *connection
+-
+-	// Unregister requests from connections.
+-	unregister chan *connection
+-}
+-
+-var h = hub{
+-	open:        false,
+-	broadcast:   make(chan string),
+-	register:    make(chan *connection),
+-	unregister:  make(chan *connection),
+-	connections: make(map[*connection]bool),
+-}
+-
+-func Hub() *hub {
+-	return &h
+-}
+-
+-func HubOpen() bool {
+-	return h.open
+-}
+-
+-func (h *hub) run() {
+-	h.open = true
+-	for {
+-		select {
+-		case c := <-h.register:
+-			h.connections[c] = true
+-		case c := <-h.unregister:
+-			delete(h.connections, c)
+-			close(c.send)
+-		case m := <-h.broadcast:
+-			for c := range h.connections {
+-				select {
+-				case c.send <- m:
+-				default:
+-					delete(h.connections, c)
+-					close(c.send)
+-					go c.ws.Close()
+-				}
+-			}
+-		}
+-	}
+-}
+-
+-func (h *hub) Send(msg string) {
+-	h.broadcast <- msg
+-}
+diff --git a/web/index.go b/web/index.go
+deleted file mode 100644
+index 2e30b6d..0000000
+--- a/web/index.go
++++ /dev/null
+@@ -1,5 +0,0 @@
+-package web
+-
+-// This file was generated from index.html.
+-
+-var index_html string = "<html>\n<head>\n<title>etcd Web Interface</title>\n<script type=\"text/javascript\" src=\"//ajax.googleapis.com/ajax/libs/jquery/1.10.1/jquery.min.js\"></script>\n<script type=\"text/javascript\">\n    $(function() {\n\n    var conn;\n    var content = $(\"#content\");\n\n    function update(response) {\n        // if set\n        if (response.action == \"SET\") {\n\n            if (response.expiration > \"1970\") {\n                t = response.key + \"=\" + response.value\n                        + \"  \" + response.expiration\n            } else {\n                t = response.key + \"=\" + response.value\n            }\n\n            id = response.key.replace(new RegExp(\"/\", 'g'), \"\\\\/\");\n\n            if ($(\"#store_\" + id).length == 0) {\n                if (response.expiration > \"1970\") {\n                    t = response.key + \"=\" + response.value\n                        + \"  \" + response.expiration\n                } else {\n                    t = response.key + \"=\" + response.value\n                }\n\n                var e = $('<div id=\"store_' + response.key + '\"/>')\n                    .text(t)\n                e.appendTo(content)\n            }\n            else {\n\n                $(\"#store_\" + id)\n                    .text(t)\n            }\n        }\n        // if delete\n        else if (response.action == \"DELETE\") {\n            id = response.key.replace(new RegExp(\"/\", 'g'), \"\\\\/\");\n\n            $(\"#store_\" + id).remove()\n        }\n    }\n\n\n    if (window[\"WebSocket\"]) {\n        conn = new WebSocket(\"ws://{{.Address}}/ws\");\n        conn.onclose = function(evt) {\n\n        }\n        conn.onmessage = function(evt) {\n            var response = JSON.parse(evt.data)\n            update(response)\n        }\n    } else {\n        appendLog($(\"<div><b>Your browser does not support WebSockets.</b></div>\"))\n    }\n    });\n</script>\n</head>\n<body>\n    <div id=\"leader\">Leader: {{.Leader}}</div>\n    <div id=\"content\"></div>\n</body>\n</html>\n"
+diff --git a/web/index.html b/web/index.html
+deleted file mode 100644
+index 919bc98..0000000
+--- a/web/index.html
++++ /dev/null
+@@ -1,70 +0,0 @@
+-<html>
+-<head>
+-<title>etcd Web Interface</title>
+-<script type="text/javascript" src="//ajax.googleapis.com/ajax/libs/jquery/1.10.1/jquery.min.js"></script>
+-<script type="text/javascript">
+-    $(function() {
+-
+-    var conn;
+-    var content = $("#content");
+-
+-    function update(response) {
+-        // if set
+-        if (response.action == "SET") {
+-
+-            if (response.expiration > "1970") {
+-                t = response.key + "=" + response.value
+-                        + "  " + response.expiration
+-            } else {
+-                t = response.key + "=" + response.value
+-            }
+-
+-            id = response.key.replace(new RegExp("/", 'g'), "\\/");
+-
+-            if ($("#store_" + id).length == 0) {
+-                if (response.expiration > "1970") {
+-                    t = response.key + "=" + response.value
+-                        + "  " + response.expiration
+-                } else {
+-                    t = response.key + "=" + response.value
+-                }
+-
+-                var e = $('<div id="store_' + response.key + '"/>')
+-                    .text(t)
+-                e.appendTo(content)
+-            }
+-            else {
+-
+-                $("#store_" + id)
+-                    .text(t)
+-            }
+-        }
+-        // if delete
+-        else if (response.action == "DELETE") {
+-            id = response.key.replace(new RegExp("/", 'g'), "\\/");
+-
+-            $("#store_" + id).remove()
+-        }
+-    }
+-
+-
+-    if (window["WebSocket"]) {
+-        conn = new WebSocket("ws://{{.Address}}/ws");
+-        conn.onclose = function(evt) {
+-
+-        }
+-        conn.onmessage = function(evt) {
+-            var response = JSON.parse(evt.data)
+-            update(response)
+-        }
+-    } else {
+-        appendLog($("<div><b>Your browser does not support WebSockets.</b></div>"))
+-    }
+-    });
+-</script>
+-</head>
+-<body>
+-    <div id="leader">Leader: {{.Leader}}</div>
+-    <div id="content"></div>
+-</body>
+-</html>
+diff --git a/web/web.go b/web/web.go
+deleted file mode 100644
+index 723eb05..0000000
+--- a/web/web.go
++++ /dev/null
+@@ -1,50 +0,0 @@
+-package web
+-
+-import (
+-	"code.google.com/p/go.net/websocket"
+-	"fmt"
+-	"github.com/coreos/go-raft"
+-	"html/template"
+-	"net/http"
+-	"net/url"
+-)
+-
+-var mainTempl *template.Template
+-var mainPage *MainPage
+-
+-type MainPage struct {
+-	Leader  string
+-	Address string
+-}
+-
+-func mainHandler(c http.ResponseWriter, req *http.Request) {
+-	p := mainPage
+-
+-	mainTempl.Execute(c, p)
+-}
+-
+-func Start(raftServer raft.Server, webURL string) {
+-	u, _ := url.Parse(webURL)
+-
+-	webMux := http.NewServeMux()
+-
+-	server := &http.Server{
+-		Handler: webMux,
+-		Addr:    u.Host,
+-	}
+-
+-	mainPage = &MainPage{
+-		Leader:  raftServer.Leader(),
+-		Address: u.Host,
+-	}
+-
+-	mainTempl = template.Must(template.New("index.html").Parse(index_html))
+-
+-	go h.run()
+-	webMux.HandleFunc("/", mainHandler)
+-	webMux.Handle("/ws", websocket.Handler(wsHandler))
+-
+-	fmt.Printf("etcd web server [%s] listening on %s\n", raftServer.Name(), u)
+-
+-	server.ListenAndServe()
+-}

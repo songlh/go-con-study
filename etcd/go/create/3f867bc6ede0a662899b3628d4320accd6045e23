@@ -1,0 +1,172 @@
+commit 3f867bc6ede0a662899b3628d4320accd6045e23
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Sat Mar 28 11:46:22 2015 -0700
+
+    raft: node bench matches reality
+
+diff --git a/raft/node_bench_test.go b/raft/node_bench_test.go
+index 9175cb8..dcb967b 100644
+--- a/raft/node_bench_test.go
++++ b/raft/node_bench_test.go
+@@ -16,6 +16,7 @@ package raft
+ 
+ import (
+ 	"testing"
++	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+ )
+@@ -32,14 +33,20 @@ func BenchmarkOneNode(b *testing.B) {
+ 	defer n.Stop()
+ 
+ 	n.Campaign(ctx)
+-	for i := 0; i < b.N; i++ {
++	go func() {
++		for i := 0; i < b.N; i++ {
++			n.Propose(ctx, []byte("foo"))
++		}
++	}()
++
++	for {
+ 		rd := <-n.Ready()
+ 		s.Append(rd.Entries)
++		// a reasonable disk sync latency
++		time.Sleep(1 * time.Millisecond)
+ 		n.Advance()
+-		n.Propose(ctx, []byte("foo"))
+-	}
+-	rd := <-n.Ready()
+-	if rd.HardState.Commit != uint64(b.N+1) {
+-		b.Errorf("commit = %d, want %d", rd.HardState.Commit, b.N+1)
++		if rd.HardState.Commit == uint64(b.N+1) {
++			return
++		}
+ 	}
+ }
+diff --git a/raft/rafttest/node.go b/raft/rafttest/node.go
+index 6071b3d..f5d6c7e 100644
+--- a/raft/rafttest/node.go
++++ b/raft/rafttest/node.go
+@@ -23,7 +23,15 @@ type node struct {
+ 
+ func startNode(id uint64, peers []raft.Peer, iface iface) *node {
+ 	st := raft.NewMemoryStorage()
+-	rn := raft.StartNode(id, peers, 10, 1, st)
++	c := &raft.Config{
++		ID:              id,
++		ElectionTick:    10,
++		HeartbeatTick:   1,
++		Storage:         st,
++		MaxSizePerMsg:   1024 * 1024,
++		MaxInflightMsgs: 256,
++	}
++	rn := raft.StartNode(c, peers)
+ 	n := &node{
+ 		Node:    rn,
+ 		id:      id,
+@@ -50,6 +58,7 @@ func (n *node) start() {
+ 					n.storage.SetHardState(n.state)
+ 				}
+ 				n.storage.Append(rd.Entries)
++				time.Sleep(time.Millisecond)
+ 				// TODO: make send async, more like real world...
+ 				for _, m := range rd.Messages {
+ 					n.iface.send(m)
+@@ -96,7 +105,15 @@ func (n *node) stop() {
+ func (n *node) restart() {
+ 	// wait for the shutdown
+ 	<-n.stopc
+-	n.Node = raft.RestartNode(n.id, 10, 1, n.storage, 0)
++	c := &raft.Config{
++		ID:              n.id,
++		ElectionTick:    10,
++		HeartbeatTick:   1,
++		Storage:         n.storage,
++		MaxSizePerMsg:   1024 * 1024,
++		MaxInflightMsgs: 256,
++	}
++	n.Node = raft.RestartNode(c)
+ 	n.start()
+ 	n.iface.connect()
+ }
+diff --git a/raft/rafttest/node_bench_test.go b/raft/rafttest/node_bench_test.go
+new file mode 100644
+index 0000000..afdb353
+--- /dev/null
++++ b/raft/rafttest/node_bench_test.go
+@@ -0,0 +1,39 @@
++package rafttest
++
++import (
++	"testing"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/raft"
++)
++
++func BenchmarkProposal3Nodes(b *testing.B) {
++	peers := []raft.Peer{{1, nil}, {2, nil}, {3, nil}}
++	nt := newRaftNetwork(1, 2, 3)
++
++	nodes := make([]*node, 0)
++
++	for i := 1; i <= 3; i++ {
++		n := startNode(uint64(i), peers, nt.nodeNetwork(uint64(i)))
++		nodes = append(nodes, n)
++	}
++	// get ready and warm up
++	time.Sleep(50 * time.Millisecond)
++
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		nodes[0].Propose(context.TODO(), []byte("somedata"))
++	}
++
++	for _, n := range nodes {
++		if n.state.Commit != uint64(b.N+4) {
++			continue
++		}
++	}
++	b.StopTimer()
++
++	for _, n := range nodes {
++		n.stop()
++	}
++}
+diff --git a/raft/rafttest/node_test.go b/raft/rafttest/node_test.go
+index 37c80d9..a705d93 100644
+--- a/raft/rafttest/node_test.go
++++ b/raft/rafttest/node_test.go
+@@ -19,16 +19,17 @@ func TestBasicProgress(t *testing.T) {
+ 		nodes = append(nodes, n)
+ 	}
+ 
+-	time.Sleep(50 * time.Millisecond)
+-	for i := 0; i < 1000; i++ {
++	time.Sleep(10 * time.Millisecond)
++
++	for i := 0; i < 10000; i++ {
+ 		nodes[0].Propose(context.TODO(), []byte("somedata"))
+ 	}
+ 
+-	time.Sleep(100 * time.Millisecond)
++	time.Sleep(500 * time.Millisecond)
+ 	for _, n := range nodes {
+ 		n.stop()
+-		if n.state.Commit != 1006 {
+-			t.Errorf("commit = %d, want = 1006", n.state.Commit)
++		if n.state.Commit != 10006 {
++			t.Errorf("commit = %d, want = 10006", n.state.Commit)
+ 		}
+ 	}
+ }
+@@ -63,7 +64,7 @@ func TestRestart(t *testing.T) {
+ 	nodes[1].restart()
+ 
+ 	// give some time for nodes to catch up with the raft leader
+-	time.Sleep(300 * time.Millisecond)
++	time.Sleep(500 * time.Millisecond)
+ 	for _, n := range nodes {
+ 		n.stop()
+ 		if n.state.Commit != 1206 {

@@ -1,0 +1,777 @@
+commit 47f24d1088954014f92586a42634a1585a1ca956
+Author: Brian Waldon <bcwaldon@gmail.com>
+Date:   Tue Jan 21 11:18:36 2014 -0800
+
+    bump(github.com/coreos/raft): bf7accb84ce4fe446983abffe00dd18a6b8cbc18
+
+diff --git a/third_party/src/github.com/coreos/raft/README.md b/third_party/src/github.com/coreos/raft/README.md
+index 5486cc5..13e0c84 100644
+--- a/third_party/src/github.com/coreos/raft/README.md
++++ b/third_party/src/github.com/coreos/raft/README.md
+@@ -1,8 +1,6 @@
+-go-raft
++go-raft [![Build Status](https://drone.io/github.com/goraft/raft/status.png)](https://drone.io/github.com/goraft/raft/latest) [![Coverage Status](https://coveralls.io/repos/goraft/raft/badge.png?branch=master)](https://coveralls.io/r/goraft/raft?branch=master)
+ =======
+ 
+-[![Build Status](https://travis-ci.org/goraft/raft.png?branch=master)](https://travis-ci.org/goraft/raft)
+-
+ ## Overview
+ 
+ This is a Go implementation of the Raft distributed consensus protocol.
+diff --git a/third_party/src/github.com/coreos/raft/event.go b/third_party/src/github.com/coreos/raft/event.go
+index 649a115..d6cc3d0 100644
+--- a/third_party/src/github.com/coreos/raft/event.go
++++ b/third_party/src/github.com/coreos/raft/event.go
+@@ -9,6 +9,8 @@ const (
+ 
+ 	HeartbeatTimeoutEventType         = "heartbeatTimeout"
+ 	ElectionTimeoutThresholdEventType = "electionTimeoutThreshold"
++
++	HeartbeatEventType = "heartbeat"
+ )
+ 
+ // Event represents an action that occurred within the Raft library.
+diff --git a/third_party/src/github.com/coreos/raft/http_transporter.go b/third_party/src/github.com/coreos/raft/http_transporter.go
+index a74a5d6..1ab06dd 100644
+--- a/third_party/src/github.com/coreos/raft/http_transporter.go
++++ b/third_party/src/github.com/coreos/raft/http_transporter.go
+@@ -5,6 +5,8 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
++	"path"
+ )
+ 
+ // Parts from this transporter were heavily influenced by Peter Bougon's
+@@ -19,12 +21,14 @@ import (
+ // An HTTPTransporter is a default transport layer used to communicate between
+ // multiple servers.
+ type HTTPTransporter struct {
+-	DisableKeepAlives bool
+-	prefix            string
+-	appendEntriesPath string
+-	requestVotePath   string
+-	httpClient        http.Client
+-	Transport         *http.Transport
++	DisableKeepAlives    bool
++	prefix               string
++	appendEntriesPath    string
++	requestVotePath      string
++	snapshotPath         string
++	snapshotRecoveryPath string
++	httpClient           http.Client
++	Transport            *http.Transport
+ }
+ 
+ type HTTPMuxer interface {
+@@ -40,11 +44,13 @@ type HTTPMuxer interface {
+ // Creates a new HTTP transporter with the given path prefix.
+ func NewHTTPTransporter(prefix string) *HTTPTransporter {
+ 	t := &HTTPTransporter{
+-		DisableKeepAlives: false,
+-		prefix:            prefix,
+-		appendEntriesPath: fmt.Sprintf("%s%s", prefix, "/appendEntries"),
+-		requestVotePath:   fmt.Sprintf("%s%s", prefix, "/requestVote"),
+-		Transport:         &http.Transport{DisableKeepAlives: false},
++		DisableKeepAlives:    false,
++		prefix:               prefix,
++		appendEntriesPath:    joinPath(prefix, "/appendEntries"),
++		requestVotePath:      joinPath(prefix, "/requestVote"),
++		snapshotPath:         joinPath(prefix, "/snapshot"),
++		snapshotRecoveryPath: joinPath(prefix, "/snapshotRecovery"),
++		Transport:            &http.Transport{DisableKeepAlives: false},
+ 	}
+ 	t.httpClient.Transport = t.Transport
+ 	return t
+@@ -71,6 +77,16 @@ func (t *HTTPTransporter) RequestVotePath() string {
+ 	return t.requestVotePath
+ }
+ 
++// Retrieves the Snapshot path.
++func (t *HTTPTransporter) SnapshotPath() string {
++	return t.snapshotPath
++}
++
++// Retrieves the SnapshotRecovery path.
++func (t *HTTPTransporter) SnapshotRecoveryPath() string {
++	return t.snapshotRecoveryPath
++}
++
+ //------------------------------------------------------------------------------
+ //
+ // Methods
+@@ -85,6 +101,8 @@ func (t *HTTPTransporter) RequestVotePath() string {
+ func (t *HTTPTransporter) Install(server Server, mux HTTPMuxer) {
+ 	mux.HandleFunc(t.AppendEntriesPath(), t.appendEntriesHandler(server))
+ 	mux.HandleFunc(t.RequestVotePath(), t.requestVoteHandler(server))
++	mux.HandleFunc(t.SnapshotPath(), t.snapshotHandler(server))
++	mux.HandleFunc(t.SnapshotRecoveryPath(), t.snapshotRecoveryHandler(server))
+ }
+ 
+ //--------------------------------------
+@@ -99,7 +117,7 @@ func (t *HTTPTransporter) SendAppendEntriesRequest(server Server, peer *Peer, re
+ 		return nil
+ 	}
+ 
+-	url := fmt.Sprintf("%s%s", peer.ConnectionString, t.AppendEntriesPath())
++	url := joinPath(peer.ConnectionString, t.AppendEntriesPath())
+ 	traceln(server.Name(), "POST", url)
+ 
+ 	t.Transport.ResponseHeaderTimeout = server.ElectionTimeout()
+@@ -146,14 +164,67 @@ func (t *HTTPTransporter) SendVoteRequest(server Server, peer *Peer, req *Reques
+ 	return resp
+ }
+ 
++func joinPath(connectionString, thePath string) string {
++	u, err := url.Parse(connectionString)
++	if err != nil {
++		panic(err)
++	}
++	u.Path = path.Join(u.Path, thePath)
++	return u.String()
++}
++
+ // Sends a SnapshotRequest RPC to a peer.
+ func (t *HTTPTransporter) SendSnapshotRequest(server Server, peer *Peer, req *SnapshotRequest) *SnapshotResponse {
+-	return nil
++	var b bytes.Buffer
++	if _, err := req.Encode(&b); err != nil {
++		traceln("transporter.rv.encoding.error:", err)
++		return nil
++	}
++
++	url := joinPath(peer.ConnectionString, t.snapshotPath)
++	traceln(server.Name(), "POST", url)
++
++	httpResp, err := t.httpClient.Post(url, "application/protobuf", &b)
++	if httpResp == nil || err != nil {
++		traceln("transporter.rv.response.error:", err)
++		return nil
++	}
++	defer httpResp.Body.Close()
++
++	resp := &SnapshotResponse{}
++	if _, err = resp.Decode(httpResp.Body); err != nil && err != io.EOF {
++		traceln("transporter.rv.decoding.error:", err)
++		return nil
++	}
++
++	return resp
+ }
+ 
+ // Sends a SnapshotRequest RPC to a peer.
+ func (t *HTTPTransporter) SendSnapshotRecoveryRequest(server Server, peer *Peer, req *SnapshotRecoveryRequest) *SnapshotRecoveryResponse {
+-	return nil
++	var b bytes.Buffer
++	if _, err := req.Encode(&b); err != nil {
++		traceln("transporter.rv.encoding.error:", err)
++		return nil
++	}
++
++	url := joinPath(peer.ConnectionString, t.snapshotRecoveryPath)
++	traceln(server.Name(), "POST", url)
++
++	httpResp, err := t.httpClient.Post(url, "application/protobuf", &b)
++	if httpResp == nil || err != nil {
++		traceln("transporter.rv.response.error:", err)
++		return nil
++	}
++	defer httpResp.Body.Close()
++
++	resp := &SnapshotRecoveryResponse{}
++	if _, err = resp.Decode(httpResp.Body); err != nil && err != io.EOF {
++		traceln("transporter.rv.decoding.error:", err)
++		return nil
++	}
++
++	return resp
+ }
+ 
+ //--------------------------------------
+@@ -197,3 +268,41 @@ func (t *HTTPTransporter) requestVoteHandler(server Server) http.HandlerFunc {
+ 		}
+ 	}
+ }
++
++// Handles incoming Snapshot requests.
++func (t *HTTPTransporter) snapshotHandler(server Server) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		traceln(server.Name(), "RECV /snapshot")
++
++		req := &SnapshotRequest{}
++		if _, err := req.Decode(r.Body); err != nil {
++			http.Error(w, "", http.StatusBadRequest)
++			return
++		}
++
++		resp := server.RequestSnapshot(req)
++		if _, err := resp.Encode(w); err != nil {
++			http.Error(w, "", http.StatusInternalServerError)
++			return
++		}
++	}
++}
++
++// Handles incoming SnapshotRecovery requests.
++func (t *HTTPTransporter) snapshotRecoveryHandler(server Server) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		traceln(server.Name(), "RECV /snapshotRecovery")
++
++		req := &SnapshotRecoveryRequest{}
++		if _, err := req.Decode(r.Body); err != nil {
++			http.Error(w, "", http.StatusBadRequest)
++			return
++		}
++
++		resp := server.SnapshotRecoveryRequest(req)
++		if _, err := resp.Encode(w); err != nil {
++			http.Error(w, "", http.StatusInternalServerError)
++			return
++		}
++	}
++}
+diff --git a/third_party/src/github.com/coreos/raft/log.go b/third_party/src/github.com/coreos/raft/log.go
+index f137ecf..89f1b03 100644
+--- a/third_party/src/github.com/coreos/raft/log.go
++++ b/third_party/src/github.com/coreos/raft/log.go
+@@ -206,6 +206,11 @@ func (l *Log) close() {
+ 	l.entries = make([]*LogEntry, 0)
+ }
+ 
++// sync to disk
++func (l *Log) sync() error {
++	return l.file.Sync()
++}
++
+ //--------------------------------------
+ // Entries
+ //--------------------------------------
+@@ -262,7 +267,7 @@ func (l *Log) getEntriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*
+ 	entries := l.entries[index-l.startIndex:]
+ 	length := len(entries)
+ 
+-	traceln("log.entriesAfter: startIndex:", l.startIndex, " lenght", len(l.entries))
++	traceln("log.entriesAfter: startIndex:", l.startIndex, " length", len(l.entries))
+ 
+ 	if uint64(length) < maxLogEntriesPerRequest {
+ 		// Determine the term at the given entry and return a subslice.
+@@ -336,7 +341,7 @@ func (l *Log) setCommitIndex(index uint64) error {
+ 	// Do not allow previous indices to be committed again.
+ 
+ 	// This could happens, since the guarantee is that the new leader has up-to-dated
+-	// log entires rather than has most up-to-dated committed index
++	// log entries rather than has most up-to-dated committed index
+ 
+ 	// For example, Leader 1 send log 80 to follower 2 and follower 3
+ 	// follower 2 and follow 3 all got the new entries and reply
+@@ -368,7 +373,7 @@ func (l *Log) setCommitIndex(index uint64) error {
+ 
+ 		// Apply the changes to the state machine and store the error code.
+ 		returnValue, err := l.ApplyFunc(command)
+-		debugln("setCommitIndex.set.result index: ", entryIndex)
++		debugf("setCommitIndex.set.result index: %v, entries index: %v", i, entryIndex)
+ 		if entry.event != nil {
+ 			entry.event.returnValue = returnValue
+ 			entry.event.c <- err
+@@ -477,7 +482,7 @@ func (l *Log) appendEntries(entries []*LogEntry) error {
+ 		startPosition += size
+ 	}
+ 	w.Flush()
+-	err = l.file.Sync()
++	err = l.sync()
+ 
+ 	if err != nil {
+ 		panic(err)
+@@ -573,7 +578,8 @@ func (l *Log) compact(index uint64, term uint64) error {
+ 	}
+ 
+ 	// create a new log file and add all the entries
+-	file, err := os.OpenFile(l.path+".new", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
++	new_file_path := l.path + ".new"
++	file, err := os.OpenFile(new_file_path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -582,25 +588,27 @@ func (l *Log) compact(index uint64, term uint64) error {
+ 		entry.Position = position
+ 
+ 		if _, err = entry.encode(file); err != nil {
++			file.Close()
++			os.Remove(new_file_path)
+ 			return err
+ 		}
+ 	}
+-	// close the current log file
+-	l.file.Close()
++	file.Sync()
+ 
+-	// remove the current log file to .bak
+-	err = os.Remove(l.path)
+-	if err != nil {
+-		return err
+-	}
++	old_file := l.file
+ 
+ 	// rename the new log file
+-	err = os.Rename(l.path+".new", l.path)
++	err = os.Rename(new_file_path, l.path)
+ 	if err != nil {
++		file.Close()
++		os.Remove(new_file_path)
+ 		return err
+ 	}
+ 	l.file = file
+ 
++	// close the old log file
++	old_file.Close()
++
+ 	// compaction the in memory log
+ 	l.entries = entries
+ 	l.startIndex = index
+diff --git a/third_party/src/github.com/coreos/raft/peer.go b/third_party/src/github.com/coreos/raft/peer.go
+index 1a0f205..e5ef08c 100644
+--- a/third_party/src/github.com/coreos/raft/peer.go
++++ b/third_party/src/github.com/coreos/raft/peer.go
+@@ -79,7 +79,7 @@ func (p *Peer) setPrevLogIndex(value uint64) {
+ 
+ // Starts the peer heartbeat.
+ func (p *Peer) startHeartbeat() {
+-	p.stopChan = make(chan bool, 1)
++	p.stopChan = make(chan bool)
+ 	c := make(chan bool)
+ 	go p.heartbeat(c)
+ 	<-c
+@@ -87,17 +87,7 @@ func (p *Peer) startHeartbeat() {
+ 
+ // Stops the peer heartbeat.
+ func (p *Peer) stopHeartbeat(flush bool) {
+-	// here is a problem
+-	// the previous stop is no buffer leader may get blocked
+-	// when heartbeat returns
+-	// I make the channel with 1 buffer
+-	// and try to panic here
+-	select {
+-	case p.stopChan <- flush:
+-
+-	default:
+-		panic("[" + p.server.Name() + "] cannot stop [" + p.Name + "] heartbeat")
+-	}
++	p.stopChan <- flush
+ }
+ 
+ //--------------------------------------
+@@ -140,18 +130,21 @@ func (p *Peer) heartbeat(c chan bool) {
+ 				// before we can safely remove a node
+ 				// we must flush the remove command to the node first
+ 				p.flush()
+-				debugln("peer.heartbeat.stop: ", p.Name)
++				debugln("peer.heartbeat.stop.with.flush: ", p.Name)
+ 				return
+ 			}
+ 
+ 		case <-ticker:
++			start := time.Now()
+ 			p.flush()
++			duration := time.Now().Sub(start)
++			p.server.DispatchEvent(newEvent(HeartbeatEventType, duration, nil))
+ 		}
+ 	}
+ }
+ 
+ func (p *Peer) flush() {
+-	debugln("peer.heartbeat.run: ", p.Name)
++	debugln("peer.heartbeat.flush: ", p.Name)
+ 	prevLogIndex := p.getPrevLogIndex()
+ 	entries, prevLogTerm := p.server.log.getEntriesAfter(prevLogIndex, p.server.maxLogEntriesPerRequest)
+ 
+@@ -172,15 +165,16 @@ func (p *Peer) flush() {
+ 
+ // Sends an AppendEntries request to the peer through the transport.
+ func (p *Peer) sendAppendEntriesRequest(req *AppendEntriesRequest) {
+-	traceln("peer.flush.send: ", p.server.Name(), "->", p.Name, " ", len(req.Entries))
++	tracef("peer.append.send: %s->%s [prevLog:%v length: %v]\n",
++		p.server.Name(), p.Name, req.PrevLogIndex, len(req.Entries))
+ 
+ 	resp := p.server.Transporter().SendAppendEntriesRequest(p.server, p, req)
+ 	if resp == nil {
+ 		p.server.DispatchEvent(newEvent(HeartbeatTimeoutEventType, p, nil))
+-		debugln("peer.flush.timeout: ", p.server.Name(), "->", p.Name)
++		debugln("peer.append.timeout: ", p.server.Name(), "->", p.Name)
+ 		return
+ 	}
+-	traceln("peer.flush.recv: ", p.Name)
++	traceln("peer.append.resp: ", p.server.Name(), "<-", p.Name)
+ 
+ 	// If successful then update the previous log index.
+ 	p.mutex.Lock()
+@@ -194,21 +188,22 @@ func (p *Peer) sendAppendEntriesRequest(req *AppendEntriesRequest) {
+ 				resp.append = true
+ 			}
+ 		}
+-		traceln("peer.flush.success: ", p.server.Name(), "->", p.Name, "; idx =", p.prevLogIndex)
+-
++		traceln("peer.append.resp.success: ", p.Name, "; idx =", p.prevLogIndex)
+ 		// If it was unsuccessful then decrement the previous log index and
+ 		// we'll try again next time.
+ 	} else {
+ 		if resp.CommitIndex >= p.prevLogIndex {
+-
+ 			// we may miss a response from peer
+-			// so maybe the peer has commited the logs we sent
+-			// but we did not receive the success reply and did not increase
++			// so maybe the peer has committed the logs we just sent
++			// but we did not receive the successful reply and did not increase
+ 			// the prevLogIndex
+ 
++			// peer failed to truncate the log and sent a fail reply at this time
++			// we just need to update peer's prevLog index to commitIndex
++
+ 			p.prevLogIndex = resp.CommitIndex
++			debugln("peer.append.resp.update: ", p.Name, "; idx =", p.prevLogIndex)
+ 
+-			debugln("peer.flush.commitIndex: ", p.server.Name(), "->", p.Name, " idx =", p.prevLogIndex)
+ 		} else if p.prevLogIndex > 0 {
+ 			// Decrement the previous log index down until we find a match. Don't
+ 			// let it go below where the peer's commit index is though. That's a
+@@ -219,7 +214,7 @@ func (p *Peer) sendAppendEntriesRequest(req *AppendEntriesRequest) {
+ 				p.prevLogIndex = resp.Index
+ 			}
+ 
+-			debugln("peer.flush.decrement: ", p.server.Name(), "->", p.Name, " idx =", p.prevLogIndex)
++			debugln("peer.append.resp.decrement: ", p.Name, "; idx =", p.prevLogIndex)
+ 		}
+ 	}
+ 	p.mutex.Unlock()
+@@ -227,7 +222,7 @@ func (p *Peer) sendAppendEntriesRequest(req *AppendEntriesRequest) {
+ 	// Attach the peer to resp, thus server can know where it comes from
+ 	resp.peer = p.Name
+ 	// Send response to server for processing.
+-	p.server.send(resp)
++	p.server.sendAsync(resp)
+ }
+ 
+ // Sends an Snapshot request to the peer through the transport.
+@@ -271,7 +266,7 @@ func (p *Peer) sendSnapshotRecoveryRequest() {
+ 		return
+ 	}
+ 	// Send response to server for processing.
+-	p.server.send(&AppendEntriesResponse{Term: resp.Term, Success: resp.Success, append: (resp.Term == p.server.currentTerm)})
++	p.server.sendAsync(&AppendEntriesResponse{Term: resp.Term, Success: resp.Success, append: (resp.Term == p.server.currentTerm)})
+ }
+ 
+ //--------------------------------------
+@@ -283,8 +278,10 @@ func (p *Peer) sendVoteRequest(req *RequestVoteRequest, c chan *RequestVoteRespo
+ 	debugln("peer.vote: ", p.server.Name(), "->", p.Name)
+ 	req.peer = p
+ 	if resp := p.server.Transporter().SendVoteRequest(p.server, p, req); resp != nil {
+-		debugln("peer.vote: recv", p.server.Name(), "<-", p.Name)
++		debugln("peer.vote.recv: ", p.server.Name(), "<-", p.Name)
+ 		resp.peer = p
+ 		c <- resp
++	} else {
++		debugln("peer.vote.failed: ", p.server.Name(), "<-", p.Name)
+ 	}
+ }
+diff --git a/third_party/src/github.com/coreos/raft/server.go b/third_party/src/github.com/coreos/raft/server.go
+index 4513196..f60a80c 100644
+--- a/third_party/src/github.com/coreos/raft/server.go
++++ b/third_party/src/github.com/coreos/raft/server.go
+@@ -119,6 +119,7 @@ type server struct {
+ 	mutex      sync.RWMutex
+ 	syncedPeer map[string]bool
+ 
++	stopped          chan bool
+ 	c                chan *ev
+ 	electionTimeout  time.Duration
+ 	heartbeatTimeout time.Duration
+@@ -166,6 +167,7 @@ func NewServer(name string, path string, transporter Transporter, stateMachine S
+ 		state:                   Stopped,
+ 		peers:                   make(map[string]*Peer),
+ 		log:                     newLog(),
++		stopped:                 make(chan bool),
+ 		c:                       make(chan *ev, 256),
+ 		electionTimeout:         DefaultElectionTimeout,
+ 		heartbeatTimeout:        DefaultHeartbeatTimeout,
+@@ -279,6 +281,7 @@ func (s *server) setState(state string) {
+ 	s.state = state
+ 	if state == Leader {
+ 		s.leader = s.Name()
++		s.syncedPeer = make(map[string]bool)
+ 	}
+ 
+ 	// Dispatch state and leader change events.
+@@ -463,8 +466,9 @@ func (s *server) Start() error {
+ // Shuts down the server.
+ func (s *server) Stop() {
+ 	s.send(&stopValue)
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
++
++	// make sure the server has stopped before we close the log
++	<-s.stopped
+ 	s.log.close()
+ }
+ 
+@@ -553,6 +557,7 @@ func (s *server) loop() {
+ 			s.snapshotLoop()
+ 
+ 		case Stopped:
++			s.stopped <- true
+ 			return
+ 		}
+ 	}
+@@ -561,15 +566,26 @@ func (s *server) loop() {
+ // Sends an event to the event loop to be processed. The function will wait
+ // until the event is actually processed before returning.
+ func (s *server) send(value interface{}) (interface{}, error) {
+-	event := s.sendAsync(value)
++	event := &ev{target: value, c: make(chan error, 1)}
++	s.c <- event
+ 	err := <-event.c
+ 	return event.returnValue, err
+ }
+ 
+-func (s *server) sendAsync(value interface{}) *ev {
++func (s *server) sendAsync(value interface{}) {
+ 	event := &ev{target: value, c: make(chan error, 1)}
+-	s.c <- event
+-	return event
++	// try a non-blocking send first
++	// in most cases, this should not be blocking
++	// avoid create unnecessary go routines
++	select {
++	case s.c <- event:
++		return
++	default:
++	}
++
++	go func() {
++		s.c <- event
++	}()
+ }
+ 
+ // The event loop that is run when the server is in a Follower state.
+@@ -578,7 +594,6 @@ func (s *server) sendAsync(value interface{}) *ev {
+ //   1.Receiving valid AppendEntries RPC, or
+ //   2.Granting vote to candidate
+ func (s *server) followerLoop() {
+-
+ 	s.setState(Follower)
+ 	since := time.Now()
+ 	electionTimeout := s.ElectionTimeout()
+@@ -739,7 +754,6 @@ func (s *server) candidateLoop() {
+ // The event loop that is run when the server is in a Leader state.
+ func (s *server) leaderLoop() {
+ 	s.setState(Leader)
+-	s.syncedPeer = make(map[string]bool)
+ 	logIndex, _ := s.log.lastInfo()
+ 
+ 	// Update the peers prevLogIndex to leader's lastLogIndex and start heartbeat.
+@@ -786,6 +800,7 @@ func (s *server) leaderLoop() {
+ 	for _, peer := range s.peers {
+ 		peer.stopHeartbeat(false)
+ 	}
++
+ 	s.syncedPeer = nil
+ }
+ 
+@@ -851,19 +866,12 @@ func (s *server) processCommand(command Command, e *ev) {
+ 		return
+ 	}
+ 
+-	// Issue an append entries response for the server.
+-	resp := newAppendEntriesResponse(s.currentTerm, true, s.log.currentIndex(), s.log.CommitIndex())
+-	resp.append = true
+-	resp.peer = s.Name()
+-
+-	// this must be async
+-	// sendAsync is not really async every time
+-	// when the sending speed of the user is larger than
+-	// the processing speed of the server, the buffered channel
+-	// will be full. Then sendAsync will become sync, which will
+-	// cause deadlock here.
+-	// so we use a goroutine to avoid the deadlock
+-	go s.sendAsync(resp)
++	s.syncedPeer[s.Name()] = true
++	if len(s.peers) == 0 {
++		commitIndex := s.log.currentIndex()
++		s.log.setCommitIndex(commitIndex)
++		s.debugln("commit index ", commitIndex)
++	}
+ }
+ 
+ //--------------------------------------
+@@ -879,7 +887,6 @@ func (s *server) AppendEntries(req *AppendEntriesRequest) *AppendEntriesResponse
+ 
+ // Processes the "append entries" request.
+ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*AppendEntriesResponse, bool) {
+-
+ 	s.traceln("server.ae.process")
+ 
+ 	if req.Term < s.currentTerm {
+@@ -908,7 +915,7 @@ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*Append
+ 		return newAppendEntriesResponse(s.currentTerm, false, s.log.currentIndex(), s.log.CommitIndex()), true
+ 	}
+ 
+-	// once the server appended and commited all the log entries from the leader
++	// once the server appended and committed all the log entries from the leader
+ 
+ 	return newAppendEntriesResponse(s.currentTerm, true, s.log.currentIndex(), s.log.CommitIndex()), true
+ }
+@@ -953,6 +960,8 @@ func (s *server) processAppendEntriesResponse(resp *AppendEntriesResponse) {
+ 	committedIndex := s.log.commitIndex
+ 
+ 	if commitIndex > committedIndex {
++		// leader needs to do a fsync before committing log entries
++		s.log.sync()
+ 		s.log.setCommitIndex(commitIndex)
+ 		s.debugln("commit index ", commitIndex)
+ 	}
+@@ -976,7 +985,7 @@ func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (*RequestVot
+ 
+ 	// If the request is coming from an old term then reject it.
+ 	if req.Term < s.Term() {
+-		s.debugln("server.rv.error: stale term")
++		s.debugln("server.rv.deny.vote: cause stale term")
+ 		return newRequestVoteResponse(s.currentTerm, false), false
+ 	}
+ 
+@@ -984,7 +993,7 @@ func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (*RequestVot
+ 
+ 	// If we've already voted for a different candidate then don't vote for this candidate.
+ 	if s.votedFor != "" && s.votedFor != req.CandidateName {
+-		s.debugln("server.rv.error: duplicate vote: ", req.CandidateName,
++		s.debugln("server.deny.vote: cause duplicate vote: ", req.CandidateName,
+ 			" already vote for ", s.votedFor)
+ 		return newRequestVoteResponse(s.currentTerm, false), false
+ 	}
+@@ -992,7 +1001,7 @@ func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (*RequestVot
+ 	// If the candidate's log is not at least as up-to-date as our last log then don't vote.
+ 	lastIndex, lastTerm := s.log.lastInfo()
+ 	if lastIndex > req.LastLogIndex || lastTerm > req.LastLogTerm {
+-		s.debugln("server.rv.error: out of date log: ", req.CandidateName,
++		s.debugln("server.deny.vote: cause out of date log: ", req.CandidateName,
+ 			"Index :[", lastIndex, "]", " [", req.LastLogIndex, "]",
+ 			"Term :[", lastTerm, "]", " [", req.LastLogTerm, "]")
+ 		return newRequestVoteResponse(s.currentTerm, false), false
+@@ -1322,7 +1331,7 @@ func (s *server) writeConf() {
+ 	confPath := path.Join(s.path, "conf")
+ 	tmpConfPath := path.Join(s.path, "conf.tmp")
+ 
+-	err := ioutil.WriteFile(tmpConfPath, b, 0600)
++	err := writeFileSynced(tmpConfPath, b, 0600)
+ 
+ 	if err != nil {
+ 		panic(err)
+@@ -1359,9 +1368,13 @@ func (s *server) readConf() error {
+ //--------------------------------------
+ 
+ func (s *server) debugln(v ...interface{}) {
+-	debugf("[%s Term:%d] %s", s.name, s.Term(), fmt.Sprintln(v...))
++	if logLevel > Debug {
++		debugf("[%s Term:%d] %s", s.name, s.Term(), fmt.Sprintln(v...))
++	}
+ }
+ 
+ func (s *server) traceln(v ...interface{}) {
+-	tracef("[%s] %s", s.name, fmt.Sprintln(v...))
++	if logLevel > Trace {
++		tracef("[%s] %s", s.name, fmt.Sprintln(v...))
++	}
+ }
+diff --git a/third_party/src/github.com/coreos/raft/server_test.go b/third_party/src/github.com/coreos/raft/server_test.go
+index 3ac3681..4994fae 100644
+--- a/third_party/src/github.com/coreos/raft/server_test.go
++++ b/third_party/src/github.com/coreos/raft/server_test.go
+@@ -501,7 +501,19 @@ func TestServerMultiNode(t *testing.T) {
+ 		clonedReq := &RequestVoteRequest{}
+ 		json.Unmarshal(b, clonedReq)
+ 
+-		return target.RequestVote(clonedReq)
++		c := make(chan *RequestVoteResponse)
++
++		go func() {
++			c <- target.RequestVote(clonedReq)
++		}()
++
++		select {
++		case resp := <-c:
++			return resp
++		case <-time.After(time.Millisecond * 200):
++			return nil
++		}
++
+ 	}
+ 	transporter.sendAppendEntriesRequestFunc = func(s Server, peer *Peer, req *AppendEntriesRequest) *AppendEntriesResponse {
+ 		mutex.RLock()
+@@ -512,7 +524,18 @@ func TestServerMultiNode(t *testing.T) {
+ 		clonedReq := &AppendEntriesRequest{}
+ 		json.Unmarshal(b, clonedReq)
+ 
+-		return target.AppendEntries(clonedReq)
++		c := make(chan *AppendEntriesResponse)
++
++		go func() {
++			c <- target.AppendEntries(clonedReq)
++		}()
++
++		select {
++		case resp := <-c:
++			return resp
++		case <-time.After(time.Millisecond * 200):
++			return nil
++		}
+ 	}
+ 
+ 	disTransporter := &testTransporter{}
+diff --git a/third_party/src/github.com/coreos/raft/snapshot.go b/third_party/src/github.com/coreos/raft/snapshot.go
+index 4f416f7..dcdcac3 100644
+--- a/third_party/src/github.com/coreos/raft/snapshot.go
++++ b/third_party/src/github.com/coreos/raft/snapshot.go
+@@ -52,7 +52,7 @@ func (ss *Snapshot) save() error {
+ 		return err
+ 	}
+ 
+-	// force the change writting to disk
++	// force the change writing to disk
+ 	file.Sync()
+ 	return err
+ }
+diff --git a/third_party/src/github.com/coreos/raft/util.go b/third_party/src/github.com/coreos/raft/util.go
+new file mode 100644
+index 0000000..ff3d62f
+--- /dev/null
++++ b/third_party/src/github.com/coreos/raft/util.go
+@@ -0,0 +1,31 @@
++package raft
++
++import (
++	"io"
++	"os"
++)
++
++// WriteFile writes data to a file named by filename.
++// If the file does not exist, WriteFile creates it with permissions perm;
++// otherwise WriteFile truncates it before writing.
++// This is copied from ioutil.WriteFile with the addition of a Sync call to
++// ensure the data reaches the disk.
++func writeFileSynced(filename string, data []byte, perm os.FileMode) error {
++	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
++	if err != nil {
++		return err
++	}
++
++	n, err := f.Write(data)
++	if n < len(data) {
++		f.Close()
++		return io.ErrShortWrite
++	}
++
++	err = f.Sync()
++	if err != nil {
++		return err
++	}
++
++	return f.Close()
++}

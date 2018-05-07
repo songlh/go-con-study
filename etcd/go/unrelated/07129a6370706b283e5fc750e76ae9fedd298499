@@ -1,0 +1,89 @@
+commit 07129a6370706b283e5fc750e76ae9fedd298499
+Author: fanmin shi <fanmin.shi@coreos.com>
+Date:   Fri Feb 17 09:33:32 2017 -0800
+
+    *: add and expose StopSignal field in ExpectProcess
+    
+    add and expose StopSignal to ExpectProcess allows user
+    to define what signal to send on ExpectProcess.close()
+    
+    coverage testing code sets StopSignal to SIGTERM allowing
+    the test binary to shutdown gracefully so that it can generate
+    a coverage report.
+
+diff --git a/e2e/etcd_spawn_cov.go.go b/e2e/etcd_spawn_cov.go.go
+index 94717e2..d7b8f8c 100644
+--- a/e2e/etcd_spawn_cov.go.go
++++ b/e2e/etcd_spawn_cov.go.go
+@@ -19,11 +19,11 @@ package e2e
+ import (
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"strings"
++	"syscall"
+ 	"time"
+ 
+-	"path/filepath"
+-
+ 	"github.com/coreos/etcd/pkg/expect"
+ 	"github.com/coreos/etcd/pkg/fileutil"
+ 	"github.com/coreos/etcd/pkg/flags"
+@@ -44,7 +44,13 @@ func spawnCmd(args []string) (*expect.ExpectProcess, error) {
+ 			fmt.Sprintf("-test.coverprofile=e2e.%v.coverprofile", time.Now().UnixNano()),
+ 			"-test.outputdir=" + coverPath,
+ 		}
+-		return expect.NewExpectWithEnv(binDir+"/etcd_test", covArgs, args2env(args[1:]))
++		ep := expect.NewExpectWithEnv(binDir+"/etcd_test", covArgs, args2env(args[1:]))
++		// ep sends SIGTERM to etcd_test process on ep.close()
++		// allowing the process to exit gracefully in order to generate a coverage report.
++		// note: go runtime ignores SIGINT but not SIGTERM
++		// if e2e test is run as a background process.
++		ep.StopSignal = syscall.SIGTERM
++		return nil, ep
+ 	}
+ 	return expect.NewExpect(args[0], args[1:]...)
+ }
+diff --git a/pkg/expect/expect.go b/pkg/expect/expect.go
+index 94650f3..a58121c 100644
+--- a/pkg/expect/expect.go
++++ b/pkg/expect/expect.go
+@@ -23,6 +23,7 @@ import (
+ 	"os/exec"
+ 	"strings"
+ 	"sync"
++	"syscall"
+ 
+ 	"github.com/kr/pty"
+ )
+@@ -38,6 +39,9 @@ type ExpectProcess struct {
+ 	lines []string
+ 	count int // increment whenever new line gets added
+ 	err   error
++
++	// StopSignal is the signal Stop sends to the process; defaults to SIGKILL.
++	StopSignal os.Signal
+ }
+ 
+ var printDebugLines = os.Getenv("EXPECT_DEBUG") != ""
+@@ -52,7 +56,10 @@ func NewExpect(name string, arg ...string) (ep *ExpectProcess, err error) {
+ func NewExpectWithEnv(name string, args []string, env []string) (ep *ExpectProcess, err error) {
+ 	cmd := exec.Command(name, args...)
+ 	cmd.Env = env
+-	ep = &ExpectProcess{cmd: cmd}
++	ep = &ExpectProcess{
++		cmd:        cmd,
++		StopSignal: syscall.SIGKILL,
++	}
+ 	ep.cond = sync.NewCond(&ep.mu)
+ 	ep.cmd.Stderr = ep.cmd.Stdout
+ 	ep.cmd.Stdin = nil
+@@ -140,7 +147,7 @@ func (ep *ExpectProcess) close(kill bool) error {
+ 		return ep.err
+ 	}
+ 	if kill {
+-		ep.Signal(os.Interrupt)
++		ep.Signal(ep.StopSignal)
+ 	}
+ 
+ 	err := ep.cmd.Wait()

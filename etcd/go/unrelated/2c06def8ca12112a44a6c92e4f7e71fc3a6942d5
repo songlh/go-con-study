@@ -1,0 +1,156 @@
+commit 2c06def8ca12112a44a6c92e4f7e71fc3a6942d5
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Fri Dec 9 12:37:35 2016 -0800
+
+    etcdserver, embed, v2http: move pprof setup to embed
+    
+    Seems like a better place for prof setup since it's not specific to v2.
+
+diff --git a/embed/etcd.go b/embed/etcd.go
+index b45b2f2..5fdbcad 100644
+--- a/embed/etcd.go
++++ b/embed/etcd.go
+@@ -117,7 +117,6 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
+ 		AutoCompactionRetention: cfg.AutoCompactionRetention,
+ 		QuotaBackendBytes:       cfg.QuotaBackendBytes,
+ 		StrictReconfigCheck:     cfg.StrictReconfigCheck,
+-		EnablePprof:             cfg.EnablePprof,
+ 		ClientCertAuthEnabled:   cfg.ClientTLSInfo.ClientCertAuth,
+ 	}
+ 
+@@ -230,6 +229,10 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
+ 		plog.Warningf("ignoring client auto TLS since certs given")
+ 	}
+ 
++	if cfg.EnablePprof {
++		plog.Infof("pprof is enabled under %s", pprofPrefix)
++	}
++
+ 	sctxs = make(map[string]*serveCtx)
+ 	for _, u := range cfg.LCUrls {
+ 		sctx := newServeCtx()
+@@ -284,6 +287,9 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
+ 			}
+ 		}()
+ 		sctx.userHandlers = cfg.UserHandlers
++		if cfg.EnablePprof {
++			sctx.registerPprof()
++		}
+ 		sctxs[u.Host] = sctx
+ 	}
+ 	return sctxs, nil
+diff --git a/embed/serve.go b/embed/serve.go
+index 5772d38..0e113ac 100644
+--- a/embed/serve.go
++++ b/embed/serve.go
+@@ -20,6 +20,7 @@ import (
+ 	defaultLog "log"
+ 	"net"
+ 	"net/http"
++	"net/http/pprof"
+ 	"strings"
+ 	"time"
+ 
+@@ -35,6 +36,8 @@ import (
+ 	"google.golang.org/grpc/credentials"
+ )
+ 
++const pprofPrefix = "/debug/pprof"
++
+ type serveCtx struct {
+ 	l        net.Listener
+ 	secure   bool
+@@ -181,3 +184,23 @@ func (sctx *serveCtx) createMux(gwmux *gw.ServeMux, handler http.Handler) *http.
+ 	httpmux.Handle("/", handler)
+ 	return httpmux
+ }
++
++func (sctx *serveCtx) registerPprof() {
++	f := func(s string, h http.Handler) {
++		if sctx.userHandlers[s] != nil {
++			plog.Warningf("path %s already registered by user handler", s)
++			return
++		}
++		sctx.userHandlers[s] = h
++	}
++	f(pprofPrefix+"/", http.HandlerFunc(pprof.Index))
++	f(pprofPrefix+"/profile", http.HandlerFunc(pprof.Profile))
++	f(pprofPrefix+"/symbol", http.HandlerFunc(pprof.Symbol))
++	f(pprofPrefix+"/cmdline", http.HandlerFunc(pprof.Cmdline))
++	f(pprofPrefix+"/trace", http.HandlerFunc(pprof.Trace))
++
++	f(pprofPrefix+"/heap", pprof.Handler("heap"))
++	f(pprofPrefix+"/goroutine", pprof.Handler("goroutine"))
++	f(pprofPrefix+"/threadcreate", pprof.Handler("threadcreate"))
++	f(pprofPrefix+"/block", pprof.Handler("block"))
++}
+diff --git a/etcdserver/api/v2http/client.go b/etcdserver/api/v2http/client.go
+index 03ca640..39631dc 100644
+--- a/etcdserver/api/v2http/client.go
++++ b/etcdserver/api/v2http/client.go
+@@ -21,7 +21,6 @@ import (
+ 	"fmt"
+ 	"io/ioutil"
+ 	"net/http"
+-	"net/http/pprof"
+ 	"net/url"
+ 	"path"
+ 	"strconv"
+@@ -57,7 +56,6 @@ const (
+ 	healthPath               = "/health"
+ 	versionPath              = "/version"
+ 	configPath               = "/config"
+-	pprofPrefix              = "/debug/pprof"
+ )
+ 
+ // NewClientHandler generates a muxed http.Handler with the given parameters to serve etcd client requests.
+@@ -113,23 +111,6 @@ func NewClientHandler(server *etcdserver.EtcdServer, timeout time.Duration) http
+ 	mux.Handle(deprecatedMachinesPrefix, dmh)
+ 	handleAuth(mux, sech)
+ 
+-	if server.IsPprofEnabled() {
+-		plog.Infof("pprof is enabled under %s", pprofPrefix)
+-
+-		mux.HandleFunc(pprofPrefix+"/", pprof.Index)
+-		mux.HandleFunc(pprofPrefix+"/profile", pprof.Profile)
+-		mux.HandleFunc(pprofPrefix+"/symbol", pprof.Symbol)
+-		mux.HandleFunc(pprofPrefix+"/cmdline", pprof.Cmdline)
+-		// TODO: currently, we don't create an entry for pprof.Trace,
+-		// because go 1.4 doesn't provide it. After support of go 1.4 is dropped,
+-		// we should add the entry.
+-
+-		mux.Handle(pprofPrefix+"/heap", pprof.Handler("heap"))
+-		mux.Handle(pprofPrefix+"/goroutine", pprof.Handler("goroutine"))
+-		mux.Handle(pprofPrefix+"/threadcreate", pprof.Handler("threadcreate"))
+-		mux.Handle(pprofPrefix+"/block", pprof.Handler("block"))
+-	}
+-
+ 	return requestLogger(mux)
+ }
+ 
+diff --git a/etcdserver/config.go b/etcdserver/config.go
+index bdfa4ba..b488088 100644
+--- a/etcdserver/config.go
++++ b/etcdserver/config.go
+@@ -55,8 +55,6 @@ type ServerConfig struct {
+ 
+ 	StrictReconfigCheck bool
+ 
+-	EnablePprof bool
+-
+ 	// ClientCertAuthEnabled is true when cert has been signed by the client CA.
+ 	ClientCertAuthEnabled bool
+ }
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 866968b..6341f6b 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -1098,8 +1098,6 @@ func (s *EtcdServer) Lead() uint64 { return atomic.LoadUint64(&s.r.lead) }
+ 
+ func (s *EtcdServer) Leader() types.ID { return types.ID(s.Lead()) }
+ 
+-func (s *EtcdServer) IsPprofEnabled() bool { return s.Cfg.EnablePprof }
+-
+ // configure sends a configuration change through consensus and
+ // then waits for it to be applied to the server. It
+ // will block until the change is performed or there is an error.

@@ -1,0 +1,169 @@
+commit 73adb201661d9f391c88b4b7b826f01dfa69449a
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Mon Mar 30 18:43:31 2015 -0700
+
+    *: update context pkg
+
+diff --git a/Godeps/Godeps.json b/Godeps/Godeps.json
+index 788dcf7..aac596c 100644
+--- a/Godeps/Godeps.json
++++ b/Godeps/Godeps.json
+@@ -84,7 +84,7 @@
+ 		},
+ 		{
+ 			"ImportPath": "golang.org/x/net/context",
+-			"Rev": "b8c11bbe941633d84573af9686bfef280594b4fd"
++			"Rev": "7dbad50ab5b31073856416cdcfeb2796d682f844"
+ 		}
+ 	]
+ }
+diff --git a/Godeps/_workspace/src/golang.org/x/net/context/context.go b/Godeps/_workspace/src/golang.org/x/net/context/context.go
+index 66aff7c..ef2f3e8 100644
+--- a/Godeps/_workspace/src/golang.org/x/net/context/context.go
++++ b/Godeps/_workspace/src/golang.org/x/net/context/context.go
+@@ -64,18 +64,21 @@ type Context interface {
+ 	//
+ 	// Done is provided for use in select statements:
+ 	//
+-	// 	// DoSomething calls DoSomethingSlow and returns as soon as
+-	// 	// it returns or ctx.Done is closed.
+-	// 	func DoSomething(ctx context.Context) (Result, error) {
+-	// 		c := make(chan Result, 1)
+-	// 		go func() { c <- DoSomethingSlow(ctx) }()
+-	// 		select {
+-	// 		case res := <-c:
+-	// 			return res, nil
+-	// 		case <-ctx.Done():
+-	// 			return nil, ctx.Err()
+-	// 		}
+-	// 	}
++	//  // Stream generates values with DoSomething and sends them to out
++	//  // until DoSomething returns an error or ctx.Done is closed.
++	//  func Stream(ctx context.Context, out <-chan Value) error {
++	//  	for {
++	//  		v, err := DoSomething(ctx)
++	//  		if err != nil {
++	//  			return err
++	//  		}
++	//  		select {
++	//  		case <-ctx.Done():
++	//  			return ctx.Err()
++	//  		case out <- v:
++	//  		}
++	//  	}
++	//  }
+ 	//
+ 	// See http://blog.golang.org/pipelines for more examples of how to use
+ 	// a Done channel for cancelation.
+@@ -202,6 +205,9 @@ type CancelFunc func()
+ // WithCancel returns a copy of parent with a new Done channel. The returned
+ // context's Done channel is closed when the returned cancel function is called
+ // or when the parent context's Done channel is closed, whichever happens first.
++//
++// Canceling this context releases resources associated with it, so code should
++// call cancel as soon as the operations running in this Context complete.
+ func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
+ 	c := newCancelCtx(parent)
+ 	propagateCancel(parent, &c)
+@@ -262,6 +268,19 @@ func parentCancelCtx(parent Context) (*cancelCtx, bool) {
+ 	}
+ }
+ 
++// removeChild removes a context from its parent.
++func removeChild(parent Context, child canceler) {
++	p, ok := parentCancelCtx(parent)
++	if !ok {
++		return
++	}
++	p.mu.Lock()
++	if p.children != nil {
++		delete(p.children, child)
++	}
++	p.mu.Unlock()
++}
++
+ // A canceler is a context type that can be canceled directly.  The
+ // implementations are *cancelCtx and *timerCtx.
+ type canceler interface {
+@@ -316,13 +335,7 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+ 	c.mu.Unlock()
+ 
+ 	if removeFromParent {
+-		if p, ok := parentCancelCtx(c.Context); ok {
+-			p.mu.Lock()
+-			if p.children != nil {
+-				delete(p.children, c)
+-			}
+-			p.mu.Unlock()
+-		}
++		removeChild(c.Context, c)
+ 	}
+ }
+ 
+@@ -333,9 +346,8 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+ // cancel function is called, or when the parent context's Done channel is
+ // closed, whichever happens first.
+ //
+-// Canceling this context releases resources associated with the deadline
+-// timer, so code should call cancel as soon as the operations running in this
+-// Context complete.
++// Canceling this context releases resources associated with it, so code should
++// call cancel as soon as the operations running in this Context complete.
+ func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc) {
+ 	if cur, ok := parent.Deadline(); ok && cur.Before(deadline) {
+ 		// The current deadline is already sooner than the new one.
+@@ -380,7 +392,11 @@ func (c *timerCtx) String() string {
+ }
+ 
+ func (c *timerCtx) cancel(removeFromParent bool, err error) {
+-	c.cancelCtx.cancel(removeFromParent, err)
++	c.cancelCtx.cancel(false, err)
++	if removeFromParent {
++		// Remove this timerCtx from its parent cancelCtx's children.
++		removeChild(c.cancelCtx.Context, c)
++	}
+ 	c.mu.Lock()
+ 	if c.timer != nil {
+ 		c.timer.Stop()
+@@ -391,9 +407,8 @@ func (c *timerCtx) cancel(removeFromParent bool, err error) {
+ 
+ // WithTimeout returns WithDeadline(parent, time.Now().Add(timeout)).
+ //
+-// Canceling this context releases resources associated with the deadline
+-// timer, so code should call cancel as soon as the operations running in this
+-// Context complete:
++// Canceling this context releases resources associated with it, so code should
++// call cancel as soon as the operations running in this Context complete:
+ //
+ // 	func slowOperationWithTimeout(ctx context.Context) (Result, error) {
+ // 		ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+diff --git a/Godeps/_workspace/src/golang.org/x/net/context/context_test.go b/Godeps/_workspace/src/golang.org/x/net/context/context_test.go
+index 82d2494..faf6772 100644
+--- a/Godeps/_workspace/src/golang.org/x/net/context/context_test.go
++++ b/Godeps/_workspace/src/golang.org/x/net/context/context_test.go
+@@ -551,3 +551,25 @@ func testLayers(t *testing.T, seed int64, testTimeout bool) {
+ 		checkValues("after cancel")
+ 	}
+ }
++
++func TestCancelRemoves(t *testing.T) {
++	checkChildren := func(when string, ctx Context, want int) {
++		if got := len(ctx.(*cancelCtx).children); got != want {
++			t.Errorf("%s: context has %d children, want %d", when, got, want)
++		}
++	}
++
++	ctx, _ := WithCancel(Background())
++	checkChildren("after creation", ctx, 0)
++	_, cancel := WithCancel(ctx)
++	checkChildren("with WithCancel child ", ctx, 1)
++	cancel()
++	checkChildren("after cancelling WithCancel child", ctx, 0)
++
++	ctx, _ = WithCancel(Background())
++	checkChildren("after creation", ctx, 0)
++	_, cancel = WithTimeout(ctx, 60*time.Minute)
++	checkChildren("with WithTimeout child ", ctx, 1)
++	cancel()
++	checkChildren("after cancelling WithTimeout child", ctx, 0)
++}

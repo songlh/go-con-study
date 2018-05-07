@@ -1,0 +1,93 @@
+commit 04bd48fef3ef1413d2c30fea63a430cc2d241c48
+Author: Brandon Philips <brandon@ifup.co>
+Date:   Tue Sep 30 17:02:21 2014 -0700
+
+    etcdserver: stop worrying about scheme
+    
+    Stop worrying about the scheme. This puts a TODO on adding validation to
+    the schemes if TLS is specified. But we can worry about that later.
+
+diff --git a/Procfile b/Procfile
+index 4a2b653..4277c2b 100644
+--- a/Procfile
++++ b/Procfile
+@@ -1,5 +1,5 @@
+ # Use goreman to run `go get github.com/mattn/goreman`
+-etcd1: bin/etcd -name node1 -bind-addr 127.0.0.1:4001 -peer-bind-addr :7001 -bootstrap-config 'node1=localhost:7001,node2=localhost:7002,node3=localhost:7003'
+-etcd2: bin/etcd -name node2 -bind-addr 127.0.0.1:4002 -peer-bind-addr :7002 -bootstrap-config 'node1=localhost:7001,node2=localhost:7002,node3=localhost:7003'
+-etcd3: bin/etcd -name node3 -bind-addr 127.0.0.1:4003 -peer-bind-addr :7003 -bootstrap-config 'node1=localhost:7001,node2=localhost:7002,node3=localhost:7003'
++etcd1: bin/etcd -name node1 -listen-client-urls http://127.0.0.1:4001 -advertise-client-urls http://127.0.0.1:4001 -listen-peer-urls http://127.0.0.1:7001 -advertise-peer-urls http://127.0.0.1:7001 -bootstrap-config 'node1=http://localhost:7001,node2=http://localhost:7002,node3=http://localhost:7003'
++etcd2: bin/etcd -name node2 -listen-client-urls http://127.0.0.1:4002 -advertise-client-urls http://127.0.0.1:4002 -listen-peer-urls http://127.0.0.1:7002 -advertise-peer-urls http://127.0.0.1:7002 -bootstrap-config 'node1=http://localhost:7001,node2=http://localhost:7002,node3=http://localhost:7003'
++etcd3: bin/etcd -name node3 -listen-client-urls http://127.0.0.1:4003 -advertise-client-urls http://127.0.0.1:4003 -listen-peer-urls http://127.0.0.1:7003 -advertise-peer-urls http://127.0.0.1:7003 -bootstrap-config 'node1=http://localhost:7001,node2=http://localhost:7002,node3=http://localhost:7003'
+ #proxy: bin/etcd -proxy=on -bind-addr 127.0.0.1:8080 -peers 'localhost:7001,localhost:7002,localhost:7003'
+diff --git a/etcdserver/cluster.go b/etcdserver/cluster.go
+index 2287093..c31e2e9 100644
+--- a/etcdserver/cluster.go
++++ b/etcdserver/cluster.go
+@@ -48,11 +48,11 @@ func (c *Cluster) AddSlice(mems []Member) error {
+ // an addressible URI. If the given member does not exist, an empty string is returned.
+ func (c Cluster) Pick(id int64) string {
+ 	if m := c.FindID(id); m != nil {
+-		addrs := m.PeerURLs
+-		if len(addrs) == 0 {
++		urls := m.PeerURLs
++		if len(urls) == 0 {
+ 			return ""
+ 		}
+-		return addrs[rand.Intn(len(addrs))]
++		return urls[rand.Intn(len(urls))]
+ 	}
+ 
+ 	return ""
+diff --git a/etcdserver/cluster_store.go b/etcdserver/cluster_store.go
+index d21fd08..f925c5d 100644
+--- a/etcdserver/cluster_store.go
++++ b/etcdserver/cluster_store.go
+@@ -78,25 +78,20 @@ func (s *clusterStore) Delete(id int64) {
+ func Sender(t *http.Transport, cls ClusterStore) func(msgs []raftpb.Message) {
+ 	c := &http.Client{Transport: t}
+ 
+-	scheme := "http"
+-	if t.TLSClientConfig != nil {
+-		scheme = "https"
+-	}
+-
+ 	return func(msgs []raftpb.Message) {
+ 		for _, m := range msgs {
+ 			// TODO: reuse go routines
+ 			// limit the number of outgoing connections for the same receiver
+-			go send(c, scheme, cls, m)
++			go send(c, cls, m)
+ 		}
+ 	}
+ }
+ 
+-func send(c *http.Client, scheme string, cls ClusterStore, m raftpb.Message) {
++func send(c *http.Client, cls ClusterStore, m raftpb.Message) {
+ 	// TODO (xiangli): reasonable retry logic
+ 	for i := 0; i < 3; i++ {
+-		addr := cls.Get().Pick(m.To)
+-		if addr == "" {
++		u := cls.Get().Pick(m.To)
++		if u == "" {
+ 			// TODO: unknown peer id.. what do we do? I
+ 			// don't think his should ever happen, need to
+ 			// look into this further.
+@@ -104,7 +99,7 @@ func send(c *http.Client, scheme string, cls ClusterStore, m raftpb.Message) {
+ 			return
+ 		}
+ 
+-		url := fmt.Sprintf("%s://%s%s", scheme, addr, raftPrefix)
++		u = fmt.Sprintf("%s%s", u, raftPrefix)
+ 
+ 		// TODO: don't block. we should be able to have 1000s
+ 		// of messages out at a time.
+@@ -113,7 +108,7 @@ func send(c *http.Client, scheme string, cls ClusterStore, m raftpb.Message) {
+ 			log.Println("etcdhttp: dropping message:", err)
+ 			return // drop bad message
+ 		}
+-		if httpPost(c, url, data) {
++		if httpPost(c, u, data) {
+ 			return // success
+ 		}
+ 		// TODO: backoff

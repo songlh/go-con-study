@@ -1,0 +1,44 @@
+commit 7f3d4bfae5066fa52283c0c018caecb8114b1153
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Mon Aug 22 21:34:48 2016 -0700
+
+    etcdserver: kv.commit needs to be serialized with apply
+    
+    kv.commit updates the consistent index in backend. When
+    executing in parallel with apply, it might grab tx lock
+    after apply update the consistent index and before apply
+    starts to execute the opeartion. If the server dies right
+    after kv.commit, the consistent is updated but the opeartion
+    is not executed. If we restart etcd server, etcd will skip
+    the operation. :(
+    
+    There are a few other places that we need to take care of,
+    but let us fix this first.
+
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 429ac87..077ac7d 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -1275,6 +1275,13 @@ func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.Con
+ // TODO: non-blocking snapshot
+ func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
+ 	clone := s.store.Clone()
++	// commit kv to write metadata (for example: consistent index) to disk.
++	// KV().commit() updates the consistent index in backend.
++	// All operations that update consistent index must be called sequentially
++	// from applyAll function.
++	// So KV().Commit() cannot run in parallel with apply. It has to be called outside
++	// the go routine created below.
++	s.KV().Commit()
+ 
+ 	s.wg.Add(1)
+ 	go func() {
+@@ -1295,8 +1302,6 @@ func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState) {
+ 			}
+ 			plog.Panicf("unexpected create snapshot error %v", err)
+ 		}
+-		// commit kv to write metadata (for example: consistent index) to disk.
+-		s.KV().Commit()
+ 		// SaveSnap saves the snapshot and releases the locked wal files
+ 		// to the snapshot index.
+ 		if err = s.r.storage.SaveSnap(snap); err != nil {

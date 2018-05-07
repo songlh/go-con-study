@@ -1,0 +1,334 @@
+commit 8302f839b679cf0c2f4e3613418962a2f0b3005d
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Tue Feb 23 00:56:47 2016 -0800
+
+    etcdctlv3: add printer interface and simple printer
+
+diff --git a/etcdctlv3/command/del_command.go b/etcdctlv3/command/del_command.go
+index 3193602..cdabf8d 100644
+--- a/etcdctlv3/command/del_command.go
++++ b/etcdctlv3/command/del_command.go
+@@ -40,7 +40,7 @@ func delCommandFunc(cmd *cobra.Command, args []string) {
+ 	if err != nil {
+ 		ExitWithError(ExitError, err)
+ 	}
+-	printDeleteResponse(*resp)
++	display.Del(*resp)
+ }
+ 
+ func getDelOp(cmd *cobra.Command, args []string) (string, []clientv3.OpOption) {
+@@ -54,9 +54,3 @@ func getDelOp(cmd *cobra.Command, args []string) (string, []clientv3.OpOption) {
+ 	}
+ 	return key, opts
+ }
+-
+-func printDeleteResponse(resp clientv3.DeleteResponse) {
+-	// TODO: add number of key removed into the response of delete.
+-	// TODO: print out the number of removed keys.
+-	fmt.Println(0)
+-}
+diff --git a/etcdctlv3/command/get_command.go b/etcdctlv3/command/get_command.go
+index 12b4194..43a5f16 100644
+--- a/etcdctlv3/command/get_command.go
++++ b/etcdctlv3/command/get_command.go
+@@ -27,7 +27,6 @@ var (
+ 	getLimit      int64
+ 	getSortOrder  string
+ 	getSortTarget string
+-	getHex        bool
+ )
+ 
+ // NewGetCommand returns the cobra command for "get".
+@@ -41,7 +40,6 @@ func NewGetCommand() *cobra.Command {
+ 	cmd.Flags().StringVar(&getSortOrder, "order", "", "order of results; ASCEND or DESCEND")
+ 	cmd.Flags().StringVar(&getSortTarget, "sort-by", "", "sort target; CREATE, KEY, MODIFY, VALUE, or VERSION")
+ 	cmd.Flags().Int64Var(&getLimit, "limit", 0, "maximum number of results")
+-	cmd.Flags().BoolVar(&getHex, "hex", false, "print out key and value as hex encode string for text format")
+ 	// TODO: add fromkey.
+ 	// TODO: add prefix.
+ 	// TODO: add consistency.
+@@ -57,7 +55,8 @@ func getCommandFunc(cmd *cobra.Command, args []string) {
+ 	if err != nil {
+ 		ExitWithError(ExitError, err)
+ 	}
+-	printGetResponse(*resp, getHex)
++
++	display.Get(*resp)
+ }
+ 
+ func getGetOp(cmd *cobra.Command, args []string) (string, []clientv3.OpOption) {
+@@ -107,9 +106,3 @@ func getGetOp(cmd *cobra.Command, args []string) (string, []clientv3.OpOption) {
+ 	opts = append(opts, clientv3.WithSort(sortByTarget, sortByOrder))
+ 	return key, opts
+ }
+-
+-func printGetResponse(resp clientv3.GetResponse, isHex bool) {
+-	for _, kv := range resp.Kvs {
+-		printKV(isHex, kv)
+-	}
+-}
+diff --git a/etcdctlv3/command/global.go b/etcdctlv3/command/global.go
+index 961f3c3..4278997 100644
+--- a/etcdctlv3/command/global.go
++++ b/etcdctlv3/command/global.go
+@@ -30,8 +30,13 @@ import (
+ type GlobalFlags struct {
+ 	Endpoints string
+ 	TLS       transport.TLSInfo
++
++	OutputFormat string
++	IsHex        bool
+ }
+ 
++var display printer = &simplePrinter{}
++
+ func mustClientFromCmd(cmd *cobra.Command) *clientv3.Client {
+ 	endpoint, err := cmd.Flags().GetString("endpoint")
+ 	if err != nil {
+@@ -57,6 +62,8 @@ func mustClientFromCmd(cmd *cobra.Command) *clientv3.Client {
+ 		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --cacert option"))
+ 	}
+ 
++	isHex, _ := cmd.Flags().GetBool("hex")
++	display = &simplePrinter{isHex: isHex}
+ 	return mustClient(endpoint, cert, key, cacert)
+ }
+ 
+@@ -90,6 +97,7 @@ func mustClient(endpoint, cert, key, cacert string) *clientv3.Client {
+ 	if err != nil {
+ 		ExitWithError(ExitBadConnection, err)
+ 	}
++
+ 	return client
+ }
+ 
+diff --git a/etcdctlv3/command/printer.go b/etcdctlv3/command/printer.go
+new file mode 100644
+index 0000000..9c77c92
+--- /dev/null
++++ b/etcdctlv3/command/printer.go
+@@ -0,0 +1,77 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"fmt"
++
++	v3 "github.com/coreos/etcd/clientv3"
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++)
++
++type printer interface {
++	Del(v3.DeleteResponse)
++	Get(v3.GetResponse)
++	Put(v3.PutResponse)
++	Txn(v3.TxnResponse)
++	Watch(v3.WatchResponse)
++}
++
++type simplePrinter struct {
++	isHex bool
++}
++
++func (s *simplePrinter) Del(v3.DeleteResponse) {
++	// TODO: add number of key removed into the response of delete.
++	// TODO: print out the number of removed keys.
++	fmt.Println(0)
++}
++
++func (s *simplePrinter) Get(resp v3.GetResponse) {
++	for _, kv := range resp.Kvs {
++		printKV(s.isHex, kv)
++	}
++}
++
++func (s *simplePrinter) Put(r v3.PutResponse) { fmt.Println("OK") }
++
++func (s *simplePrinter) Txn(resp v3.TxnResponse) {
++	if resp.Succeeded {
++		fmt.Println("SUCCESS")
++	} else {
++		fmt.Println("FAILURE")
++	}
++
++	for _, r := range resp.Responses {
++		fmt.Println("")
++		switch v := r.Response.(type) {
++		case *pb.ResponseUnion_ResponseDeleteRange:
++			s.Del((v3.DeleteResponse)(*v.ResponseDeleteRange))
++		case *pb.ResponseUnion_ResponsePut:
++			s.Put((v3.PutResponse)(*v.ResponsePut))
++		case *pb.ResponseUnion_ResponseRange:
++			s.Get(((v3.GetResponse)(*v.ResponseRange)))
++		default:
++			fmt.Printf("unexpected response %+v\n", r)
++		}
++	}
++}
++
++func (s *simplePrinter) Watch(resp v3.WatchResponse) {
++	for _, e := range resp.Events {
++		fmt.Println(e.Type)
++		printKV(s.isHex, e.Kv)
++	}
++}
+diff --git a/etcdctlv3/command/put_command.go b/etcdctlv3/command/put_command.go
+index 5f21351..7096759 100644
+--- a/etcdctlv3/command/put_command.go
++++ b/etcdctlv3/command/put_command.go
+@@ -64,7 +64,7 @@ func putCommandFunc(cmd *cobra.Command, args []string) {
+ 	if err != nil {
+ 		ExitWithError(ExitError, err)
+ 	}
+-	printPutResponse(*resp)
++	display.Put(*resp)
+ }
+ 
+ func getPutOp(cmd *cobra.Command, args []string) (string, string, []clientv3.OpOption) {
+@@ -90,7 +90,3 @@ func getPutOp(cmd *cobra.Command, args []string) (string, string, []clientv3.OpO
+ 
+ 	return key, value, opts
+ }
+-
+-func printPutResponse(resp clientv3.PutResponse) {
+-	fmt.Println("OK")
+-}
+diff --git a/etcdctlv3/command/txn_command.go b/etcdctlv3/command/txn_command.go
+index 37c24aa..1395016 100644
+--- a/etcdctlv3/command/txn_command.go
++++ b/etcdctlv3/command/txn_command.go
+@@ -24,12 +24,10 @@ import (
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+ 	"github.com/coreos/etcd/clientv3"
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+ )
+ 
+ var (
+ 	txnInteractive bool
+-	txnHex         bool
+ )
+ 
+ // NewTxnCommand returns the cobra command for "txn".
+@@ -40,7 +38,6 @@ func NewTxnCommand() *cobra.Command {
+ 		Run:   txnCommandFunc,
+ 	}
+ 	cmd.Flags().BoolVarP(&txnInteractive, "interactive", "i", false, "input transaction in interactive mode")
+-	cmd.Flags().BoolVar(&txnHex, "hex", false, "print out key-values as hex encoded strings")
+ 	return cmd
+ }
+ 
+@@ -69,7 +66,7 @@ func txnCommandFunc(cmd *cobra.Command, args []string) {
+ 		ExitWithError(ExitError, err)
+ 	}
+ 
+-	printTxnResponse(*resp, txnHex)
++	display.Txn(*resp)
+ }
+ 
+ func readCompares(r *bufio.Reader) (cmps []clientv3.Cmp) {
+@@ -202,25 +199,3 @@ func parseCompare(line string) (*clientv3.Cmp, error) {
+ 
+ 	return &cmp, nil
+ }
+-
+-func printTxnResponse(resp clientv3.TxnResponse, isHex bool) {
+-	if resp.Succeeded {
+-		fmt.Println("SUCCESS")
+-	} else {
+-		fmt.Println("FAILURE")
+-	}
+-
+-	for _, r := range resp.Responses {
+-		fmt.Println("")
+-		switch v := r.Response.(type) {
+-		case *pb.ResponseUnion_ResponseDeleteRange:
+-			printDeleteResponse((clientv3.DeleteResponse)(*v.ResponseDeleteRange))
+-		case *pb.ResponseUnion_ResponsePut:
+-			printPutResponse((clientv3.PutResponse)(*v.ResponsePut))
+-		case *pb.ResponseUnion_ResponseRange:
+-			printGetResponse(((clientv3.GetResponse)(*v.ResponseRange)), isHex)
+-		default:
+-			fmt.Printf("unexpected response %+v\n", r)
+-		}
+-	}
+-}
+diff --git a/etcdctlv3/command/watch_command.go b/etcdctlv3/command/watch_command.go
+index 686574f..58defbe 100644
+--- a/etcdctlv3/command/watch_command.go
++++ b/etcdctlv3/command/watch_command.go
+@@ -28,7 +28,6 @@ import (
+ var (
+ 	watchRev         int64
+ 	watchPrefix      bool
+-	watchHex         bool
+ 	watchInteractive bool
+ )
+ 
+@@ -40,7 +39,6 @@ func NewWatchCommand() *cobra.Command {
+ 		Run:   watchCommandFunc,
+ 	}
+ 
+-	cmd.Flags().BoolVar(&watchHex, "hex", false, "print out key and value as hex encode string for text format")
+ 	cmd.Flags().BoolVarP(&watchInteractive, "interactive", "i", false, "interactive mode")
+ 	cmd.Flags().BoolVar(&watchPrefix, "prefix", false, "watch on a prefix if prefix is set")
+ 	cmd.Flags().Int64Var(&watchRev, "rev", 0, "revision to start watching")
+@@ -68,7 +66,7 @@ func watchCommandFunc(cmd *cobra.Command, args []string) {
+ 	} else {
+ 		wc = w.Watch(context.TODO(), args[0], watchRev)
+ 	}
+-	printWatchCh(wc, watchHex)
++	printWatchCh(wc)
+ 	err := w.Close()
+ 	if err == nil {
+ 		ExitWithError(ExitInterrupted, fmt.Errorf("watch is canceled by the server"))
+@@ -122,19 +120,12 @@ func watchInteractiveFunc(cmd *cobra.Command, args []string) {
+ 		} else {
+ 			ch = w.Watch(context.TODO(), key, watchRev)
+ 		}
+-		go printWatchCh(ch, watchHex)
++		go printWatchCh(ch)
+ 	}
+ }
+ 
+-func printWatchCh(ch clientv3.WatchChan, hex bool) {
++func printWatchCh(ch clientv3.WatchChan) {
+ 	for resp := range ch {
+-		printWatchResponse(resp, hex)
+-	}
+-}
+-
+-func printWatchResponse(resp clientv3.WatchResponse, hex bool) {
+-	for _, e := range resp.Events {
+-		fmt.Println(e.Type)
+-		printKV(hex, e.Kv)
++		display.Watch(resp)
+ 	}
+ }
+diff --git a/etcdctlv3/main.go b/etcdctlv3/main.go
+index 0ae7757..3106a7a 100644
+--- a/etcdctlv3/main.go
++++ b/etcdctlv3/main.go
+@@ -43,6 +43,9 @@ var (
+ func init() {
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.Endpoints, "endpoint", "127.0.0.1:2378", "gRPC endpoint")
+ 
++	rootCmd.PersistentFlags().StringVarP(&globalFlags.OutputFormat, "write-out", "w", "simple", "set the output format (simple, json, protobuf)")
++	rootCmd.PersistentFlags().BoolVar(&globalFlags.IsHex, "hex", false, "print byte strings as hex encoded strings")
++
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.TLS.CertFile, "cert", "", "identify secure client using this TLS certificate file")
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.TLS.KeyFile, "key", "", "identify secure client using this TLS key file")
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.TLS.CAFile, "cacert", "", "verify certificates of TLS-enabled secure servers using this CA bundle")

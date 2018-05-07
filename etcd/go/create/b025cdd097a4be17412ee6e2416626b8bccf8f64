@@ -1,0 +1,841 @@
+commit b025cdd097a4be17412ee6e2416626b8bccf8f64
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Mar 9 20:39:47 2017 -0800
+
+    adapter, integration: split out grpc adapters from grpcproxy package
+    
+    Break cyclic dependency:
+    clientv3/naming <-> integration <-> v3client <-> grpcproxy <-> clientv3/naming
+
+diff --git a/integration/cluster_proxy.go b/integration/cluster_proxy.go
+index 4371f0b..c81d280 100644
+--- a/integration/cluster_proxy.go
++++ b/integration/cluster_proxy.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/coreos/etcd/clientv3"
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+ 	"github.com/coreos/etcd/proxy/grpcproxy"
++	"github.com/coreos/etcd/proxy/grpcproxy/adapter"
+ )
+ 
+ var (
+@@ -48,9 +49,9 @@ func toGRPC(c *clientv3.Client) grpcAPI {
+ 	lp, lpch := grpcproxy.NewLeaseProxy(c)
+ 	grpc := grpcAPI{
+ 		pb.NewClusterClient(c.ActiveConnection()),
+-		grpcproxy.KvServerToKvClient(kvp),
+-		grpcproxy.LeaseServerToLeaseClient(lp),
+-		grpcproxy.WatchServerToWatchClient(wp),
++		adapter.KvServerToKvClient(kvp),
++		adapter.LeaseServerToLeaseClient(lp),
++		adapter.WatchServerToWatchClient(wp),
+ 		pb.NewMaintenanceClient(c.ActiveConnection()),
+ 		pb.NewAuthClient(c.ActiveConnection()),
+ 	}
+diff --git a/proxy/grpcproxy/adapter/chan_stream.go b/proxy/grpcproxy/adapter/chan_stream.go
+new file mode 100644
+index 0000000..0b85098
+--- /dev/null
++++ b/proxy/grpcproxy/adapter/chan_stream.go
+@@ -0,0 +1,138 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package adapter
++
++import (
++	"golang.org/x/net/context"
++
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
++)
++
++// chanServerStream implements grpc.ServerStream with a chanStream
++type chanServerStream struct {
++	headerc  chan<- metadata.MD
++	trailerc chan<- metadata.MD
++	grpc.Stream
++
++	headers []metadata.MD
++}
++
++func (ss *chanServerStream) SendHeader(md metadata.MD) error {
++	if ss.headerc == nil {
++		return errAlreadySentHeader
++	}
++	outmd := make(map[string][]string)
++	for _, h := range append(ss.headers, md) {
++		for k, v := range h {
++			outmd[k] = v
++		}
++	}
++	select {
++	case ss.headerc <- outmd:
++		ss.headerc = nil
++		ss.headers = nil
++		return nil
++	case <-ss.Context().Done():
++	}
++	return ss.Context().Err()
++}
++
++func (ss *chanServerStream) SetHeader(md metadata.MD) error {
++	if ss.headerc == nil {
++		return errAlreadySentHeader
++	}
++	ss.headers = append(ss.headers, md)
++	return nil
++}
++
++func (ss *chanServerStream) SetTrailer(md metadata.MD) {
++	ss.trailerc <- md
++}
++
++// chanClientStream implements grpc.ClientStream with a chanStream
++type chanClientStream struct {
++	headerc  <-chan metadata.MD
++	trailerc <-chan metadata.MD
++	*chanStream
++}
++
++func (cs *chanClientStream) Header() (metadata.MD, error) {
++	select {
++	case md := <-cs.headerc:
++		return md, nil
++	case <-cs.Context().Done():
++	}
++	return nil, cs.Context().Err()
++}
++
++func (cs *chanClientStream) Trailer() metadata.MD {
++	select {
++	case md := <-cs.trailerc:
++		return md
++	case <-cs.Context().Done():
++		return nil
++	}
++}
++
++func (cs *chanClientStream) CloseSend() error {
++	close(cs.chanStream.sendc)
++	return nil
++}
++
++// chanStream implements grpc.Stream using channels
++type chanStream struct {
++	recvc  <-chan interface{}
++	sendc  chan<- interface{}
++	ctx    context.Context
++	cancel context.CancelFunc
++}
++
++func (s *chanStream) Context() context.Context { return s.ctx }
++
++func (s *chanStream) SendMsg(m interface{}) error {
++	select {
++	case s.sendc <- m:
++		if err, ok := m.(error); ok {
++			return err
++		}
++		return nil
++	case <-s.ctx.Done():
++	}
++	return s.ctx.Err()
++}
++
++func (s *chanStream) RecvMsg(m interface{}) error {
++	v := m.(*interface{})
++	for {
++		select {
++		case msg, ok := <-s.recvc:
++			if !ok {
++				return grpc.ErrClientConnClosing
++			}
++			if err, ok := msg.(error); ok {
++				return err
++			}
++			*v = msg
++			return nil
++		case <-s.ctx.Done():
++		}
++		if len(s.recvc) == 0 {
++			// prioritize any pending recv messages over canceled context
++			break
++		}
++	}
++	return s.ctx.Err()
++}
+diff --git a/proxy/grpcproxy/adapter/doc.go b/proxy/grpcproxy/adapter/doc.go
+new file mode 100644
+index 0000000..7170be2
+--- /dev/null
++++ b/proxy/grpcproxy/adapter/doc.go
+@@ -0,0 +1,17 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package adapter provides gRPC adapters between client and server
++// gRPC interfaces without needing to go through a gRPC connection.
++package adapter
+diff --git a/proxy/grpcproxy/adapter/kv_client_adapter.go b/proxy/grpcproxy/adapter/kv_client_adapter.go
+new file mode 100644
+index 0000000..fec401d
+--- /dev/null
++++ b/proxy/grpcproxy/adapter/kv_client_adapter.go
+@@ -0,0 +1,47 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package adapter
++
++import (
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"golang.org/x/net/context"
++	grpc "google.golang.org/grpc"
++)
++
++type kvs2kvc struct{ kvs pb.KVServer }
++
++func KvServerToKvClient(kvs pb.KVServer) pb.KVClient {
++	return &kvs2kvc{kvs}
++}
++
++func (s *kvs2kvc) Range(ctx context.Context, in *pb.RangeRequest, opts ...grpc.CallOption) (*pb.RangeResponse, error) {
++	return s.kvs.Range(ctx, in)
++}
++
++func (s *kvs2kvc) Put(ctx context.Context, in *pb.PutRequest, opts ...grpc.CallOption) (*pb.PutResponse, error) {
++	return s.kvs.Put(ctx, in)
++}
++
++func (s *kvs2kvc) DeleteRange(ctx context.Context, in *pb.DeleteRangeRequest, opts ...grpc.CallOption) (*pb.DeleteRangeResponse, error) {
++	return s.kvs.DeleteRange(ctx, in)
++}
++
++func (s *kvs2kvc) Txn(ctx context.Context, in *pb.TxnRequest, opts ...grpc.CallOption) (*pb.TxnResponse, error) {
++	return s.kvs.Txn(ctx, in)
++}
++
++func (s *kvs2kvc) Compact(ctx context.Context, in *pb.CompactionRequest, opts ...grpc.CallOption) (*pb.CompactionResponse, error) {
++	return s.kvs.Compact(ctx, in)
++}
+diff --git a/proxy/grpcproxy/adapter/lease_client_adapter.go b/proxy/grpcproxy/adapter/lease_client_adapter.go
+new file mode 100644
+index 0000000..ea36a3d
+--- /dev/null
++++ b/proxy/grpcproxy/adapter/lease_client_adapter.go
+@@ -0,0 +1,97 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package adapter
++
++import (
++	"golang.org/x/net/context"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
++)
++
++type ls2lc struct {
++	leaseServer pb.LeaseServer
++}
++
++func LeaseServerToLeaseClient(ls pb.LeaseServer) pb.LeaseClient {
++	return &ls2lc{ls}
++}
++
++func (c *ls2lc) LeaseGrant(ctx context.Context, in *pb.LeaseGrantRequest, opts ...grpc.CallOption) (*pb.LeaseGrantResponse, error) {
++	return c.leaseServer.LeaseGrant(ctx, in)
++}
++
++func (c *ls2lc) LeaseRevoke(ctx context.Context, in *pb.LeaseRevokeRequest, opts ...grpc.CallOption) (*pb.LeaseRevokeResponse, error) {
++	return c.leaseServer.LeaseRevoke(ctx, in)
++}
++
++func (c *ls2lc) LeaseKeepAlive(ctx context.Context, opts ...grpc.CallOption) (pb.Lease_LeaseKeepAliveClient, error) {
++	// ch1 is buffered so server can send error on close
++	ch1, ch2 := make(chan interface{}, 1), make(chan interface{})
++	headerc, trailerc := make(chan metadata.MD, 1), make(chan metadata.MD, 1)
++
++	cctx, ccancel := context.WithCancel(ctx)
++	cli := &chanStream{recvc: ch1, sendc: ch2, ctx: cctx, cancel: ccancel}
++	lclient := &ls2lcClientStream{chanClientStream{headerc, trailerc, cli}}
++
++	sctx, scancel := context.WithCancel(ctx)
++	srv := &chanStream{recvc: ch2, sendc: ch1, ctx: sctx, cancel: scancel}
++	lserver := &ls2lcServerStream{chanServerStream{headerc, trailerc, srv, nil}}
++	go func() {
++		if err := c.leaseServer.LeaseKeepAlive(lserver); err != nil {
++			select {
++			case srv.sendc <- err:
++			case <-sctx.Done():
++			case <-cctx.Done():
++			}
++		}
++		scancel()
++		ccancel()
++	}()
++	return lclient, nil
++}
++
++func (c *ls2lc) LeaseTimeToLive(ctx context.Context, in *pb.LeaseTimeToLiveRequest, opts ...grpc.CallOption) (*pb.LeaseTimeToLiveResponse, error) {
++	return c.leaseServer.LeaseTimeToLive(ctx, in)
++}
++
++// ls2lcClientStream implements Lease_LeaseKeepAliveClient
++type ls2lcClientStream struct{ chanClientStream }
++
++// ls2lcServerStream implements Lease_LeaseKeepAliveServer
++type ls2lcServerStream struct{ chanServerStream }
++
++func (s *ls2lcClientStream) Send(rr *pb.LeaseKeepAliveRequest) error {
++	return s.SendMsg(rr)
++}
++func (s *ls2lcClientStream) Recv() (*pb.LeaseKeepAliveResponse, error) {
++	var v interface{}
++	if err := s.RecvMsg(&v); err != nil {
++		return nil, err
++	}
++	return v.(*pb.LeaseKeepAliveResponse), nil
++}
++
++func (s *ls2lcServerStream) Send(rr *pb.LeaseKeepAliveResponse) error {
++	return s.SendMsg(rr)
++}
++func (s *ls2lcServerStream) Recv() (*pb.LeaseKeepAliveRequest, error) {
++	var v interface{}
++	if err := s.RecvMsg(&v); err != nil {
++		return nil, err
++	}
++	return v.(*pb.LeaseKeepAliveRequest), nil
++}
+diff --git a/proxy/grpcproxy/adapter/watch_client_adapter.go b/proxy/grpcproxy/adapter/watch_client_adapter.go
+new file mode 100644
+index 0000000..5bb7120
+--- /dev/null
++++ b/proxy/grpcproxy/adapter/watch_client_adapter.go
+@@ -0,0 +1,86 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package adapter
++
++import (
++	"errors"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"golang.org/x/net/context"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
++)
++
++var errAlreadySentHeader = errors.New("adapter: already sent header")
++
++type ws2wc struct{ wserv pb.WatchServer }
++
++func WatchServerToWatchClient(wserv pb.WatchServer) pb.WatchClient {
++	return &ws2wc{wserv}
++}
++
++func (s *ws2wc) Watch(ctx context.Context, opts ...grpc.CallOption) (pb.Watch_WatchClient, error) {
++	// ch1 is buffered so server can send error on close
++	ch1, ch2 := make(chan interface{}, 1), make(chan interface{})
++	headerc, trailerc := make(chan metadata.MD, 1), make(chan metadata.MD, 1)
++
++	cctx, ccancel := context.WithCancel(ctx)
++	cli := &chanStream{recvc: ch1, sendc: ch2, ctx: cctx, cancel: ccancel}
++	wclient := &ws2wcClientStream{chanClientStream{headerc, trailerc, cli}}
++
++	sctx, scancel := context.WithCancel(ctx)
++	srv := &chanStream{recvc: ch2, sendc: ch1, ctx: sctx, cancel: scancel}
++	wserver := &ws2wcServerStream{chanServerStream{headerc, trailerc, srv, nil}}
++	go func() {
++		if err := s.wserv.Watch(wserver); err != nil {
++			select {
++			case srv.sendc <- err:
++			case <-sctx.Done():
++			case <-cctx.Done():
++			}
++		}
++		scancel()
++		ccancel()
++	}()
++	return wclient, nil
++}
++
++// ws2wcClientStream implements Watch_WatchClient
++type ws2wcClientStream struct{ chanClientStream }
++
++// ws2wcServerStream implements Watch_WatchServer
++type ws2wcServerStream struct{ chanServerStream }
++
++func (s *ws2wcClientStream) Send(wr *pb.WatchRequest) error {
++	return s.SendMsg(wr)
++}
++func (s *ws2wcClientStream) Recv() (*pb.WatchResponse, error) {
++	var v interface{}
++	if err := s.RecvMsg(&v); err != nil {
++		return nil, err
++	}
++	return v.(*pb.WatchResponse), nil
++}
++
++func (s *ws2wcServerStream) Send(wr *pb.WatchResponse) error {
++	return s.SendMsg(wr)
++}
++func (s *ws2wcServerStream) Recv() (*pb.WatchRequest, error) {
++	var v interface{}
++	if err := s.RecvMsg(&v); err != nil {
++		return nil, err
++	}
++	return v.(*pb.WatchRequest), nil
++}
+diff --git a/proxy/grpcproxy/chan_stream.go b/proxy/grpcproxy/chan_stream.go
+deleted file mode 100644
+index b1620bb..0000000
+--- a/proxy/grpcproxy/chan_stream.go
++++ /dev/null
+@@ -1,138 +0,0 @@
+-// Copyright 2017 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package grpcproxy
+-
+-import (
+-	"golang.org/x/net/context"
+-
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/metadata"
+-)
+-
+-// chanServerStream implements grpc.ServerStream with a chanStream
+-type chanServerStream struct {
+-	headerc  chan<- metadata.MD
+-	trailerc chan<- metadata.MD
+-	grpc.Stream
+-
+-	headers []metadata.MD
+-}
+-
+-func (ss *chanServerStream) SendHeader(md metadata.MD) error {
+-	if ss.headerc == nil {
+-		return errAlreadySentHeader
+-	}
+-	outmd := make(map[string][]string)
+-	for _, h := range append(ss.headers, md) {
+-		for k, v := range h {
+-			outmd[k] = v
+-		}
+-	}
+-	select {
+-	case ss.headerc <- outmd:
+-		ss.headerc = nil
+-		ss.headers = nil
+-		return nil
+-	case <-ss.Context().Done():
+-	}
+-	return ss.Context().Err()
+-}
+-
+-func (ss *chanServerStream) SetHeader(md metadata.MD) error {
+-	if ss.headerc == nil {
+-		return errAlreadySentHeader
+-	}
+-	ss.headers = append(ss.headers, md)
+-	return nil
+-}
+-
+-func (ss *chanServerStream) SetTrailer(md metadata.MD) {
+-	ss.trailerc <- md
+-}
+-
+-// chanClientStream implements grpc.ClientStream with a chanStream
+-type chanClientStream struct {
+-	headerc  <-chan metadata.MD
+-	trailerc <-chan metadata.MD
+-	*chanStream
+-}
+-
+-func (cs *chanClientStream) Header() (metadata.MD, error) {
+-	select {
+-	case md := <-cs.headerc:
+-		return md, nil
+-	case <-cs.Context().Done():
+-	}
+-	return nil, cs.Context().Err()
+-}
+-
+-func (cs *chanClientStream) Trailer() metadata.MD {
+-	select {
+-	case md := <-cs.trailerc:
+-		return md
+-	case <-cs.Context().Done():
+-		return nil
+-	}
+-}
+-
+-func (cs *chanClientStream) CloseSend() error {
+-	close(cs.chanStream.sendc)
+-	return nil
+-}
+-
+-// chanStream implements grpc.Stream using channels
+-type chanStream struct {
+-	recvc  <-chan interface{}
+-	sendc  chan<- interface{}
+-	ctx    context.Context
+-	cancel context.CancelFunc
+-}
+-
+-func (s *chanStream) Context() context.Context { return s.ctx }
+-
+-func (s *chanStream) SendMsg(m interface{}) error {
+-	select {
+-	case s.sendc <- m:
+-		if err, ok := m.(error); ok {
+-			return err
+-		}
+-		return nil
+-	case <-s.ctx.Done():
+-	}
+-	return s.ctx.Err()
+-}
+-
+-func (s *chanStream) RecvMsg(m interface{}) error {
+-	v := m.(*interface{})
+-	for {
+-		select {
+-		case msg, ok := <-s.recvc:
+-			if !ok {
+-				return grpc.ErrClientConnClosing
+-			}
+-			if err, ok := msg.(error); ok {
+-				return err
+-			}
+-			*v = msg
+-			return nil
+-		case <-s.ctx.Done():
+-		}
+-		if len(s.recvc) == 0 {
+-			// prioritize any pending recv messages over canceled context
+-			break
+-		}
+-	}
+-	return s.ctx.Err()
+-}
+diff --git a/proxy/grpcproxy/kv_client_adapter.go b/proxy/grpcproxy/kv_client_adapter.go
+deleted file mode 100644
+index 7880b18..0000000
+--- a/proxy/grpcproxy/kv_client_adapter.go
++++ /dev/null
+@@ -1,47 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package grpcproxy
+-
+-import (
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"golang.org/x/net/context"
+-	grpc "google.golang.org/grpc"
+-)
+-
+-type kvs2kvc struct{ kvs pb.KVServer }
+-
+-func KvServerToKvClient(kvs pb.KVServer) pb.KVClient {
+-	return &kvs2kvc{kvs}
+-}
+-
+-func (s *kvs2kvc) Range(ctx context.Context, in *pb.RangeRequest, opts ...grpc.CallOption) (*pb.RangeResponse, error) {
+-	return s.kvs.Range(ctx, in)
+-}
+-
+-func (s *kvs2kvc) Put(ctx context.Context, in *pb.PutRequest, opts ...grpc.CallOption) (*pb.PutResponse, error) {
+-	return s.kvs.Put(ctx, in)
+-}
+-
+-func (s *kvs2kvc) DeleteRange(ctx context.Context, in *pb.DeleteRangeRequest, opts ...grpc.CallOption) (*pb.DeleteRangeResponse, error) {
+-	return s.kvs.DeleteRange(ctx, in)
+-}
+-
+-func (s *kvs2kvc) Txn(ctx context.Context, in *pb.TxnRequest, opts ...grpc.CallOption) (*pb.TxnResponse, error) {
+-	return s.kvs.Txn(ctx, in)
+-}
+-
+-func (s *kvs2kvc) Compact(ctx context.Context, in *pb.CompactionRequest, opts ...grpc.CallOption) (*pb.CompactionResponse, error) {
+-	return s.kvs.Compact(ctx, in)
+-}
+diff --git a/proxy/grpcproxy/lease_client_adapter.go b/proxy/grpcproxy/lease_client_adapter.go
+deleted file mode 100644
+index ccc05f0..0000000
+--- a/proxy/grpcproxy/lease_client_adapter.go
++++ /dev/null
+@@ -1,97 +0,0 @@
+-// Copyright 2017 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package grpcproxy
+-
+-import (
+-	"golang.org/x/net/context"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/metadata"
+-)
+-
+-type ls2lc struct {
+-	leaseServer pb.LeaseServer
+-}
+-
+-func LeaseServerToLeaseClient(ls pb.LeaseServer) pb.LeaseClient {
+-	return &ls2lc{ls}
+-}
+-
+-func (c *ls2lc) LeaseGrant(ctx context.Context, in *pb.LeaseGrantRequest, opts ...grpc.CallOption) (*pb.LeaseGrantResponse, error) {
+-	return c.leaseServer.LeaseGrant(ctx, in)
+-}
+-
+-func (c *ls2lc) LeaseRevoke(ctx context.Context, in *pb.LeaseRevokeRequest, opts ...grpc.CallOption) (*pb.LeaseRevokeResponse, error) {
+-	return c.leaseServer.LeaseRevoke(ctx, in)
+-}
+-
+-func (c *ls2lc) LeaseKeepAlive(ctx context.Context, opts ...grpc.CallOption) (pb.Lease_LeaseKeepAliveClient, error) {
+-	// ch1 is buffered so server can send error on close
+-	ch1, ch2 := make(chan interface{}, 1), make(chan interface{})
+-	headerc, trailerc := make(chan metadata.MD, 1), make(chan metadata.MD, 1)
+-
+-	cctx, ccancel := context.WithCancel(ctx)
+-	cli := &chanStream{recvc: ch1, sendc: ch2, ctx: cctx, cancel: ccancel}
+-	lclient := &ls2lcClientStream{chanClientStream{headerc, trailerc, cli}}
+-
+-	sctx, scancel := context.WithCancel(ctx)
+-	srv := &chanStream{recvc: ch2, sendc: ch1, ctx: sctx, cancel: scancel}
+-	lserver := &ls2lcServerStream{chanServerStream{headerc, trailerc, srv, nil}}
+-	go func() {
+-		if err := c.leaseServer.LeaseKeepAlive(lserver); err != nil {
+-			select {
+-			case srv.sendc <- err:
+-			case <-sctx.Done():
+-			case <-cctx.Done():
+-			}
+-		}
+-		scancel()
+-		ccancel()
+-	}()
+-	return lclient, nil
+-}
+-
+-func (c *ls2lc) LeaseTimeToLive(ctx context.Context, in *pb.LeaseTimeToLiveRequest, opts ...grpc.CallOption) (*pb.LeaseTimeToLiveResponse, error) {
+-	return c.leaseServer.LeaseTimeToLive(ctx, in)
+-}
+-
+-// ls2lcClientStream implements Lease_LeaseKeepAliveClient
+-type ls2lcClientStream struct{ chanClientStream }
+-
+-// ls2lcServerStream implements Lease_LeaseKeepAliveServer
+-type ls2lcServerStream struct{ chanServerStream }
+-
+-func (s *ls2lcClientStream) Send(rr *pb.LeaseKeepAliveRequest) error {
+-	return s.SendMsg(rr)
+-}
+-func (s *ls2lcClientStream) Recv() (*pb.LeaseKeepAliveResponse, error) {
+-	var v interface{}
+-	if err := s.RecvMsg(&v); err != nil {
+-		return nil, err
+-	}
+-	return v.(*pb.LeaseKeepAliveResponse), nil
+-}
+-
+-func (s *ls2lcServerStream) Send(rr *pb.LeaseKeepAliveResponse) error {
+-	return s.SendMsg(rr)
+-}
+-func (s *ls2lcServerStream) Recv() (*pb.LeaseKeepAliveRequest, error) {
+-	var v interface{}
+-	if err := s.RecvMsg(&v); err != nil {
+-		return nil, err
+-	}
+-	return v.(*pb.LeaseKeepAliveRequest), nil
+-}
+diff --git a/proxy/grpcproxy/watch_client_adapter.go b/proxy/grpcproxy/watch_client_adapter.go
+deleted file mode 100644
+index 61447c7..0000000
+--- a/proxy/grpcproxy/watch_client_adapter.go
++++ /dev/null
+@@ -1,86 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package grpcproxy
+-
+-import (
+-	"errors"
+-
+-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+-	"golang.org/x/net/context"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/metadata"
+-)
+-
+-var errAlreadySentHeader = errors.New("grpcproxy: already send header")
+-
+-type ws2wc struct{ wserv pb.WatchServer }
+-
+-func WatchServerToWatchClient(wserv pb.WatchServer) pb.WatchClient {
+-	return &ws2wc{wserv}
+-}
+-
+-func (s *ws2wc) Watch(ctx context.Context, opts ...grpc.CallOption) (pb.Watch_WatchClient, error) {
+-	// ch1 is buffered so server can send error on close
+-	ch1, ch2 := make(chan interface{}, 1), make(chan interface{})
+-	headerc, trailerc := make(chan metadata.MD, 1), make(chan metadata.MD, 1)
+-
+-	cctx, ccancel := context.WithCancel(ctx)
+-	cli := &chanStream{recvc: ch1, sendc: ch2, ctx: cctx, cancel: ccancel}
+-	wclient := &ws2wcClientStream{chanClientStream{headerc, trailerc, cli}}
+-
+-	sctx, scancel := context.WithCancel(ctx)
+-	srv := &chanStream{recvc: ch2, sendc: ch1, ctx: sctx, cancel: scancel}
+-	wserver := &ws2wcServerStream{chanServerStream{headerc, trailerc, srv, nil}}
+-	go func() {
+-		if err := s.wserv.Watch(wserver); err != nil {
+-			select {
+-			case srv.sendc <- err:
+-			case <-sctx.Done():
+-			case <-cctx.Done():
+-			}
+-		}
+-		scancel()
+-		ccancel()
+-	}()
+-	return wclient, nil
+-}
+-
+-// ws2wcClientStream implements Watch_WatchClient
+-type ws2wcClientStream struct{ chanClientStream }
+-
+-// ws2wcServerStream implements Watch_WatchServer
+-type ws2wcServerStream struct{ chanServerStream }
+-
+-func (s *ws2wcClientStream) Send(wr *pb.WatchRequest) error {
+-	return s.SendMsg(wr)
+-}
+-func (s *ws2wcClientStream) Recv() (*pb.WatchResponse, error) {
+-	var v interface{}
+-	if err := s.RecvMsg(&v); err != nil {
+-		return nil, err
+-	}
+-	return v.(*pb.WatchResponse), nil
+-}
+-
+-func (s *ws2wcServerStream) Send(wr *pb.WatchResponse) error {
+-	return s.SendMsg(wr)
+-}
+-func (s *ws2wcServerStream) Recv() (*pb.WatchRequest, error) {
+-	var v interface{}
+-	if err := s.RecvMsg(&v); err != nil {
+-		return nil, err
+-	}
+-	return v.(*pb.WatchRequest), nil
+-}

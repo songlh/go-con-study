@@ -1,0 +1,1436 @@
+commit 9e7f47c490103bc388f664dab283a73dbb81030d
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Wed Mar 23 17:20:52 2016 -0700
+
+    etcdserver: Alarm RPC
+    
+    Alarms are events that nodes can use to relay health information to
+    the rest of the cluster. A node may Activate an alarm and that alarm
+    will stay set until Deactivated.
+
+diff --git a/alarm/alarms.go b/alarm/alarms.go
+new file mode 100644
+index 0000000..f94fabc
+--- /dev/null
++++ b/alarm/alarms.go
+@@ -0,0 +1,144 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package alarm manages health status alarms in etcd.
++package alarm
++
++import (
++	"sync"
++
++	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/pkg/types"
++	"github.com/coreos/etcd/storage/backend"
++	"github.com/coreos/pkg/capnslog"
++)
++
++var (
++	alarmBucketName = []byte("alarm")
++	plog            = capnslog.NewPackageLogger("github.com/coreos/etcd", "alarm")
++)
++
++type BackendGetter interface {
++	Backend() backend.Backend
++}
++
++type alarmSet map[types.ID]*pb.AlarmMember
++
++// AlarmStore persists alarms to the backend.
++type AlarmStore struct {
++	mu    sync.Mutex
++	types map[pb.AlarmType]alarmSet
++
++	bg BackendGetter
++}
++
++func NewAlarmStore(bg BackendGetter) (*AlarmStore, error) {
++	ret := &AlarmStore{types: make(map[pb.AlarmType]alarmSet), bg: bg}
++	err := ret.restore()
++	return ret, err
++}
++
++func (a *AlarmStore) Activate(id types.ID, at pb.AlarmType) *pb.AlarmMember {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++
++	newAlarm := &pb.AlarmMember{MemberID: uint64(id), Alarm: at}
++	if m := a.addToMap(newAlarm); m != newAlarm {
++		return m
++	}
++
++	v, err := newAlarm.Marshal()
++	if err != nil {
++		plog.Panicf("failed to marshal alarm member")
++	}
++
++	b := a.bg.Backend()
++	b.BatchTx().Lock()
++	b.BatchTx().UnsafePut(alarmBucketName, v, nil)
++	b.BatchTx().Unlock()
++
++	return newAlarm
++}
++
++func (a *AlarmStore) Deactivate(id types.ID, at pb.AlarmType) *pb.AlarmMember {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++
++	t := a.types[at]
++	if t == nil {
++		t = make(alarmSet)
++		a.types[at] = t
++	}
++	m := t[id]
++	if m == nil {
++		return nil
++	}
++
++	delete(t, id)
++
++	v, err := m.Marshal()
++	if err != nil {
++		plog.Panicf("failed to marshal alarm member")
++	}
++
++	b := a.bg.Backend()
++	b.BatchTx().Lock()
++	b.BatchTx().UnsafeDelete(alarmBucketName, v)
++	b.BatchTx().Unlock()
++
++	return m
++}
++
++func (a *AlarmStore) Get(at pb.AlarmType) (ret []*pb.AlarmMember) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	for _, m := range a.types[at] {
++		ret = append(ret, m)
++	}
++	return ret
++}
++
++func (a *AlarmStore) restore() error {
++	b := a.bg.Backend()
++	tx := b.BatchTx()
++
++	tx.Lock()
++	tx.UnsafeCreateBucket(alarmBucketName)
++	err := tx.UnsafeForEach(alarmBucketName, func(k, v []byte) error {
++		var m pb.AlarmMember
++		if err := m.Unmarshal(k); err != nil {
++			return err
++		}
++		a.addToMap(&m)
++		return nil
++	})
++	tx.Unlock()
++
++	b.ForceCommit()
++	return err
++}
++
++func (a *AlarmStore) addToMap(newAlarm *pb.AlarmMember) *pb.AlarmMember {
++	t := a.types[newAlarm.Alarm]
++	if t == nil {
++		t = make(alarmSet)
++		a.types[newAlarm.Alarm] = t
++	}
++	m := t[types.ID(newAlarm.MemberID)]
++	if m != nil {
++		return m
++	}
++	t[types.ID(newAlarm.MemberID)] = newAlarm
++	return newAlarm
++}
+diff --git a/etcdserver/api/v3rpc/maintenance.go b/etcdserver/api/v3rpc/maintenance.go
+index 6fa5411..8c3664f 100644
+--- a/etcdserver/api/v3rpc/maintenance.go
++++ b/etcdserver/api/v3rpc/maintenance.go
+@@ -25,12 +25,17 @@ type BackendGetter interface {
+ 	Backend() backend.Backend
+ }
+ 
++type Alarmer interface {
++	Alarm(ctx context.Context, ar *pb.AlarmRequest) (*pb.AlarmResponse, error)
++}
++
+ type maintenanceServer struct {
+ 	bg BackendGetter
++	a  Alarmer
+ }
+ 
+ func NewMaintenanceServer(s *etcdserver.EtcdServer) pb.MaintenanceServer {
+-	return &maintenanceServer{bg: s}
++	return &maintenanceServer{bg: s, a: s}
+ }
+ 
+ func (ms *maintenanceServer) Defragment(ctx context.Context, sr *pb.DefragmentRequest) (*pb.DefragmentResponse, error) {
+@@ -43,3 +48,8 @@ func (ms *maintenanceServer) Defragment(ctx context.Context, sr *pb.DefragmentRe
+ 	plog.Noticef("finished defragmenting the storage backend")
+ 	return &pb.DefragmentResponse{}, nil
+ }
++
++func (ms *maintenanceServer) Alarm(ctx context.Context, ar *pb.AlarmRequest) (*pb.AlarmResponse, error) {
++	plog.Warningf("alarming %+v", ar)
++	return ms.a.Alarm(ctx, ar)
++}
+diff --git a/etcdserver/api/v3rpc/quota.go b/etcdserver/api/v3rpc/quota.go
+index 1892d1b..ba2288d 100644
+--- a/etcdserver/api/v3rpc/quota.go
++++ b/etcdserver/api/v3rpc/quota.go
+@@ -18,44 +18,72 @@ import (
+ 	"github.com/coreos/etcd/etcdserver"
+ 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
++	"github.com/coreos/etcd/pkg/types"
+ 	"golang.org/x/net/context"
+ )
+ 
+ type quotaKVServer struct {
+ 	pb.KVServer
+-	q etcdserver.Quota
++	qa quotaAlarmer
++}
++
++type quotaAlarmer struct {
++	q  etcdserver.Quota
++	a  Alarmer
++	id types.ID
++}
++
++// check whether request satisfies the quota. If there is not enough space,
++// ignore request and raise the free space alarm.
++func (qa *quotaAlarmer) check(ctx context.Context, r interface{}) error {
++	if qa.q.Available(r) {
++		return nil
++	}
++	req := &pb.AlarmRequest{
++		MemberID: int64(qa.id),
++		Action:   pb.AlarmRequest_ACTIVATE,
++		Alarm:    pb.AlarmType_NOSPACE,
++	}
++	qa.a.Alarm(ctx, req)
++	return rpctypes.ErrNoSpace
+ }
+ 
+ func NewQuotaKVServer(s *etcdserver.EtcdServer) pb.KVServer {
+-	return &quotaKVServer{NewKVServer(s), etcdserver.NewBackendQuota(s)}
++	return &quotaKVServer{
++		NewKVServer(s),
++		quotaAlarmer{etcdserver.NewBackendQuota(s), s, s.ID()},
++	}
+ }
+ 
+ func (s *quotaKVServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
+-	if !s.q.Available(r) {
+-		return nil, rpctypes.ErrNoSpace
++	if err := s.qa.check(ctx, r); err != nil {
++		return nil, err
+ 	}
+ 	return s.KVServer.Put(ctx, r)
+ }
+ 
+ func (s *quotaKVServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
+-	if !s.q.Available(r) {
+-		return nil, rpctypes.ErrNoSpace
++	if err := s.qa.check(ctx, r); err != nil {
++		return nil, err
+ 	}
+ 	return s.KVServer.Txn(ctx, r)
+ }
+ 
+ type quotaLeaseServer struct {
+ 	pb.LeaseServer
+-	q etcdserver.Quota
++	qa quotaAlarmer
+ }
+ 
+ func (s *quotaLeaseServer) LeaseCreate(ctx context.Context, cr *pb.LeaseCreateRequest) (*pb.LeaseCreateResponse, error) {
+-	if !s.q.Available(cr) {
+-		return nil, rpctypes.ErrNoSpace
++	if err := s.qa.check(ctx, cr); err != nil {
++		return nil, err
+ 	}
+ 	return s.LeaseServer.LeaseCreate(ctx, cr)
+ }
+ 
+ func NewQuotaLeaseServer(s *etcdserver.EtcdServer) pb.LeaseServer {
+-	return &quotaLeaseServer{NewLeaseServer(s), etcdserver.NewBackendQuota(s)}
++	return &quotaLeaseServer{
++		NewLeaseServer(s),
++		quotaAlarmer{etcdserver.NewBackendQuota(s), s, s.ID()},
++	}
+ }
+diff --git a/etcdserver/apply.go b/etcdserver/apply.go
+index cb2172a..68bf9f0 100644
+--- a/etcdserver/apply.go
++++ b/etcdserver/apply.go
+@@ -21,6 +21,7 @@ import (
+ 
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+ 	"github.com/coreos/etcd/lease"
++	"github.com/coreos/etcd/pkg/types"
+ 	dstorage "github.com/coreos/etcd/storage"
+ 	"github.com/coreos/etcd/storage/storagepb"
+ 	"github.com/gogo/protobuf/proto"
+@@ -47,6 +48,7 @@ type applierV3 interface {
+ 	Compaction(compaction *pb.CompactionRequest) (*pb.CompactionResponse, error)
+ 	LeaseCreate(lc *pb.LeaseCreateRequest) (*pb.LeaseCreateResponse, error)
+ 	LeaseRevoke(lc *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error)
++	Alarm(*pb.AlarmRequest) (*pb.AlarmResponse, error)
+ 	AuthEnable() (*pb.AuthEnableResponse, error)
+ 	UserAdd(ua *pb.UserAddRequest) (*pb.UserAddResponse, error)
+ }
+@@ -72,6 +74,8 @@ func (s *EtcdServer) applyV3Request(r *pb.InternalRaftRequest) *applyResult {
+ 		ar.resp, ar.err = s.applyV3.LeaseCreate(r.LeaseCreate)
+ 	case r.LeaseRevoke != nil:
+ 		ar.resp, ar.err = s.applyV3.LeaseRevoke(r.LeaseRevoke)
++	case r.Alarm != nil:
++		ar.resp, ar.err = s.applyV3.Alarm(r.Alarm)
+ 	case r.AuthEnable != nil:
+ 		ar.resp, ar.err = s.applyV3.AuthEnable()
+ 	case r.UserAdd != nil:
+@@ -385,6 +389,29 @@ func (a *applierV3backend) LeaseRevoke(lc *pb.LeaseRevokeRequest) (*pb.LeaseRevo
+ 	return &pb.LeaseRevokeResponse{}, err
+ }
+ 
++func (a *applierV3backend) Alarm(ar *pb.AlarmRequest) (*pb.AlarmResponse, error) {
++	resp := &pb.AlarmResponse{}
++	switch ar.Action {
++	case pb.AlarmRequest_GET:
++		resp.Alarms = a.s.alarmStore.Get(ar.Alarm)
++		return resp, nil
++	case pb.AlarmRequest_ACTIVATE:
++		m := a.s.alarmStore.Activate(types.ID(ar.MemberID), ar.Alarm)
++		if m != nil {
++			resp.Alarms = append(resp.Alarms, m)
++		}
++		return resp, nil
++	case pb.AlarmRequest_DEACTIVATE:
++		m := a.s.alarmStore.Deactivate(types.ID(ar.MemberID), ar.Alarm)
++		if m != nil {
++			resp.Alarms = append(resp.Alarms, m)
++		}
++		return resp, nil
++	default:
++		return nil, nil
++	}
++}
++
+ func (a *applierV3backend) AuthEnable() (*pb.AuthEnableResponse, error) {
+ 	a.s.AuthStore().AuthEnable()
+ 	return &pb.AuthEnableResponse{}, nil
+diff --git a/etcdserver/etcdserverpb/etcdserver.pb.go b/etcdserver/etcdserverpb/etcdserver.pb.go
+index 0044a7a..e5519e9 100644
+--- a/etcdserver/etcdserverpb/etcdserver.pb.go
++++ b/etcdserver/etcdserverpb/etcdserver.pb.go
+@@ -52,6 +52,9 @@
+ 		MemberListResponse
+ 		DefragmentRequest
+ 		DefragmentResponse
++		AlarmRequest
++		AlarmMember
++		AlarmResponse
+ 		AuthEnableRequest
+ 		AuthDisableRequest
+ 		AuthenticateRequest
+diff --git a/etcdserver/etcdserverpb/raft_internal.pb.go b/etcdserver/etcdserverpb/raft_internal.pb.go
+index d269791..83a6ef8 100644
+--- a/etcdserver/etcdserverpb/raft_internal.pb.go
++++ b/etcdserver/etcdserverpb/raft_internal.pb.go
+@@ -33,6 +33,7 @@ type InternalRaftRequest struct {
+ 	LeaseRevoke *LeaseRevokeRequest `protobuf:"bytes,9,opt,name=lease_revoke" json:"lease_revoke,omitempty"`
+ 	AuthEnable  *AuthEnableRequest  `protobuf:"bytes,10,opt,name=auth_enable" json:"auth_enable,omitempty"`
+ 	UserAdd     *UserAddRequest     `protobuf:"bytes,11,opt,name=user_add" json:"user_add,omitempty"`
++	Alarm       *AlarmRequest       `protobuf:"bytes,12,opt,name=alarm" json:"alarm,omitempty"`
+ }
+ 
+ func (m *InternalRaftRequest) Reset()         { *m = InternalRaftRequest{} }
+@@ -170,6 +171,16 @@ func (m *InternalRaftRequest) MarshalTo(data []byte) (int, error) {
+ 		}
+ 		i += n10
+ 	}
++	if m.Alarm != nil {
++		data[i] = 0x62
++		i++
++		i = encodeVarintRaftInternal(data, i, uint64(m.Alarm.Size()))
++		n11, err := m.Alarm.MarshalTo(data[i:])
++		if err != nil {
++			return 0, err
++		}
++		i += n11
++	}
+ 	return i, nil
+ }
+ 
+@@ -264,6 +275,10 @@ func (m *InternalRaftRequest) Size() (n int) {
+ 		l = m.UserAdd.Size()
+ 		n += 1 + l + sovRaftInternal(uint64(l))
+ 	}
++	if m.Alarm != nil {
++		l = m.Alarm.Size()
++		n += 1 + l + sovRaftInternal(uint64(l))
++	}
+ 	return n
+ }
+ 
+@@ -664,6 +679,39 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
+ 				return err
+ 			}
+ 			iNdEx = postIndex
++		case 12:
++			if wireType != 2 {
++				return fmt.Errorf("proto: wrong wireType = %d for field Alarm", wireType)
++			}
++			var msglen int
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRaftInternal
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				msglen |= (int(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++			if msglen < 0 {
++				return ErrInvalidLengthRaftInternal
++			}
++			postIndex := iNdEx + msglen
++			if postIndex > l {
++				return io.ErrUnexpectedEOF
++			}
++			if m.Alarm == nil {
++				m.Alarm = &AlarmRequest{}
++			}
++			if err := m.Alarm.Unmarshal(data[iNdEx:postIndex]); err != nil {
++				return err
++			}
++			iNdEx = postIndex
+ 		default:
+ 			iNdEx = preIndex
+ 			skippy, err := skipRaftInternal(data[iNdEx:])
+diff --git a/etcdserver/etcdserverpb/raft_internal.proto b/etcdserver/etcdserverpb/raft_internal.proto
+index 01e0e7c..dd7ac05 100644
+--- a/etcdserver/etcdserverpb/raft_internal.proto
++++ b/etcdserver/etcdserverpb/raft_internal.proto
+@@ -27,6 +27,8 @@ message InternalRaftRequest {
+ 
+   AuthEnableRequest auth_enable = 10;
+   UserAddRequest user_add = 11;
++
++  AlarmRequest alarm = 12;
+ }
+ 
+ message EmptyResponse {
+diff --git a/etcdserver/etcdserverpb/rpc.pb.go b/etcdserver/etcdserverpb/rpc.pb.go
+index f2e4abd..d9e5472 100644
+--- a/etcdserver/etcdserverpb/rpc.pb.go
++++ b/etcdserver/etcdserverpb/rpc.pb.go
+@@ -26,6 +26,26 @@ var _ = proto.Marshal
+ var _ = fmt.Errorf
+ var _ = math.Inf
+ 
++type AlarmType int32
++
++const (
++	AlarmType_NONE    AlarmType = 0
++	AlarmType_NOSPACE AlarmType = 1
++)
++
++var AlarmType_name = map[int32]string{
++	0: "NONE",
++	1: "NOSPACE",
++}
++var AlarmType_value = map[string]int32{
++	"NONE":    0,
++	"NOSPACE": 1,
++}
++
++func (x AlarmType) String() string {
++	return proto.EnumName(AlarmType_name, int32(x))
++}
++
+ type RangeRequest_SortOrder int32
+ 
+ const (
+@@ -127,6 +147,29 @@ func (x Compare_CompareTarget) String() string {
+ 	return proto.EnumName(Compare_CompareTarget_name, int32(x))
+ }
+ 
++type AlarmRequest_AlarmAction int32
++
++const (
++	AlarmRequest_GET        AlarmRequest_AlarmAction = 0
++	AlarmRequest_ACTIVATE   AlarmRequest_AlarmAction = 1
++	AlarmRequest_DEACTIVATE AlarmRequest_AlarmAction = 2
++)
++
++var AlarmRequest_AlarmAction_name = map[int32]string{
++	0: "GET",
++	1: "ACTIVATE",
++	2: "DEACTIVATE",
++}
++var AlarmRequest_AlarmAction_value = map[string]int32{
++	"GET":        0,
++	"ACTIVATE":   1,
++	"DEACTIVATE": 2,
++}
++
++func (x AlarmRequest_AlarmAction) String() string {
++	return proto.EnumName(AlarmRequest_AlarmAction_name, int32(x))
++}
++
+ type ResponseHeader struct {
+ 	ClusterId uint64 `protobuf:"varint,1,opt,name=cluster_id,proto3" json:"cluster_id,omitempty"`
+ 	MemberId  uint64 `protobuf:"varint,2,opt,name=member_id,proto3" json:"member_id,omitempty"`
+@@ -1159,6 +1202,49 @@ func (m *DefragmentResponse) GetHeader() *ResponseHeader {
+ 	return nil
+ }
+ 
++type AlarmRequest struct {
++	Action AlarmRequest_AlarmAction `protobuf:"varint,1,opt,name=action,proto3,enum=etcdserverpb.AlarmRequest_AlarmAction" json:"action,omitempty"`
++	// MemberID is the member raising the alarm request
++	MemberID int64     `protobuf:"varint,2,opt,name=memberID,proto3" json:"memberID,omitempty"`
++	Alarm    AlarmType `protobuf:"varint,3,opt,name=alarm,proto3,enum=etcdserverpb.AlarmType" json:"alarm,omitempty"`
++}
++
++func (m *AlarmRequest) Reset()         { *m = AlarmRequest{} }
++func (m *AlarmRequest) String() string { return proto.CompactTextString(m) }
++func (*AlarmRequest) ProtoMessage()    {}
++
++type AlarmMember struct {
++	MemberID uint64    `protobuf:"varint,1,opt,name=memberID,proto3" json:"memberID,omitempty"`
++	Alarm    AlarmType `protobuf:"varint,2,opt,name=alarm,proto3,enum=etcdserverpb.AlarmType" json:"alarm,omitempty"`
++}
++
++func (m *AlarmMember) Reset()         { *m = AlarmMember{} }
++func (m *AlarmMember) String() string { return proto.CompactTextString(m) }
++func (*AlarmMember) ProtoMessage()    {}
++
++type AlarmResponse struct {
++	Header *ResponseHeader `protobuf:"bytes,1,opt,name=header" json:"header,omitempty"`
++	Alarms []*AlarmMember  `protobuf:"bytes,2,rep,name=alarms" json:"alarms,omitempty"`
++}
++
++func (m *AlarmResponse) Reset()         { *m = AlarmResponse{} }
++func (m *AlarmResponse) String() string { return proto.CompactTextString(m) }
++func (*AlarmResponse) ProtoMessage()    {}
++
++func (m *AlarmResponse) GetHeader() *ResponseHeader {
++	if m != nil {
++		return m.Header
++	}
++	return nil
++}
++
++func (m *AlarmResponse) GetAlarms() []*AlarmMember {
++	if m != nil {
++		return m.Alarms
++	}
++	return nil
++}
++
+ type AuthEnableRequest struct {
+ }
+ 
+@@ -1507,6 +1593,9 @@ func init() {
+ 	proto.RegisterType((*MemberListResponse)(nil), "etcdserverpb.MemberListResponse")
+ 	proto.RegisterType((*DefragmentRequest)(nil), "etcdserverpb.DefragmentRequest")
+ 	proto.RegisterType((*DefragmentResponse)(nil), "etcdserverpb.DefragmentResponse")
++	proto.RegisterType((*AlarmRequest)(nil), "etcdserverpb.AlarmRequest")
++	proto.RegisterType((*AlarmMember)(nil), "etcdserverpb.AlarmMember")
++	proto.RegisterType((*AlarmResponse)(nil), "etcdserverpb.AlarmResponse")
+ 	proto.RegisterType((*AuthEnableRequest)(nil), "etcdserverpb.AuthEnableRequest")
+ 	proto.RegisterType((*AuthDisableRequest)(nil), "etcdserverpb.AuthDisableRequest")
+ 	proto.RegisterType((*AuthenticateRequest)(nil), "etcdserverpb.AuthenticateRequest")
+@@ -1535,10 +1624,12 @@ func init() {
+ 	proto.RegisterType((*RoleDeleteResponse)(nil), "etcdserverpb.RoleDeleteResponse")
+ 	proto.RegisterType((*RoleGrantResponse)(nil), "etcdserverpb.RoleGrantResponse")
+ 	proto.RegisterType((*RoleRevokeResponse)(nil), "etcdserverpb.RoleRevokeResponse")
++	proto.RegisterEnum("etcdserverpb.AlarmType", AlarmType_name, AlarmType_value)
+ 	proto.RegisterEnum("etcdserverpb.RangeRequest_SortOrder", RangeRequest_SortOrder_name, RangeRequest_SortOrder_value)
+ 	proto.RegisterEnum("etcdserverpb.RangeRequest_SortTarget", RangeRequest_SortTarget_name, RangeRequest_SortTarget_value)
+ 	proto.RegisterEnum("etcdserverpb.Compare_CompareResult", Compare_CompareResult_name, Compare_CompareResult_value)
+ 	proto.RegisterEnum("etcdserverpb.Compare_CompareTarget", Compare_CompareTarget_name, Compare_CompareTarget_value)
++	proto.RegisterEnum("etcdserverpb.AlarmRequest_AlarmAction", AlarmRequest_AlarmAction_name, AlarmRequest_AlarmAction_value)
+ }
+ 
+ // Reference imports to suppress errors if they are not otherwise used.
+@@ -2185,6 +2276,8 @@ var _Cluster_serviceDesc = grpc.ServiceDesc{
+ type MaintenanceClient interface {
+ 	// TODO: move Hash from kv to Maintenance
+ 	Defragment(ctx context.Context, in *DefragmentRequest, opts ...grpc.CallOption) (*DefragmentResponse, error)
++	// Alarm activates, deactivates, and queries alarms regarding cluster health.
++	Alarm(ctx context.Context, in *AlarmRequest, opts ...grpc.CallOption) (*AlarmResponse, error)
+ }
+ 
+ type maintenanceClient struct {
+@@ -2204,11 +2297,22 @@ func (c *maintenanceClient) Defragment(ctx context.Context, in *DefragmentReques
+ 	return out, nil
+ }
+ 
++func (c *maintenanceClient) Alarm(ctx context.Context, in *AlarmRequest, opts ...grpc.CallOption) (*AlarmResponse, error) {
++	out := new(AlarmResponse)
++	err := grpc.Invoke(ctx, "/etcdserverpb.Maintenance/Alarm", in, out, c.cc, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ // Server API for Maintenance service
+ 
+ type MaintenanceServer interface {
+ 	// TODO: move Hash from kv to Maintenance
+ 	Defragment(context.Context, *DefragmentRequest) (*DefragmentResponse, error)
++	// Alarm activates, deactivates, and queries alarms regarding cluster health.
++	Alarm(context.Context, *AlarmRequest) (*AlarmResponse, error)
+ }
+ 
+ func RegisterMaintenanceServer(s *grpc.Server, srv MaintenanceServer) {
+@@ -2227,6 +2331,18 @@ func _Maintenance_Defragment_Handler(srv interface{}, ctx context.Context, dec f
+ 	return out, nil
+ }
+ 
++func _Maintenance_Alarm_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error) (interface{}, error) {
++	in := new(AlarmRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	out, err := srv.(MaintenanceServer).Alarm(ctx, in)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ var _Maintenance_serviceDesc = grpc.ServiceDesc{
+ 	ServiceName: "etcdserverpb.Maintenance",
+ 	HandlerType: (*MaintenanceServer)(nil),
+@@ -2235,6 +2351,10 @@ var _Maintenance_serviceDesc = grpc.ServiceDesc{
+ 			MethodName: "Defragment",
+ 			Handler:    _Maintenance_Defragment_Handler,
+ 		},
++		{
++			MethodName: "Alarm",
++			Handler:    _Maintenance_Alarm_Handler,
++		},
+ 	},
+ 	Streams: []grpc.StreamDesc{},
+ }
+@@ -4115,6 +4235,107 @@ func (m *DefragmentResponse) MarshalTo(data []byte) (int, error) {
+ 	return i, nil
+ }
+ 
++func (m *AlarmRequest) Marshal() (data []byte, err error) {
++	size := m.Size()
++	data = make([]byte, size)
++	n, err := m.MarshalTo(data)
++	if err != nil {
++		return nil, err
++	}
++	return data[:n], nil
++}
++
++func (m *AlarmRequest) MarshalTo(data []byte) (int, error) {
++	var i int
++	_ = i
++	var l int
++	_ = l
++	if m.Action != 0 {
++		data[i] = 0x8
++		i++
++		i = encodeVarintRpc(data, i, uint64(m.Action))
++	}
++	if m.MemberID != 0 {
++		data[i] = 0x10
++		i++
++		i = encodeVarintRpc(data, i, uint64(m.MemberID))
++	}
++	if m.Alarm != 0 {
++		data[i] = 0x18
++		i++
++		i = encodeVarintRpc(data, i, uint64(m.Alarm))
++	}
++	return i, nil
++}
++
++func (m *AlarmMember) Marshal() (data []byte, err error) {
++	size := m.Size()
++	data = make([]byte, size)
++	n, err := m.MarshalTo(data)
++	if err != nil {
++		return nil, err
++	}
++	return data[:n], nil
++}
++
++func (m *AlarmMember) MarshalTo(data []byte) (int, error) {
++	var i int
++	_ = i
++	var l int
++	_ = l
++	if m.MemberID != 0 {
++		data[i] = 0x8
++		i++
++		i = encodeVarintRpc(data, i, uint64(m.MemberID))
++	}
++	if m.Alarm != 0 {
++		data[i] = 0x10
++		i++
++		i = encodeVarintRpc(data, i, uint64(m.Alarm))
++	}
++	return i, nil
++}
++
++func (m *AlarmResponse) Marshal() (data []byte, err error) {
++	size := m.Size()
++	data = make([]byte, size)
++	n, err := m.MarshalTo(data)
++	if err != nil {
++		return nil, err
++	}
++	return data[:n], nil
++}
++
++func (m *AlarmResponse) MarshalTo(data []byte) (int, error) {
++	var i int
++	_ = i
++	var l int
++	_ = l
++	if m.Header != nil {
++		data[i] = 0xa
++		i++
++		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
++		n29, err := m.Header.MarshalTo(data[i:])
++		if err != nil {
++			return 0, err
++		}
++		i += n29
++	}
++	if len(m.Alarms) > 0 {
++		for _, msg := range m.Alarms {
++			data[i] = 0x12
++			i++
++			i = encodeVarintRpc(data, i, uint64(msg.Size()))
++			n, err := msg.MarshalTo(data[i:])
++			if err != nil {
++				return 0, err
++			}
++			i += n
++		}
++	}
++	return i, nil
++}
++
+ func (m *AuthEnableRequest) Marshal() (data []byte, err error) {
+ 	size := m.Size()
+ 	data = make([]byte, size)
+@@ -4398,11 +4619,11 @@ func (m *AuthEnableResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n29, err := m.Header.MarshalTo(data[i:])
++		n30, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n29
++		i += n30
+ 	}
+ 	return i, nil
+ }
+@@ -4426,11 +4647,11 @@ func (m *AuthDisableResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n30, err := m.Header.MarshalTo(data[i:])
++		n31, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n30
++		i += n31
+ 	}
+ 	return i, nil
+ }
+@@ -4454,11 +4675,11 @@ func (m *AuthenticateResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n31, err := m.Header.MarshalTo(data[i:])
++		n32, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n31
++		i += n32
+ 	}
+ 	return i, nil
+ }
+@@ -4482,11 +4703,11 @@ func (m *UserAddResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n32, err := m.Header.MarshalTo(data[i:])
++		n33, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n32
++		i += n33
+ 	}
+ 	return i, nil
+ }
+@@ -4510,11 +4731,11 @@ func (m *UserGetResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n33, err := m.Header.MarshalTo(data[i:])
++		n34, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n33
++		i += n34
+ 	}
+ 	return i, nil
+ }
+@@ -4538,11 +4759,11 @@ func (m *UserDeleteResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n34, err := m.Header.MarshalTo(data[i:])
++		n35, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n34
++		i += n35
+ 	}
+ 	return i, nil
+ }
+@@ -4566,11 +4787,11 @@ func (m *UserChangePasswordResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n35, err := m.Header.MarshalTo(data[i:])
++		n36, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n35
++		i += n36
+ 	}
+ 	return i, nil
+ }
+@@ -4594,11 +4815,11 @@ func (m *UserGrantResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n36, err := m.Header.MarshalTo(data[i:])
++		n37, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n36
++		i += n37
+ 	}
+ 	return i, nil
+ }
+@@ -4622,11 +4843,11 @@ func (m *UserRevokeResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n37, err := m.Header.MarshalTo(data[i:])
++		n38, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n37
++		i += n38
+ 	}
+ 	return i, nil
+ }
+@@ -4650,11 +4871,11 @@ func (m *RoleAddResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n38, err := m.Header.MarshalTo(data[i:])
++		n39, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n38
++		i += n39
+ 	}
+ 	return i, nil
+ }
+@@ -4678,11 +4899,11 @@ func (m *RoleGetResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n39, err := m.Header.MarshalTo(data[i:])
++		n40, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n39
++		i += n40
+ 	}
+ 	return i, nil
+ }
+@@ -4706,11 +4927,11 @@ func (m *RoleDeleteResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n40, err := m.Header.MarshalTo(data[i:])
++		n41, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n40
++		i += n41
+ 	}
+ 	return i, nil
+ }
+@@ -4734,11 +4955,11 @@ func (m *RoleGrantResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n41, err := m.Header.MarshalTo(data[i:])
++		n42, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n41
++		i += n42
+ 	}
+ 	return i, nil
+ }
+@@ -4762,11 +4983,11 @@ func (m *RoleRevokeResponse) MarshalTo(data []byte) (int, error) {
+ 		data[i] = 0xa
+ 		i++
+ 		i = encodeVarintRpc(data, i, uint64(m.Header.Size()))
+-		n42, err := m.Header.MarshalTo(data[i:])
++		n43, err := m.Header.MarshalTo(data[i:])
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		i += n42
++		i += n43
+ 	}
+ 	return i, nil
+ }
+@@ -5431,6 +5652,49 @@ func (m *DefragmentResponse) Size() (n int) {
+ 	return n
+ }
+ 
++func (m *AlarmRequest) Size() (n int) {
++	var l int
++	_ = l
++	if m.Action != 0 {
++		n += 1 + sovRpc(uint64(m.Action))
++	}
++	if m.MemberID != 0 {
++		n += 1 + sovRpc(uint64(m.MemberID))
++	}
++	if m.Alarm != 0 {
++		n += 1 + sovRpc(uint64(m.Alarm))
++	}
++	return n
++}
++
++func (m *AlarmMember) Size() (n int) {
++	var l int
++	_ = l
++	if m.MemberID != 0 {
++		n += 1 + sovRpc(uint64(m.MemberID))
++	}
++	if m.Alarm != 0 {
++		n += 1 + sovRpc(uint64(m.Alarm))
++	}
++	return n
++}
++
++func (m *AlarmResponse) Size() (n int) {
++	var l int
++	_ = l
++	if m.Header != nil {
++		l = m.Header.Size()
++		n += 1 + l + sovRpc(uint64(l))
++	}
++	if len(m.Alarms) > 0 {
++		for _, e := range m.Alarms {
++			l = e.Size()
++			n += 1 + l + sovRpc(uint64(l))
++		}
++	}
++	return n
++}
++
+ func (m *AuthEnableRequest) Size() (n int) {
+ 	var l int
+ 	_ = l
+@@ -9761,6 +10025,315 @@ func (m *DefragmentResponse) Unmarshal(data []byte) error {
+ 	}
+ 	return nil
+ }
++func (m *AlarmRequest) Unmarshal(data []byte) error {
++	l := len(data)
++	iNdEx := 0
++	for iNdEx < l {
++		preIndex := iNdEx
++		var wire uint64
++		for shift := uint(0); ; shift += 7 {
++			if shift >= 64 {
++				return ErrIntOverflowRpc
++			}
++			if iNdEx >= l {
++				return io.ErrUnexpectedEOF
++			}
++			b := data[iNdEx]
++			iNdEx++
++			wire |= (uint64(b) & 0x7F) << shift
++			if b < 0x80 {
++				break
++			}
++		}
++		fieldNum := int32(wire >> 3)
++		wireType := int(wire & 0x7)
++		if wireType == 4 {
++			return fmt.Errorf("proto: AlarmRequest: wiretype end group for non-group")
++		}
++		if fieldNum <= 0 {
++			return fmt.Errorf("proto: AlarmRequest: illegal tag %d (wire type %d)", fieldNum, wire)
++		}
++		switch fieldNum {
++		case 1:
++			if wireType != 0 {
++				return fmt.Errorf("proto: wrong wireType = %d for field Action", wireType)
++			}
++			m.Action = 0
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				m.Action |= (AlarmRequest_AlarmAction(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 2:
++			if wireType != 0 {
++				return fmt.Errorf("proto: wrong wireType = %d for field MemberID", wireType)
++			}
++			m.MemberID = 0
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				m.MemberID |= (int64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 3:
++			if wireType != 0 {
++				return fmt.Errorf("proto: wrong wireType = %d for field Alarm", wireType)
++			}
++			m.Alarm = 0
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				m.Alarm |= (AlarmType(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		default:
++			iNdEx = preIndex
++			skippy, err := skipRpc(data[iNdEx:])
++			if err != nil {
++				return err
++			}
++			if skippy < 0 {
++				return ErrInvalidLengthRpc
++			}
++			if (iNdEx + skippy) > l {
++				return io.ErrUnexpectedEOF
++			}
++			iNdEx += skippy
++		}
++	}
++
++	if iNdEx > l {
++		return io.ErrUnexpectedEOF
++	}
++	return nil
++}
++func (m *AlarmMember) Unmarshal(data []byte) error {
++	l := len(data)
++	iNdEx := 0
++	for iNdEx < l {
++		preIndex := iNdEx
++		var wire uint64
++		for shift := uint(0); ; shift += 7 {
++			if shift >= 64 {
++				return ErrIntOverflowRpc
++			}
++			if iNdEx >= l {
++				return io.ErrUnexpectedEOF
++			}
++			b := data[iNdEx]
++			iNdEx++
++			wire |= (uint64(b) & 0x7F) << shift
++			if b < 0x80 {
++				break
++			}
++		}
++		fieldNum := int32(wire >> 3)
++		wireType := int(wire & 0x7)
++		if wireType == 4 {
++			return fmt.Errorf("proto: AlarmMember: wiretype end group for non-group")
++		}
++		if fieldNum <= 0 {
++			return fmt.Errorf("proto: AlarmMember: illegal tag %d (wire type %d)", fieldNum, wire)
++		}
++		switch fieldNum {
++		case 1:
++			if wireType != 0 {
++				return fmt.Errorf("proto: wrong wireType = %d for field MemberID", wireType)
++			}
++			m.MemberID = 0
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				m.MemberID |= (uint64(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		case 2:
++			if wireType != 0 {
++				return fmt.Errorf("proto: wrong wireType = %d for field Alarm", wireType)
++			}
++			m.Alarm = 0
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				m.Alarm |= (AlarmType(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++		default:
++			iNdEx = preIndex
++			skippy, err := skipRpc(data[iNdEx:])
++			if err != nil {
++				return err
++			}
++			if skippy < 0 {
++				return ErrInvalidLengthRpc
++			}
++			if (iNdEx + skippy) > l {
++				return io.ErrUnexpectedEOF
++			}
++			iNdEx += skippy
++		}
++	}
++
++	if iNdEx > l {
++		return io.ErrUnexpectedEOF
++	}
++	return nil
++}
++func (m *AlarmResponse) Unmarshal(data []byte) error {
++	l := len(data)
++	iNdEx := 0
++	for iNdEx < l {
++		preIndex := iNdEx
++		var wire uint64
++		for shift := uint(0); ; shift += 7 {
++			if shift >= 64 {
++				return ErrIntOverflowRpc
++			}
++			if iNdEx >= l {
++				return io.ErrUnexpectedEOF
++			}
++			b := data[iNdEx]
++			iNdEx++
++			wire |= (uint64(b) & 0x7F) << shift
++			if b < 0x80 {
++				break
++			}
++		}
++		fieldNum := int32(wire >> 3)
++		wireType := int(wire & 0x7)
++		if wireType == 4 {
++			return fmt.Errorf("proto: AlarmResponse: wiretype end group for non-group")
++		}
++		if fieldNum <= 0 {
++			return fmt.Errorf("proto: AlarmResponse: illegal tag %d (wire type %d)", fieldNum, wire)
++		}
++		switch fieldNum {
++		case 1:
++			if wireType != 2 {
++				return fmt.Errorf("proto: wrong wireType = %d for field Header", wireType)
++			}
++			var msglen int
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				msglen |= (int(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++			if msglen < 0 {
++				return ErrInvalidLengthRpc
++			}
++			postIndex := iNdEx + msglen
++			if postIndex > l {
++				return io.ErrUnexpectedEOF
++			}
++			if m.Header == nil {
++				m.Header = &ResponseHeader{}
++			}
++			if err := m.Header.Unmarshal(data[iNdEx:postIndex]); err != nil {
++				return err
++			}
++			iNdEx = postIndex
++		case 2:
++			if wireType != 2 {
++				return fmt.Errorf("proto: wrong wireType = %d for field Alarms", wireType)
++			}
++			var msglen int
++			for shift := uint(0); ; shift += 7 {
++				if shift >= 64 {
++					return ErrIntOverflowRpc
++				}
++				if iNdEx >= l {
++					return io.ErrUnexpectedEOF
++				}
++				b := data[iNdEx]
++				iNdEx++
++				msglen |= (int(b) & 0x7F) << shift
++				if b < 0x80 {
++					break
++				}
++			}
++			if msglen < 0 {
++				return ErrInvalidLengthRpc
++			}
++			postIndex := iNdEx + msglen
++			if postIndex > l {
++				return io.ErrUnexpectedEOF
++			}
++			m.Alarms = append(m.Alarms, &AlarmMember{})
++			if err := m.Alarms[len(m.Alarms)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
++				return err
++			}
++			iNdEx = postIndex
++		default:
++			iNdEx = preIndex
++			skippy, err := skipRpc(data[iNdEx:])
++			if err != nil {
++				return err
++			}
++			if skippy < 0 {
++				return ErrInvalidLengthRpc
++			}
++			if (iNdEx + skippy) > l {
++				return io.ErrUnexpectedEOF
++			}
++			iNdEx += skippy
++		}
++	}
++
++	if iNdEx > l {
++		return io.ErrUnexpectedEOF
++	}
++	return nil
++}
+ func (m *AuthEnableRequest) Unmarshal(data []byte) error {
+ 	l := len(data)
+ 	iNdEx := 0
+diff --git a/etcdserver/etcdserverpb/rpc.proto b/etcdserver/etcdserverpb/rpc.proto
+index 444b004..cbed75a 100644
+--- a/etcdserver/etcdserverpb/rpc.proto
++++ b/etcdserver/etcdserverpb/rpc.proto
+@@ -79,6 +79,9 @@ service Cluster {
+ service Maintenance {
+   // TODO: move Hash from kv to Maintenance
+   rpc Defragment(DefragmentRequest) returns (DefragmentResponse) {}
++
++  // Alarm activates, deactivates, and queries alarms regarding cluster health.
++  rpc Alarm(AlarmRequest) returns (AlarmResponse) {}
+ }
+ 
+ service Auth {
+@@ -438,6 +441,33 @@ message DefragmentResponse {
+   ResponseHeader header = 1;
+ }
+ 
++enum AlarmType {
++	NONE = 0; // default, used to query if any alarm is active
++	NOSPACE = 1;
++}
++
++message AlarmRequest {
++  enum AlarmAction {
++	GET = 0;
++	ACTIVATE = 1;
++	DEACTIVATE = 2;
++  }
++  AlarmAction action = 1;
++  // MemberID is the member raising the alarm request
++  int64 memberID = 2;
++  AlarmType alarm = 3;
++}
++
++message AlarmMember {
++	uint64	memberID = 1;
++	AlarmType alarm = 2;
++}
++
++message AlarmResponse {
++  ResponseHeader header = 1;
++  repeated AlarmMember alarms = 2;
++}
++
+ message AuthEnableRequest {
+ }
+ 
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index b18d48a..fdb6880 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -27,6 +27,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/coreos/etcd/alarm"
+ 	"github.com/coreos/etcd/auth"
+ 	"github.com/coreos/etcd/compactor"
+ 	"github.com/coreos/etcd/discovery"
+@@ -172,12 +173,13 @@ type EtcdServer struct {
+ 
+ 	store store.Store
+ 
+-	applyV3 applierV3
+-	kv        dstorage.ConsistentWatchableKV
+-	lessor    lease.Lessor
+-	bemu      sync.Mutex
+-	be        backend.Backend
+-	authStore auth.AuthStore
++	applyV3    applierV3
++	kv         dstorage.ConsistentWatchableKV
++	lessor     lease.Lessor
++	bemu       sync.Mutex
++	be         backend.Backend
++	authStore  auth.AuthStore
++	alarmStore *alarm.AlarmStore
+ 
+ 	stats  *stats.ServerStats
+ 	lstats *stats.LeaderStats
+@@ -374,6 +376,12 @@ func NewServer(cfg *ServerConfig) (*EtcdServer, error) {
+ 		srv.compactor = compactor.NewPeriodic(h, srv.kv, srv)
+ 		srv.compactor.Run()
+ 	}
++
++	as, aserr := alarm.NewAlarmStore(srv)
++	if aserr != nil {
++		return nil, aserr
++	}
++	srv.alarmStore = as
+ 	srv.applyV3 = newQuotaApplierV3(srv, &applierV3backend{srv})
+ 
+ 	// TODO: move transport initialization near the definition of remote
+diff --git a/etcdserver/v3demo_server.go b/etcdserver/v3demo_server.go
+index 78b132f..395ed74 100644
+--- a/etcdserver/v3demo_server.go
++++ b/etcdserver/v3demo_server.go
+@@ -173,6 +173,14 @@ func (s *EtcdServer) LeaseRenew(id lease.LeaseID) (int64, error) {
+ 	return ttl, err
+ }
+ 
++func (s *EtcdServer) Alarm(ctx context.Context, r *pb.AlarmRequest) (*pb.AlarmResponse, error) {
++	result, err := s.processInternalRaftRequest(ctx, pb.InternalRaftRequest{Alarm: r})
++	if err != nil {
++		return nil, err
++	}
++	return result.resp.(*pb.AlarmResponse), result.err
++}
++
+ func (s *EtcdServer) AuthEnable(ctx context.Context, r *pb.AuthEnableRequest) (*pb.AuthEnableResponse, error) {
+ 	result, err := s.processInternalRaftRequest(ctx, pb.InternalRaftRequest{AuthEnable: r})
+ 	if err != nil {
+diff --git a/test b/test
+index 8882667..60551b6 100755
+--- a/test
++++ b/test
+@@ -21,7 +21,7 @@ TESTABLE_AND_FORMATTABLE="client clientv3 discovery error etcdctl/ctlv2 etcdctl/
+ # TODO: add it to race testing when the issue is resolved
+ # https://github.com/golang/go/issues/9946
+ NO_RACE_TESTABLE="rafthttp"
+-FORMATTABLE="$TESTABLE_AND_FORMATTABLE $NO_RACE_TESTABLE *.go etcdctl/ integration clientv3/integration e2e"
++FORMATTABLE="$TESTABLE_AND_FORMATTABLE $NO_RACE_TESTABLE *.go etcdctl/ integration clientv3/integration e2e alarm"
+ 
+ # user has not provided PKG override
+ if [ -z "$PKG" ]; then

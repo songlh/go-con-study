@@ -1,0 +1,219 @@
+commit 24a210ab2064638ca4be1d76896ecc1c110d3a4f
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Thu Mar 5 21:52:35 2015 -0800
+
+    tools/etcd-tester: add kill one member tests
+
+diff --git a/tools/functional-tester/etcd-tester/cluster.go b/tools/functional-tester/etcd-tester/cluster.go
+index 25b8516..876d57e 100644
+--- a/tools/functional-tester/etcd-tester/cluster.go
++++ b/tools/functional-tester/etcd-tester/cluster.go
+@@ -32,6 +32,7 @@ type cluster struct {
+ 
+ 	Size       int
+ 	Agents     []client.Agent
++	Stressers  []Stresser
+ 	Names      []string
+ 	ClientURLs []string
+ }
+@@ -98,8 +99,19 @@ func (c *cluster) Bootstrap() error {
+ 		}
+ 	}
+ 
++	stressers := make([]Stresser, len(clientURLs))
++	for i, u := range clientURLs {
++		s := &stresser{
++			Endpoint: u,
++			N:        200,
++		}
++		go s.Stress()
++		stressers[i] = s
++	}
++
+ 	c.Size = size
+ 	c.Agents = agents
++	c.Stressers = stressers
+ 	c.Names = names
+ 	c.ClientURLs = clientURLs
+ 	return nil
+@@ -117,19 +129,35 @@ func (c *cluster) WaitHealth() error {
+ 	return err
+ }
+ 
++func (c *cluster) Report() (success, failure int) {
++	for _, stress := range c.Stressers {
++		s, f := stress.Report()
++		success += s
++		failure += f
++	}
++	return
++}
++
+ func (c *cluster) Cleanup() error {
++	var lasterr error
+ 	for _, a := range c.Agents {
+ 		if err := a.Cleanup(); err != nil {
+-			return err
++			lasterr = err
+ 		}
+ 	}
+-	return nil
++	for _, s := range c.Stressers {
++		s.Cancel()
++	}
++	return lasterr
+ }
+ 
+ func (c *cluster) Terminate() {
+ 	for _, a := range c.Agents {
+ 		a.Terminate()
+ 	}
++	for _, s := range c.Stressers {
++		s.Cancel()
++	}
+ }
+ 
+ // setHealthKey sets health key on all given urls.
+diff --git a/tools/functional-tester/etcd-tester/failure.go b/tools/functional-tester/etcd-tester/failure.go
+index fc8aebe..79efe4c 100644
+--- a/tools/functional-tester/etcd-tester/failure.go
++++ b/tools/functional-tester/etcd-tester/failure.go
+@@ -14,7 +14,13 @@
+ 
+ package main
+ 
+-import "math/rand"
++import (
++	"fmt"
++	"math/rand"
++	"time"
++)
++
++const snapshotCount = 10000
+ 
+ type failure interface {
+ 	// Inject injeccts the failure into the testing cluster at the given
+@@ -98,3 +104,71 @@ func getToKillMap(size int, seed int) map[int]bool {
+ 		}
+ 	}
+ }
++
++type failureKillOne struct {
++	description
++}
++
++func newFailureKillOne() *failureKillOne {
++	return &failureKillOne{
++		description: "kill one random member",
++	}
++}
++
++func (f *failureKillOne) Inject(c *cluster, round int) error {
++	i := round % c.Size
++	return c.Agents[i].Stop()
++}
++
++func (f *failureKillOne) Recover(c *cluster, round int) error {
++	i := round % c.Size
++	if _, err := c.Agents[i].Restart(); err != nil {
++		return err
++	}
++	return c.WaitHealth()
++}
++
++// failureKillOneForLongTime kills one member for long time, and restart
++// after a snapshot is required.
++type failureKillOneForLongTime struct {
++	description
++}
++
++func newFailureKillOneForLongTime() *failureKillOneForLongTime {
++	return &failureKillOneForLongTime{
++		description: "kill one member for long time and expect it to recover from incoming snapshot",
++	}
++}
++
++func (f *failureKillOneForLongTime) Inject(c *cluster, round int) error {
++	i := round % c.Size
++	if err := c.Agents[i].Stop(); err != nil {
++		return err
++	}
++	if c.Size >= 3 {
++		start, _ := c.Report()
++		var end int
++		// Normal healthy cluster could accept 1000req/s at least.
++		// Give it 3-times time to create a new snapshot.
++		retry := snapshotCount / 1000 * 3
++		for j := 0; j < retry; j++ {
++			end, _ = c.Report()
++			// If the number of proposals committed is bigger than snapshot count,
++			// a new snapshot should have been created.
++			if end-start > snapshotCount {
++				return nil
++			}
++			time.Sleep(time.Second)
++		}
++		return fmt.Errorf("cluster too slow: only commit %d requests in %ds", end-start, retry)
++	}
++	return nil
++}
++
++func (f *failureKillOneForLongTime) Recover(c *cluster, round int) error {
++	i := round % c.Size
++	if _, err := c.Agents[i].Restart(); err != nil {
++		return err
++	}
++	return c.WaitHealth()
++}
+diff --git a/tools/functional-tester/etcd-tester/main.go b/tools/functional-tester/etcd-tester/main.go
+index d0d4c2b..6c8fe5d 100644
+--- a/tools/functional-tester/etcd-tester/main.go
++++ b/tools/functional-tester/etcd-tester/main.go
+@@ -33,24 +33,15 @@ func main() {
+ 	}
+ 	defer c.Terminate()
+ 
+-	stressers := make([]Stresser, len(c.ClientURLs))
+-	for i, u := range c.ClientURLs {
+-		s := &stresser{
+-			Endpoint: u,
+-			N:        200,
+-		}
+-		go s.Stress()
+-		stressers[i] = s
+-	}
+-
+ 	t := &tester{
+-		failures: []failure{newFailureKillAll(), newFailureKillMajority()},
+-		cluster:  c,
+-		limit:    *limit,
++		failures: []failure{
++			newFailureKillAll(),
++			newFailureKillMajority(),
++			newFailureKillOne(),
++			newFailureKillOneForLongTime(),
++		},
++		cluster: c,
++		limit:   *limit,
+ 	}
+ 	t.runLoop()
+-
+-	for _, s := range stressers {
+-		s.Cancel()
+-	}
+ }
+diff --git a/tools/functional-tester/etcd-tester/stresser.go b/tools/functional-tester/etcd-tester/stresser.go
+index 680d473..280c1e1 100644
+--- a/tools/functional-tester/etcd-tester/stresser.go
++++ b/tools/functional-tester/etcd-tester/stresser.go
+@@ -65,8 +65,9 @@ func (s *stresser) Stress() error {
+ 				s.mu.Lock()
+ 				if err != nil {
+ 					s.failure++
++				} else {
++					s.success++
+ 				}
+-				s.success++
+ 				s.mu.Unlock()
+ 			}
+ 		}()

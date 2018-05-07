@@ -1,0 +1,152 @@
+commit 9def4cb9febc0a12026eeac72c4815f0a5efe021
+Author: sharat <sinsharat@gmail.com>
+Date:   Thu Feb 2 18:49:02 2017 +0530
+
+    *: Use http.Request.WithContext instead of Cancel
+
+diff --git a/lease/leasehttp/http.go b/lease/leasehttp/http.go
+index 256051e..c3175cb 100644
+--- a/lease/leasehttp/http.go
++++ b/lease/leasehttp/http.go
+@@ -16,6 +16,7 @@ package leasehttp
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"io/ioutil"
+@@ -26,7 +27,6 @@ import (
+ 	"github.com/coreos/etcd/lease"
+ 	"github.com/coreos/etcd/lease/leasepb"
+ 	"github.com/coreos/etcd/pkg/httputil"
+-	"golang.org/x/net/context"
+ )
+ 
+ var (
+@@ -202,45 +202,27 @@ func TimeToLiveHTTP(ctx context.Context, id lease.LeaseID, keys bool, url string
+ 	}
+ 	req.Header.Set("Content-Type", "application/protobuf")
+ 
+-	cancel := httputil.RequestCanceler(req)
++	req = req.WithContext(ctx)
+ 
+ 	cc := &http.Client{Transport: rt}
+ 	var b []byte
+ 	// buffer errc channel so that errc don't block inside the go routinue
+-	errc := make(chan error, 2)
+-	go func() {
+-		resp, err := cc.Do(req)
+-		if err != nil {
+-			errc <- err
+-			return
+-		}
+-		b, err = readResponse(resp)
+-		if err != nil {
+-			errc <- err
+-			return
+-		}
+-		if resp.StatusCode == http.StatusRequestTimeout {
+-			errc <- ErrLeaseHTTPTimeout
+-			return
+-		}
+-		if resp.StatusCode == http.StatusNotFound {
+-			errc <- lease.ErrLeaseNotFound
+-			return
+-		}
+-		if resp.StatusCode != http.StatusOK {
+-			errc <- fmt.Errorf("lease: unknown error(%s)", string(b))
+-			return
+-		}
+-		errc <- nil
+-	}()
+-	select {
+-	case derr := <-errc:
+-		if derr != nil {
+-			return nil, derr
+-		}
+-	case <-ctx.Done():
+-		cancel()
+-		return nil, ctx.Err()
++	resp, err := cc.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	b, err = readResponse(resp)
++	if err != nil {
++		return nil, err
++	}
++	if resp.StatusCode == http.StatusRequestTimeout {
++		return nil, ErrLeaseHTTPTimeout
++	}
++	if resp.StatusCode == http.StatusNotFound {
++		return nil, lease.ErrLeaseNotFound
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("lease: unknown error(%s)", string(b))
+ 	}
+ 
+ 	lresp := &leasepb.LeaseInternalResponse{}
+diff --git a/pkg/httputil/httputil.go b/pkg/httputil/httputil.go
+index 859fc9d..09f44e7 100644
+--- a/pkg/httputil/httputil.go
++++ b/pkg/httputil/httputil.go
+@@ -13,15 +13,6 @@ import (
+ 	"net/http"
+ )
+ 
+-func RequestCanceler(req *http.Request) func() {
+-	ch := make(chan struct{})
+-	req.Cancel = ch
+-
+-	return func() {
+-		close(ch)
+-	}
+-}
+-
+ // GracefulClose drains http.Response.Body until it hits EOF
+ // and closes it. This prevents TCP/TLS connections from closing,
+ // therefore available for reuse.
+diff --git a/proxy/httpproxy/reverse.go b/proxy/httpproxy/reverse.go
+index d024de6..fbde812 100644
+--- a/proxy/httpproxy/reverse.go
++++ b/proxy/httpproxy/reverse.go
+@@ -16,6 +16,7 @@ package httpproxy
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+@@ -24,11 +25,9 @@ import (
+ 	"net/url"
+ 	"strings"
+ 	"sync/atomic"
+-
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
+-	"github.com/coreos/etcd/pkg/httputil"
+ 	"github.com/coreos/pkg/capnslog"
+ )
+ 
+@@ -110,7 +109,9 @@ func (p *reverseProxy) ServeHTTP(rw http.ResponseWriter, clientreq *http.Request
+ 	var requestClosed int32
+ 	completeCh := make(chan bool, 1)
+ 	closeNotifier, ok := rw.(http.CloseNotifier)
+-	cancel := httputil.RequestCanceler(proxyreq)
++	ctx, cancel := context.WithCancel(context.Background())
++	proxyreq = proxyreq.WithContext(ctx)
++	defer cancel()
+ 	if ok {
+ 		closeCh := closeNotifier.CloseNotify()
+ 		go func() {
+@@ -118,7 +119,6 @@ func (p *reverseProxy) ServeHTTP(rw http.ResponseWriter, clientreq *http.Request
+ 			case <-closeCh:
+ 				atomic.StoreInt32(&requestClosed, 1)
+ 				plog.Printf("client %v closed request prematurely", clientreq.RemoteAddr)
+-				cancel()
+ 			case <-completeCh:
+ 			}
+ 		}()

@@ -1,0 +1,126 @@
+commit 64413927cc4ca5fadac0b93be423c326433e4365
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Jan 28 12:54:03 2016 -0800
+
+    clientv3: support connection timeout
+
+diff --git a/clientv3/client.go b/clientv3/client.go
+index f66eae5..aa8ad7f 100644
+--- a/clientv3/client.go
++++ b/clientv3/client.go
+@@ -16,6 +16,7 @@ package clientv3
+ 
+ import (
+ 	"sync"
++	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc/codes"
+@@ -49,6 +50,9 @@ type Config struct {
+ 	// RetryDialer chooses the next endpoint to use
+ 	RetryDialer EndpointDialer
+ 
++	// DialTimeout is the timeout for failing to establish a connection.
++	DialTimeout time.Duration
++
+ 	// TODO TLS options
+ }
+ 
+@@ -96,7 +100,15 @@ func (c *Client) Errors() (errs []error) {
+ // Dial establishes a connection for a given endpoint using the client's config
+ func (c *Client) Dial(endpoint string) (*grpc.ClientConn, error) {
+ 	// TODO: enable grpc.WithTransportCredentials(creds)
+-	return grpc.Dial(endpoint, grpc.WithInsecure())
++	conn, err := grpc.Dial(
++		endpoint,
++		grpc.WithBlock(),
++		grpc.WithTimeout(c.cfg.DialTimeout),
++		grpc.WithInsecure())
++	if err != nil {
++		return nil, err
++	}
++	return conn, nil
+ }
+ 
+ func newClient(conn *grpc.ClientConn, cfg *Config) *Client {
+@@ -146,7 +158,7 @@ func dialEndpointList(c *Client) (*grpc.ClientConn, error) {
+ 	var err error
+ 	for _, ep := range c.Endpoints() {
+ 		conn, curErr := c.Dial(ep)
+-		if err != nil {
++		if curErr != nil {
+ 			err = curErr
+ 		} else {
+ 			return conn, nil
+diff --git a/clientv3/client_test.go b/clientv3/client_test.go
+new file mode 100644
+index 0000000..2beac42
+--- /dev/null
++++ b/clientv3/client_test.go
+@@ -0,0 +1,53 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++package clientv3
++
++import (
++	"testing"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
++)
++
++func TestDialTimeout(t *testing.T) {
++	donec := make(chan error)
++	go func() {
++		// without timeout, grpc keeps redialing if connection refused
++		cfg := Config{
++			Endpoints:   []string{"localhost:12345"},
++			DialTimeout: 2 * time.Second}
++		c, err := New(cfg)
++		if c != nil || err == nil {
++			t.Errorf("new client should fail")
++		}
++		donec <- err
++	}()
++
++	time.Sleep(10 * time.Millisecond)
++
++	select {
++	case err := <-donec:
++		t.Errorf("dial didn't wait (%v)", err)
++	default:
++	}
++
++	select {
++	case <-time.After(5 * time.Second):
++		t.Errorf("failed to timeout dial on time")
++	case err := <-donec:
++		if err != grpc.ErrClientConnTimeout {
++			t.Errorf("unexpected error %v, want %v", err, grpc.ErrClientConnTimeout)
++		}
++	}
++}
+diff --git a/test b/test
+index 2c1d5c5..edb2135 100755
+--- a/test
++++ b/test
+@@ -16,7 +16,7 @@ COVER=${COVER:-"-cover"}
+ source ./build
+ 
+ # Hack: gofmt ./ will recursively check the .git directory. So use *.go for gofmt.
+-TESTABLE_AND_FORMATTABLE="client discovery error etcdctl/command etcdmain etcdserver etcdserver/auth etcdserver/etcdhttp etcdserver/etcdhttp/httptypes pkg/fileutil pkg/flags pkg/idutil pkg/ioutil pkg/netutil pkg/osutil pkg/pbutil pkg/types pkg/transport pkg/wait proxy raft snap storage storage/backend store version wal"
++TESTABLE_AND_FORMATTABLE="client clientv3 discovery error etcdctl/command etcdmain etcdserver etcdserver/auth etcdserver/etcdhttp etcdserver/etcdhttp/httptypes pkg/fileutil pkg/flags pkg/idutil pkg/ioutil pkg/netutil pkg/osutil pkg/pbutil pkg/types pkg/transport pkg/wait proxy raft snap storage storage/backend store version wal"
+ # TODO: add it to race testing when the issue is resolved
+ # https://github.com/golang/go/issues/9946
+ NO_RACE_TESTABLE="rafthttp"

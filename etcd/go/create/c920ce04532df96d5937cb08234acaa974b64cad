@@ -1,0 +1,225 @@
+commit c920ce04532df96d5937cb08234acaa974b64cad
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Mon Jul 18 13:29:39 2016 -0700
+
+    fileutil: rework purge tests so they don't poll
+    
+    Fixes #5966
+
+diff --git a/pkg/fileutil/purge.go b/pkg/fileutil/purge.go
+index 77d021a..53bda0c 100644
+--- a/pkg/fileutil/purge.go
++++ b/pkg/fileutil/purge.go
+@@ -23,6 +23,11 @@ import (
+ )
+ 
+ func PurgeFile(dirname string, suffix string, max uint, interval time.Duration, stop <-chan struct{}) <-chan error {
++	return purgeFile(dirname, suffix, max, interval, stop, nil)
++}
++
++// purgeFile is the internal implementation for PurgeFile which can post purged files to purgec if non-nil.
++func purgeFile(dirname string, suffix string, max uint, interval time.Duration, stop <-chan struct{}, purgec chan<- string) <-chan error {
+ 	errC := make(chan error, 1)
+ 	go func() {
+ 		for {
+@@ -38,6 +43,7 @@ func PurgeFile(dirname string, suffix string, max uint, interval time.Duration,
+ 				}
+ 			}
+ 			sort.Strings(newfnames)
++			fnames = newfnames
+ 			for len(newfnames) > int(max) {
+ 				f := path.Join(dirname, newfnames[0])
+ 				l, err := TryLockFile(f, os.O_WRONLY, PrivateFileMode)
+@@ -56,6 +62,11 @@ func PurgeFile(dirname string, suffix string, max uint, interval time.Duration,
+ 				plog.Infof("purged file %s successfully", f)
+ 				newfnames = newfnames[1:]
+ 			}
++			if purgec != nil {
++				for i := 0; i < len(fnames)-len(newfnames); i++ {
++					purgec <- fnames[i]
++				}
++			}
+ 			select {
+ 			case <-time.After(interval):
+ 			case <-stop:
+diff --git a/pkg/fileutil/purge_test.go b/pkg/fileutil/purge_test.go
+index f3c10fc..6960ce6 100644
+--- a/pkg/fileutil/purge_test.go
++++ b/pkg/fileutil/purge_test.go
+@@ -31,44 +31,48 @@ func TestPurgeFile(t *testing.T) {
+ 	}
+ 	defer os.RemoveAll(dir)
+ 
+-	for i := 0; i < 5; i++ {
+-		var f *os.File
+-		f, err = os.Create(path.Join(dir, fmt.Sprintf("%d.test", i)))
+-		if err != nil {
++	// minimal file set
++	for i := 0; i < 3; i++ {
++		f, ferr := os.Create(path.Join(dir, fmt.Sprintf("%d.test", i)))
++		if ferr != nil {
+ 			t.Fatal(err)
+ 		}
+ 		f.Close()
+ 	}
+ 
+-	stop := make(chan struct{})
++	stop, purgec := make(chan struct{}), make(chan string, 10)
+ 
+-	// keep at most 3 most recent files
+-	errch := PurgeFile(dir, "test", 3, time.Millisecond, stop)
+-
+-	// create 5 more files
+-	for i := 5; i < 10; i++ {
+-		var f *os.File
+-		f, err = os.Create(path.Join(dir, fmt.Sprintf("%d.test", i)))
+-		if err != nil {
+-			t.Fatal(err)
++	// keep 3 most recent files
++	errch := purgeFile(dir, "test", 3, time.Millisecond, stop, purgec)
++	select {
++	case f := <-purgec:
++		t.Errorf("unexpected purge on %q", f)
++	case <-time.After(10 * time.Millisecond):
++	}
++
++	// rest of the files
++	for i := 4; i < 10; i++ {
++		go func(n int) {
++			f, ferr := os.Create(path.Join(dir, fmt.Sprintf("%d.test", n)))
++			if ferr != nil {
++				t.Fatal(err)
++			}
++			f.Close()
++		}(i)
++	}
++
++	// watch files purge away
++	for i := 4; i < 10; i++ {
++		select {
++		case <-purgec:
++		case <-time.After(time.Second):
++			t.Errorf("purge took too long")
+ 		}
+-		f.Close()
+-		time.Sleep(10 * time.Millisecond)
+ 	}
+ 
+-	// purge routine should purge 7 out of 10 files and only keep the
+-	// 3 most recent ones.
+-	// Wait for purging for at most 300ms.
+-	var fnames []string
+-	for i := 0; i < 30; i++ {
+-		fnames, err = ReadDir(dir)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		if len(fnames) <= 3 {
+-			break
+-		}
+-		time.Sleep(10 * time.Millisecond)
++	fnames, rerr := ReadDir(dir)
++	if rerr != nil {
++		t.Fatal(rerr)
+ 	}
+ 	wnames := []string{"7.test", "8.test", "9.test"}
+ 	if !reflect.DeepEqual(fnames, wnames) {
+@@ -77,9 +81,11 @@ func TestPurgeFile(t *testing.T) {
+ 
+ 	// no error should be reported from purge routine
+ 	select {
++	case f := <-purgec:
++		t.Errorf("unexpected purge on %q", f)
+ 	case err := <-errch:
+ 		t.Errorf("unexpected purge error %v", err)
+-	case <-time.After(time.Millisecond):
++	case <-time.After(10 * time.Millisecond):
+ 	}
+ 	close(stop)
+ }
+@@ -107,29 +113,33 @@ func TestPurgeFileHoldingLockFile(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	stop := make(chan struct{})
+-	errch := PurgeFile(dir, "test", 3, time.Millisecond, stop)
++	stop, purgec := make(chan struct{}), make(chan string, 10)
++	errch := purgeFile(dir, "test", 3, time.Millisecond, stop, purgec)
+ 
+-	var fnames []string
+-	for i := 0; i < 10; i++ {
+-		fnames, err = ReadDir(dir)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		if len(fnames) <= 5 {
+-			break
++	for i := 0; i < 5; i++ {
++		select {
++		case <-purgec:
++		case <-time.After(time.Second):
++			t.Fatalf("purge took too long")
+ 		}
+-		time.Sleep(10 * time.Millisecond)
+ 	}
++
++	fnames, rerr := ReadDir(dir)
++	if rerr != nil {
++		t.Fatal(rerr)
++	}
++
+ 	wnames := []string{"5.test", "6.test", "7.test", "8.test", "9.test"}
+ 	if !reflect.DeepEqual(fnames, wnames) {
+ 		t.Errorf("filenames = %v, want %v", fnames, wnames)
+ 	}
+ 
+ 	select {
++	case s := <-purgec:
++		t.Errorf("unexpected purge %q", s)
+ 	case err = <-errch:
+ 		t.Errorf("unexpected purge error %v", err)
+-	case <-time.After(time.Millisecond):
++	case <-time.After(10 * time.Millisecond):
+ 	}
+ 
+ 	// remove the purge barrier
+@@ -137,15 +147,18 @@ func TestPurgeFileHoldingLockFile(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	for i := 0; i < 10; i++ {
+-		fnames, err = ReadDir(dir)
+-		if err != nil {
+-			t.Fatal(err)
++	// wait for rest of purges (5, 6)
++	for i := 0; i < 2; i++ {
++		select {
++		case <-purgec:
++		case <-time.After(time.Second):
++			t.Fatalf("purge took too long")
+ 		}
+-		if len(fnames) <= 3 {
+-			break
+-		}
+-		time.Sleep(10 * time.Millisecond)
++	}
++
++	fnames, rerr = ReadDir(dir)
++	if rerr != nil {
++		t.Fatal(rerr)
+ 	}
+ 	wnames = []string{"7.test", "8.test", "9.test"}
+ 	if !reflect.DeepEqual(fnames, wnames) {
+@@ -153,9 +166,11 @@ func TestPurgeFileHoldingLockFile(t *testing.T) {
+ 	}
+ 
+ 	select {
++	case f := <-purgec:
++		t.Errorf("unexpected purge on %q", f)
+ 	case err := <-errch:
+ 		t.Errorf("unexpected purge error %v", err)
+-	case <-time.After(time.Millisecond):
++	case <-time.After(10 * time.Millisecond):
+ 	}
+ 
+ 	close(stop)

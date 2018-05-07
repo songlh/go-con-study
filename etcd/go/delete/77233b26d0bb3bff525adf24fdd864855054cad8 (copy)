@@ -1,0 +1,180 @@
+commit 77233b26d0bb3bff525adf24fdd864855054cad8
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Sun Jul 6 20:33:48 2014 -0700
+
+    etcd: support old flags
+
+diff --git a/etcd/etcd.go b/etcd/etcd.go
+index a9ca721..8a13d55 100644
+--- a/etcd/etcd.go
++++ b/etcd/etcd.go
+@@ -8,6 +8,7 @@ import (
+ 	"path"
+ 	"time"
+ 
++	"github.com/coreos/etcd/config"
+ 	"github.com/coreos/etcd/raft"
+ 	"github.com/coreos/etcd/store"
+ )
+@@ -24,6 +25,8 @@ const (
+ )
+ 
+ type Server struct {
++	config *config.Config
++
+ 	id           int
+ 	pubAddr      string
+ 	nodes        map[string]bool
+@@ -40,14 +43,18 @@ type Server struct {
+ 	http.Handler
+ }
+ 
+-func New(id int, pubAddr string, nodes []string) *Server {
++func New(c *config.Config, id int) *Server {
++	if err := c.Sanitize(); err != nil {
++		log.Fatalf("failed sanitizing configuration: %v", err)
++	}
++
+ 	s := &Server{
++		config:       c,
+ 		id:           id,
+-		pubAddr:      pubAddr,
++		pubAddr:      c.Addr,
+ 		nodes:        make(map[string]bool),
+ 		tickDuration: defaultTickDuration,
+-
+-		proposal: make(chan v2Proposal),
++		proposal:     make(chan v2Proposal),
+ 		node: &v2Raft{
+ 			Node:   raft.New(id, defaultHeartbeat, defaultElection),
+ 			result: make(map[wait]chan interface{}),
+@@ -59,7 +66,7 @@ func New(id int, pubAddr string, nodes []string) *Server {
+ 		stop: make(chan struct{}),
+ 	}
+ 
+-	for _, seed := range nodes {
++	for _, seed := range c.Peers {
+ 		s.nodes[seed] = true
+ 	}
+ 
+@@ -75,12 +82,21 @@ func (s *Server) SetTick(d time.Duration) {
+ 	s.tickDuration = d
+ }
+ 
++func (s *Server) Run() {
++	if len(s.config.Peers) == 0 {
++		s.Bootstrap()
++	} else {
++		s.Join()
++	}
++}
++
+ func (s *Server) Stop() {
+ 	close(s.stop)
+ 	s.t.stop()
+ }
+ 
+ func (s *Server) Bootstrap() {
++	log.Println("starting a bootstrap node")
+ 	s.node.Campaign()
+ 	s.node.Add(s.id, s.pubAddr)
+ 	s.apply(s.node.Next())
+@@ -88,6 +104,7 @@ func (s *Server) Bootstrap() {
+ }
+ 
+ func (s *Server) Join() {
++	log.Println("joining cluster via peers", s.config.Peers)
+ 	d, err := json.Marshal(&raft.Config{s.id, s.pubAddr})
+ 	if err != nil {
+ 		panic(err)
+@@ -160,6 +177,7 @@ func (s *Server) apply(ents []raft.Entry) {
+ 				log.Println(err)
+ 				break
+ 			}
++			log.Printf("Add Node %x %v\n", cfg.NodeId, cfg.Addr)
+ 			s.nodes[cfg.Addr] = true
+ 			p := path.Join(nodePrefix, fmt.Sprint(cfg.NodeId))
+ 			s.Store.Set(p, false, cfg.Addr, store.Permanent)
+diff --git a/main.go b/main.go
+index 5bc00b7..e9b92a9 100644
+--- a/main.go
++++ b/main.go
+@@ -1,58 +1,38 @@
+ package main
+ 
+ import (
+-	"flag"
++	"fmt"
+ 	"log"
++	"math/rand"
+ 	"net/http"
+-	"net/url"
+-	"strings"
++	"os"
++	"time"
+ 
++	"github.com/coreos/etcd/config"
+ 	"github.com/coreos/etcd/etcd"
+ )
+ 
+-var (
+-	laddr   = flag.String("l", ":8000", "The port to listen on")
+-	paddr   = flag.String("p", "127.0.0.1:8000", "The public address to be adversited")
+-	cluster = flag.String("c", "", "The cluster to join")
+-)
+-
+ func main() {
+-	flag.Parse()
+-
+-	p, err := sanitizeURL(*paddr)
+-	if err != nil {
+-		log.Fatal(err)
++	var config = config.New()
++	if err := config.Load(os.Args[1:]); err != nil {
++		fmt.Println(err.Error(), "\n")
++		os.Exit(1)
++	} else if config.ShowVersion {
++		fmt.Println("0.5")
++		os.Exit(0)
++	} else if config.ShowHelp {
++		os.Exit(0)
+ 	}
+ 
+-	var e *etcd.Server
+-
+-	if len(*cluster) == 0 {
+-		e = etcd.New(1, p, nil)
+-		go e.Bootstrap()
+-	} else {
+-		addrs := strings.Split(*cluster, ",")
+-		cStr := addrs[0]
+-		c, err := sanitizeURL(cStr)
+-		if err != nil {
+-			log.Fatal(err)
+-		}
+-		e = etcd.New(len(addrs), p, []string{c})
+-		go e.Join()
+-	}
++	e := etcd.New(config, genId())
++	go e.Run()
+ 
+-	if err := http.ListenAndServe(*laddr, e); err != nil {
++	if err := http.ListenAndServe(config.BindAddr, e); err != nil {
+ 		log.Fatal("system", err)
+ 	}
+ }
+ 
+-func sanitizeURL(ustr string) (string, error) {
+-	u, err := url.Parse(ustr)
+-	if err != nil {
+-		return "", err
+-	}
+-
+-	if u.Scheme == "" {
+-		u.Scheme = "http"
+-	}
+-	return u.String(), nil
++func genId() int {
++	r := rand.New(rand.NewSource(int64(time.Now().Nanosecond())))
++	return r.Int()
+ }

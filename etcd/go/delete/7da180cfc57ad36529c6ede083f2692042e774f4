@@ -1,0 +1,4959 @@
+commit 7da180cfc57ad36529c6ede083f2692042e774f4
+Author: Blake Mizerany <blake.mizerany@gmail.com>
+Date:   Tue Aug 12 17:11:34 2014 -0700
+
+    metrics: remove old metrics
+
+diff --git a/metrics/metrics.go b/metrics/metrics.go
+deleted file mode 100644
+index aaccb6b..0000000
+--- a/metrics/metrics.go
++++ /dev/null
+@@ -1,42 +0,0 @@
+-// Package metrics provides both a means of generating metrics and the ability
+-// to send metric data to a graphite endpoint.
+-// The usage of this package without providing a graphite_addr when calling
+-// NewBucket results in NOP metric objects. No data will be collected.
+-package metrics
+-
+-import (
+-	"io"
+-
+-	gometrics "github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-)
+-
+-type Timer gometrics.Timer
+-type Gauge gometrics.Gauge
+-
+-type Bucket interface {
+-	// If a timer exists in this Bucket, return it. Otherwise, create
+-	// a new timer with the given name and store it in this Bucket.
+-	// The returned object will fulfull the Timer interface.
+-	Timer(name string) Timer
+-
+-	// This acts similarly to Timer, but with objects that fufill the
+-	// Gauge interface.
+-	Gauge(name string) Gauge
+-
+-	// Write the current state of all Metrics in a human-readable format
+-	// to the provide io.Writer.
+-	Dump(io.Writer)
+-
+-	// Instruct the Bucket to periodically push all metric data to the
+-	// provided graphite endpoint.
+-	Publish(string) error
+-}
+-
+-// Create a new Bucket object that periodically
+-func NewBucket(name string) Bucket {
+-	if name == "" {
+-		return nilBucket{}
+-	}
+-
+-	return newStandardBucket(name)
+-}
+diff --git a/metrics/nil.go b/metrics/nil.go
+deleted file mode 100644
+index de56ec5..0000000
+--- a/metrics/nil.go
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package metrics
+-
+-import (
+-	"io"
+-
+-	gometrics "github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-)
+-
+-type nilBucket struct{}
+-
+-func (nmb nilBucket) Dump(w io.Writer) {
+-	return
+-}
+-
+-func (nmb nilBucket) Timer(name string) Timer {
+-	return gometrics.NilTimer{}
+-}
+-
+-func (nmf nilBucket) Gauge(name string) Gauge {
+-	return gometrics.NilGauge{}
+-}
+-
+-func (nmf nilBucket) Publish(string) error {
+-	return nil
+-}
+diff --git a/metrics/standard.go b/metrics/standard.go
+deleted file mode 100644
+index 4d2f6e5..0000000
+--- a/metrics/standard.go
++++ /dev/null
+@@ -1,86 +0,0 @@
+-package metrics
+-
+-import (
+-	"io"
+-	"net"
+-	"sync"
+-	"time"
+-
+-	gometrics "github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-)
+-
+-const (
+-	// RuntimeMemStatsSampleInterval is the interval in seconds at which the
+-	// Go runtime's memory statistics will be gathered.
+-	RuntimeMemStatsSampleInterval = time.Duration(2) * time.Second
+-
+-	// GraphitePublishInterval is the interval in seconds at which all
+-	// gathered statistics will be published to a Graphite endpoint.
+-	GraphitePublishInterval = time.Duration(2) * time.Second
+-)
+-
+-type standardBucket struct {
+-	sync.Mutex
+-	name     string
+-	registry gometrics.Registry
+-	timers   map[string]Timer
+-	gauges   map[string]Gauge
+-}
+-
+-func newStandardBucket(name string) standardBucket {
+-	registry := gometrics.NewRegistry()
+-
+-	gometrics.RegisterRuntimeMemStats(registry)
+-	go gometrics.CaptureRuntimeMemStats(registry, RuntimeMemStatsSampleInterval)
+-
+-	return standardBucket{
+-		name:     name,
+-		registry: registry,
+-		timers:   make(map[string]Timer),
+-		gauges:   make(map[string]Gauge),
+-	}
+-}
+-
+-func (smb standardBucket) Dump(w io.Writer) {
+-	gometrics.WriteOnce(smb.registry, w)
+-	return
+-}
+-
+-func (smb standardBucket) Timer(name string) Timer {
+-	smb.Lock()
+-	defer smb.Unlock()
+-
+-	timer, ok := smb.timers[name]
+-	if !ok {
+-		timer = gometrics.NewTimer()
+-		smb.timers[name] = timer
+-		smb.registry.Register(name, timer)
+-	}
+-
+-	return timer
+-}
+-
+-func (smb standardBucket) Gauge(name string) Gauge {
+-	smb.Lock()
+-	defer smb.Unlock()
+-
+-	gauge, ok := smb.gauges[name]
+-	if !ok {
+-		gauge = gometrics.NewGauge()
+-		smb.gauges[name] = gauge
+-		smb.registry.Register(name, gauge)
+-	}
+-
+-	return gauge
+-}
+-
+-func (smb standardBucket) Publish(graphite_addr string) error {
+-	addr, err := net.ResolveTCPAddr("tcp", graphite_addr)
+-	if err != nil {
+-		return err
+-	}
+-
+-	go gometrics.Graphite(smb.registry, GraphitePublishInterval, smb.name, addr)
+-
+-	return nil
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/.gitignore b/third_party/github.com/rcrowley/go-metrics/.gitignore
+deleted file mode 100644
+index 83c8f82..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/.gitignore
++++ /dev/null
+@@ -1,9 +0,0 @@
+-*.[68]
+-*.a
+-*.out
+-*.swp
+-_obj
+-_testmain.go
+-cmd/metrics-bench/metrics-bench
+-cmd/metrics-example/metrics-example
+-cmd/never-read/never-read
+diff --git a/third_party/github.com/rcrowley/go-metrics/LICENSE b/third_party/github.com/rcrowley/go-metrics/LICENSE
+deleted file mode 100644
+index 363fa9e..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/LICENSE
++++ /dev/null
+@@ -1,29 +0,0 @@
+-Copyright 2012 Richard Crowley. All rights reserved.
+-
+-Redistribution and use in source and binary forms, with or without
+-modification, are permitted provided that the following conditions are
+-met:
+-
+-    1.  Redistributions of source code must retain the above copyright
+-        notice, this list of conditions and the following disclaimer.
+-
+-    2.  Redistributions in binary form must reproduce the above
+-        copyright notice, this list of conditions and the following
+-        disclaimer in the documentation and/or other materials provided
+-        with the distribution.
+-
+-THIS SOFTWARE IS PROVIDED BY RICHARD CROWLEY ``AS IS'' AND ANY EXPRESS
+-OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+-DISCLAIMED. IN NO EVENT SHALL RICHARD CROWLEY OR CONTRIBUTORS BE LIABLE
+-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+-THE POSSIBILITY OF SUCH DAMAGE.
+-
+-The views and conclusions contained in the software and documentation
+-are those of the authors and should not be interpreted as representing
+-official policies, either expressed or implied, of Richard Crowley.
+diff --git a/third_party/github.com/rcrowley/go-metrics/README.md b/third_party/github.com/rcrowley/go-metrics/README.md
+deleted file mode 100644
+index 2b26a21..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/README.md
++++ /dev/null
+@@ -1,76 +0,0 @@
+-go-metrics
+-==========
+-
+-Go port of Coda Hale's Metrics library: <https://github.com/codahale/metrics>.
+-
+-Documentation: <http://godoc.org/github.com/rcrowley/go-metrics>.
+-
+-Usage
+------
+-
+-Create and update metrics:
+-
+-```go
+-c := metrics.NewCounter()
+-metrics.Register("foo", c)
+-c.Inc(47)
+-
+-g := metrics.NewGauge()
+-metrics.Register("bar", g)
+-g.Update(47)
+-
+-s := metrics.NewExpDecaySample(1028, 0.015) // or metrics.NewUniformSample(1028)
+-h := metrics.NewHistogram(s)
+-metrics.Register("baz", h)
+-h.Update(47)
+-
+-m := metrics.NewMeter()
+-metrics.Register("quux", m)
+-m.Mark(47)
+-
+-t := metrics.NewTimer()
+-metrics.Register("bang", t)
+-t.Time(func() {})
+-t.Update(47)
+-```
+-
+-Periodically log every metric in human-readable form to standard error:
+-
+-```go
+-go metrics.Log(metrics.DefaultRegistry, 60e9, log.New(os.Stderr, "metrics: ", log.Lmicroseconds))
+-```
+-
+-Periodically log every metric in slightly-more-parseable form to syslog:
+-
+-```go
+-w, _ := syslog.Dial("unixgram", "/dev/log", syslog.LOG_INFO, "metrics")
+-go metrics.Syslog(metrics.DefaultRegistry, 60e9, w)
+-```
+-
+-Periodically emit every metric to Graphite:
+-
+-```go
+-addr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:2003")
+-go metrics.Graphite(metrics.DefaultRegistry, 10e9, "metrics", addr)
+-```
+-
+-Periodically emit every metric to StatHat:
+-
+-```go
+-import "github.com/rcrowley/go-metrics/stathat"
+-
+-stathat.Stathat(metrics.DefaultRegistry, 10e9, "example@example.com")
+-```
+-
+-Installation
+-------------
+-
+-```sh
+-go get github.com/rcrowley/go-metrics
+-```
+-
+-StatHat support additionally requires their Go client:
+-
+-```sh
+-go get github.com/stathat/go
+-```
+diff --git a/third_party/github.com/rcrowley/go-metrics/cmd/metrics-bench/metrics-bench.go b/third_party/github.com/rcrowley/go-metrics/cmd/metrics-bench/metrics-bench.go
+deleted file mode 100644
+index 94257c5..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/cmd/metrics-bench/metrics-bench.go
++++ /dev/null
+@@ -1,19 +0,0 @@
+-package main
+-
+-import (
+-	"fmt"
+-	"github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-	"time"
+-)
+-
+-func main() {
+-	r := metrics.NewRegistry()
+-	for i := 0; i < 10000; i++ {
+-		r.Register(fmt.Sprintf("counter-%d", i), metrics.NewCounter())
+-		r.Register(fmt.Sprintf("gauge-%d", i), metrics.NewGauge())
+-		r.Register(fmt.Sprintf("histogram-uniform-%d", i), metrics.NewHistogram(metrics.NewUniformSample(1028)))
+-		r.Register(fmt.Sprintf("histogram-exp-%d", i), metrics.NewHistogram(metrics.NewExpDecaySample(1028, 0.015)))
+-		r.Register(fmt.Sprintf("meter-%d", i), metrics.NewMeter())
+-	}
+-	time.Sleep(600e9)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/cmd/metrics-example/metrics-example.go b/third_party/github.com/rcrowley/go-metrics/cmd/metrics-example/metrics-example.go
+deleted file mode 100644
+index 059ed70..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/cmd/metrics-example/metrics-example.go
++++ /dev/null
+@@ -1,137 +0,0 @@
+-package main
+-
+-import (
+-	"errors"
+-	"github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-	// "github.com/rcrowley/go-metrics/stathat"
+-	"log"
+-	"math/rand"
+-	"os"
+-	// "syslog"
+-	"time"
+-)
+-
+-const fanout = 10
+-
+-func main() {
+-
+-	r := metrics.NewRegistry()
+-
+-	c := metrics.NewCounter()
+-	r.Register("foo", c)
+-	for i := 0; i < fanout; i++ {
+-		go func() {
+-			for {
+-				c.Dec(19)
+-				time.Sleep(300e6)
+-			}
+-		}()
+-		go func() {
+-			for {
+-				c.Inc(47)
+-				time.Sleep(400e6)
+-			}
+-		}()
+-	}
+-
+-	g := metrics.NewGauge()
+-	r.Register("bar", g)
+-	for i := 0; i < fanout; i++ {
+-		go func() {
+-			for {
+-				g.Update(19)
+-				time.Sleep(300e6)
+-			}
+-		}()
+-		go func() {
+-			for {
+-				g.Update(47)
+-				time.Sleep(400e6)
+-			}
+-		}()
+-	}
+-
+-	hc := metrics.NewHealthcheck(func(h metrics.Healthcheck) {
+-		if 0 < rand.Intn(2) {
+-			h.Healthy()
+-		} else {
+-			h.Unhealthy(errors.New("baz"))
+-		}
+-	})
+-	r.Register("baz", hc)
+-
+-	s := metrics.NewExpDecaySample(1028, 0.015)
+-	//s := metrics.NewUniformSample(1028)
+-	h := metrics.NewHistogram(s)
+-	r.Register("bang", h)
+-	for i := 0; i < fanout; i++ {
+-		go func() {
+-			for {
+-				h.Update(19)
+-				time.Sleep(300e6)
+-			}
+-		}()
+-		go func() {
+-			for {
+-				h.Update(47)
+-				time.Sleep(400e6)
+-			}
+-		}()
+-	}
+-
+-	m := metrics.NewMeter()
+-	r.Register("quux", m)
+-	for i := 0; i < fanout; i++ {
+-		go func() {
+-			for {
+-				m.Mark(19)
+-				time.Sleep(300e6)
+-			}
+-		}()
+-		go func() {
+-			for {
+-				m.Mark(47)
+-				time.Sleep(400e6)
+-			}
+-		}()
+-	}
+-
+-	t := metrics.NewTimer()
+-	r.Register("hooah", t)
+-	for i := 0; i < fanout; i++ {
+-		go func() {
+-			for {
+-				t.Time(func() { time.Sleep(300e6) })
+-			}
+-		}()
+-		go func() {
+-			for {
+-				t.Time(func() { time.Sleep(400e6) })
+-			}
+-		}()
+-	}
+-
+-	metrics.RegisterDebugGCStats(r)
+-	go metrics.CaptureDebugGCStats(r, 5e9)
+-
+-	metrics.RegisterRuntimeMemStats(r)
+-	go metrics.CaptureRuntimeMemStats(r, 5e9)
+-
+-	metrics.Log(r, 60e9, log.New(os.Stderr, "metrics: ", log.Lmicroseconds))
+-
+-	/*
+-		w, err := syslog.Dial("unixgram", "/dev/log", syslog.LOG_INFO, "metrics")
+-		if nil != err { log.Fatalln(err) }
+-		metrics.Syslog(r, 60e9, w)
+-	*/
+-
+-	/*
+-		addr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:2003")
+-		metrics.Graphite(r, 10e9, "metrics", addr)
+-	*/
+-
+-	/*
+-		stathat.Stathat(r, 10e9, "example@example.com")
+-	*/
+-
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/cmd/never-read/never-read.go b/third_party/github.com/rcrowley/go-metrics/cmd/never-read/never-read.go
+deleted file mode 100644
+index dc175b7..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/cmd/never-read/never-read.go
++++ /dev/null
+@@ -1,22 +0,0 @@
+-package main
+-
+-import (
+-	"log"
+-	"net"
+-)
+-
+-func main() {
+-	addr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:2003")
+-	l, err := net.ListenTCP("tcp", addr)
+-	if nil != err {
+-		log.Fatalln(err)
+-	}
+-	log.Println("listening", l.Addr())
+-	for {
+-		c, err := l.AcceptTCP()
+-		if nil != err {
+-			log.Fatalln(err)
+-		}
+-		log.Println("accepted", c.RemoteAddr())
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/counter.go b/third_party/github.com/rcrowley/go-metrics/counter.go
+deleted file mode 100644
+index e8ddc87..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/counter.go
++++ /dev/null
+@@ -1,112 +0,0 @@
+-package metrics
+-
+-import "sync/atomic"
+-
+-// Counters hold an int64 value that can be incremented and decremented.
+-type Counter interface {
+-	Clear()
+-	Count() int64
+-	Dec(int64)
+-	Inc(int64)
+-	Snapshot() Counter
+-}
+-
+-// GetOrRegisterCounter returns an existing Counter or constructs and registers
+-// a new StandardCounter.
+-func GetOrRegisterCounter(name string, r Registry) Counter {
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	return r.GetOrRegister(name, NewCounter()).(Counter)
+-}
+-
+-// NewCounter constructs a new StandardCounter.
+-func NewCounter() Counter {
+-	if UseNilMetrics {
+-		return NilCounter{}
+-	}
+-	return &StandardCounter{0}
+-}
+-
+-// NewRegisteredCounter constructs and registers a new StandardCounter.
+-func NewRegisteredCounter(name string, r Registry) Counter {
+-	c := NewCounter()
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	r.Register(name, c)
+-	return c
+-}
+-
+-// CounterSnapshot is a read-only copy of another Counter.
+-type CounterSnapshot int64
+-
+-// Clear panics.
+-func (CounterSnapshot) Clear() {
+-	panic("Clear called on a CounterSnapshot")
+-}
+-
+-// Count returns the count at the time the snapshot was taken.
+-func (c CounterSnapshot) Count() int64 { return int64(c) }
+-
+-// Dec panics.
+-func (CounterSnapshot) Dec(int64) {
+-	panic("Dec called on a CounterSnapshot")
+-}
+-
+-// Inc panics.
+-func (CounterSnapshot) Inc(int64) {
+-	panic("Inc called on a CounterSnapshot")
+-}
+-
+-// Snapshot returns the snapshot.
+-func (c CounterSnapshot) Snapshot() Counter { return c }
+-
+-// NilCounter is a no-op Counter.
+-type NilCounter struct{}
+-
+-// Clear is a no-op.
+-func (NilCounter) Clear() {}
+-
+-// Count is a no-op.
+-func (NilCounter) Count() int64 { return 0 }
+-
+-// Dec is a no-op.
+-func (NilCounter) Dec(i int64) {}
+-
+-// Inc is a no-op.
+-func (NilCounter) Inc(i int64) {}
+-
+-// Snapshot is a no-op.
+-func (NilCounter) Snapshot() Counter { return NilCounter{} }
+-
+-// StandardCounter is the standard implementation of a Counter and uses the
+-// sync/atomic package to manage a single int64 value.
+-type StandardCounter struct {
+-	count int64
+-}
+-
+-// Clear sets the counter to zero.
+-func (c *StandardCounter) Clear() {
+-	atomic.StoreInt64(&c.count, 0)
+-}
+-
+-// Count returns the current count.
+-func (c *StandardCounter) Count() int64 {
+-	return atomic.LoadInt64(&c.count)
+-}
+-
+-// Dec decrements the counter by the given amount.
+-func (c *StandardCounter) Dec(i int64) {
+-	atomic.AddInt64(&c.count, -i)
+-}
+-
+-// Inc increments the counter by the given amount.
+-func (c *StandardCounter) Inc(i int64) {
+-	atomic.AddInt64(&c.count, i)
+-}
+-
+-// Snapshot returns a read-only copy of the counter.
+-func (c *StandardCounter) Snapshot() Counter {
+-	return CounterSnapshot(c.Count())
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/counter_test.go b/third_party/github.com/rcrowley/go-metrics/counter_test.go
+deleted file mode 100644
+index dfb03b4..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/counter_test.go
++++ /dev/null
+@@ -1,77 +0,0 @@
+-package metrics
+-
+-import "testing"
+-
+-func BenchmarkCounter(b *testing.B) {
+-	c := NewCounter()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		c.Inc(1)
+-	}
+-}
+-
+-func TestCounterClear(t *testing.T) {
+-	c := NewCounter()
+-	c.Inc(1)
+-	c.Clear()
+-	if count := c.Count(); 0 != count {
+-		t.Errorf("c.Count(): 0 != %v\n", count)
+-	}
+-}
+-
+-func TestCounterDec1(t *testing.T) {
+-	c := NewCounter()
+-	c.Dec(1)
+-	if count := c.Count(); -1 != count {
+-		t.Errorf("c.Count(): -1 != %v\n", count)
+-	}
+-}
+-
+-func TestCounterDec2(t *testing.T) {
+-	c := NewCounter()
+-	c.Dec(2)
+-	if count := c.Count(); -2 != count {
+-		t.Errorf("c.Count(): -2 != %v\n", count)
+-	}
+-}
+-
+-func TestCounterInc1(t *testing.T) {
+-	c := NewCounter()
+-	c.Inc(1)
+-	if count := c.Count(); 1 != count {
+-		t.Errorf("c.Count(): 1 != %v\n", count)
+-	}
+-}
+-
+-func TestCounterInc2(t *testing.T) {
+-	c := NewCounter()
+-	c.Inc(2)
+-	if count := c.Count(); 2 != count {
+-		t.Errorf("c.Count(): 2 != %v\n", count)
+-	}
+-}
+-
+-func TestCounterSnapshot(t *testing.T) {
+-	c := NewCounter()
+-	c.Inc(1)
+-	snapshot := c.Snapshot()
+-	c.Inc(1)
+-	if count := snapshot.Count(); 1 != count {
+-		t.Errorf("c.Count(): 1 != %v\n", count)
+-	}
+-}
+-
+-func TestCounterZero(t *testing.T) {
+-	c := NewCounter()
+-	if count := c.Count(); 0 != count {
+-		t.Errorf("c.Count(): 0 != %v\n", count)
+-	}
+-}
+-
+-func TestGetOrRegisterCounter(t *testing.T) {
+-	r := NewRegistry()
+-	NewRegisteredCounter("foo", r).Inc(47)
+-	if c := GetOrRegisterCounter("foo", r); 47 != c.Count() {
+-		t.Fatal(c)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/debug.go b/third_party/github.com/rcrowley/go-metrics/debug.go
+deleted file mode 100644
+index e8db779..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/debug.go
++++ /dev/null
+@@ -1,77 +0,0 @@
+-package metrics
+-
+-import (
+-	"runtime/debug"
+-	"time"
+-)
+-
+-var (
+-	debugMetrics struct {
+-		GCStats struct {
+-			LastGC Gauge
+-			NumGC  Gauge
+-			Pause  Histogram
+-			//PauseQuantiles Histogram
+-			PauseTotal Gauge
+-		}
+-		ReadGCStats Timer
+-	}
+-	gcStats debug.GCStats
+-)
+-
+-// Capture new values for the Go garbage collector statistics exported in
+-// debug.GCStats.  This is designed to be called as a goroutine.
+-func CaptureDebugGCStats(r Registry, d time.Duration) {
+-	for {
+-		CaptureDebugGCStatsOnce(r)
+-		time.Sleep(d)
+-	}
+-}
+-
+-// Capture new values for the Go garbage collector statistics exported in
+-// debug.GCStats.  This is designed to be called in a background goroutine.
+-// Giving a registry which has not been given to RegisterDebugGCStats will
+-// panic.
+-//
+-// Be careful (but much less so) with this because debug.ReadGCStats calls
+-// the C function runtime·lock(runtime·mheap) which, while not a stop-the-world
+-// operation, isn't something you want to be doing all the time.
+-func CaptureDebugGCStatsOnce(r Registry) {
+-	lastGC := gcStats.LastGC
+-	t := time.Now()
+-	debug.ReadGCStats(&gcStats)
+-	debugMetrics.ReadGCStats.UpdateSince(t)
+-
+-	debugMetrics.GCStats.LastGC.Update(int64(gcStats.LastGC.UnixNano()))
+-	debugMetrics.GCStats.NumGC.Update(int64(gcStats.NumGC))
+-	if lastGC != gcStats.LastGC && 0 < len(gcStats.Pause) {
+-		debugMetrics.GCStats.Pause.Update(int64(gcStats.Pause[0]))
+-	}
+-	//debugMetrics.GCStats.PauseQuantiles.Update(gcStats.PauseQuantiles)
+-	debugMetrics.GCStats.PauseTotal.Update(int64(gcStats.PauseTotal))
+-}
+-
+-// Register metrics for the Go garbage collector statistics exported in
+-// debug.GCStats.  The metrics are named by their fully-qualified Go symbols,
+-// i.e. debug.GCStats.PauseTotal.
+-func RegisterDebugGCStats(r Registry) {
+-	debugMetrics.GCStats.LastGC = NewGauge()
+-	debugMetrics.GCStats.NumGC = NewGauge()
+-	debugMetrics.GCStats.Pause = NewHistogram(NewExpDecaySample(1028, 0.015))
+-	//debugMetrics.GCStats.PauseQuantiles = NewHistogram(NewExpDecaySample(1028, 0.015))
+-	debugMetrics.GCStats.PauseTotal = NewGauge()
+-	debugMetrics.ReadGCStats = NewTimer()
+-
+-	r.Register("debug.GCStats.LastGC", debugMetrics.GCStats.LastGC)
+-	r.Register("debug.GCStats.NumGC", debugMetrics.GCStats.NumGC)
+-	r.Register("debug.GCStats.Pause", debugMetrics.GCStats.Pause)
+-	//r.Register("debug.GCStats.PauseQuantiles", debugMetrics.GCStats.PauseQuantiles)
+-	r.Register("debug.GCStats.PauseTotal", debugMetrics.GCStats.PauseTotal)
+-	r.Register("debug.ReadGCStats", debugMetrics.ReadGCStats)
+-}
+-
+-// Allocate an initial slice for gcStats.Pause to avoid allocations during
+-// normal operation.
+-func init() {
+-	gcStats.Pause = make([]time.Duration, 11)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/debug_test.go b/third_party/github.com/rcrowley/go-metrics/debug_test.go
+deleted file mode 100644
+index 07eb867..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/debug_test.go
++++ /dev/null
+@@ -1,48 +0,0 @@
+-package metrics
+-
+-import (
+-	"runtime"
+-	"runtime/debug"
+-	"testing"
+-	"time"
+-)
+-
+-func BenchmarkDebugGCStats(b *testing.B) {
+-	r := NewRegistry()
+-	RegisterDebugGCStats(r)
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		CaptureDebugGCStatsOnce(r)
+-	}
+-}
+-
+-func TestDebugGCStatsBlocking(t *testing.T) {
+-	if g := runtime.GOMAXPROCS(0); g < 2 {
+-		t.Skipf("skipping TestDebugGCMemStatsBlocking with GOMAXPROCS=%d\n", g)
+-		return
+-	}
+-	ch := make(chan int)
+-	go testDebugGCStatsBlocking(ch)
+-	var gcStats debug.GCStats
+-	t0 := time.Now()
+-	debug.ReadGCStats(&gcStats)
+-	t1 := time.Now()
+-	t.Log("i++ during debug.ReadGCStats:", <-ch)
+-	go testDebugGCStatsBlocking(ch)
+-	d := t1.Sub(t0)
+-	t.Log(d)
+-	time.Sleep(d)
+-	t.Log("i++ during time.Sleep:", <-ch)
+-}
+-
+-func testDebugGCStatsBlocking(ch chan int) {
+-	i := 0
+-	for {
+-		select {
+-		case ch <- i:
+-			return
+-		default:
+-			i++
+-		}
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/ewma.go b/third_party/github.com/rcrowley/go-metrics/ewma.go
+deleted file mode 100644
+index 8e22a71..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/ewma.go
++++ /dev/null
+@@ -1,118 +0,0 @@
+-package metrics
+-
+-import (
+-	"math"
+-	"sync"
+-	"sync/atomic"
+-)
+-
+-// EWMAs continuously calculate an exponentially-weighted moving average
+-// based on an outside source of clock ticks.
+-type EWMA interface {
+-	Rate() float64
+-	Snapshot() EWMA
+-	Tick()
+-	Update(int64)
+-}
+-
+-// NewEWMA constructs a new EWMA with the given alpha.
+-func NewEWMA(alpha float64) EWMA {
+-	if UseNilMetrics {
+-		return NilEWMA{}
+-	}
+-	return &StandardEWMA{alpha: alpha}
+-}
+-
+-// NewEWMA1 constructs a new EWMA for a one-minute moving average.
+-func NewEWMA1() EWMA {
+-	return NewEWMA(1 - math.Exp(-5.0/60.0/1))
+-}
+-
+-// NewEWMA5 constructs a new EWMA for a five-minute moving average.
+-func NewEWMA5() EWMA {
+-	return NewEWMA(1 - math.Exp(-5.0/60.0/5))
+-}
+-
+-// NewEWMA15 constructs a new EWMA for a fifteen-minute moving average.
+-func NewEWMA15() EWMA {
+-	return NewEWMA(1 - math.Exp(-5.0/60.0/15))
+-}
+-
+-// EWMASnapshot is a read-only copy of another EWMA.
+-type EWMASnapshot float64
+-
+-// Rate returns the rate of events per second at the time the snapshot was
+-// taken.
+-func (a EWMASnapshot) Rate() float64 { return float64(a) }
+-
+-// Snapshot returns the snapshot.
+-func (a EWMASnapshot) Snapshot() EWMA { return a }
+-
+-// Tick panics.
+-func (EWMASnapshot) Tick() {
+-	panic("Tick called on an EWMASnapshot")
+-}
+-
+-// Update panics.
+-func (EWMASnapshot) Update(int64) {
+-	panic("Update called on an EWMASnapshot")
+-}
+-
+-// NilEWMA is a no-op EWMA.
+-type NilEWMA struct{}
+-
+-// Rate is a no-op.
+-func (NilEWMA) Rate() float64 { return 0.0 }
+-
+-// Snapshot is a no-op.
+-func (NilEWMA) Snapshot() EWMA { return NilEWMA{} }
+-
+-// Tick is a no-op.
+-func (NilEWMA) Tick() {}
+-
+-// Update is a no-op.
+-func (NilEWMA) Update(n int64) {}
+-
+-// StandardEWMA is the standard implementation of an EWMA and tracks the number
+-// of uncounted events and processes them on each tick.  It uses the
+-// sync/atomic package to manage uncounted events.
+-type StandardEWMA struct {
+-	alpha     float64
+-	init      bool
+-	mutex     sync.Mutex
+-	rate      float64
+-	uncounted int64
+-}
+-
+-// Rate returns the moving average rate of events per second.
+-func (a *StandardEWMA) Rate() float64 {
+-	a.mutex.Lock()
+-	defer a.mutex.Unlock()
+-	return a.rate * float64(1e9)
+-}
+-
+-// Snapshot returns a read-only copy of the EWMA.
+-func (a *StandardEWMA) Snapshot() EWMA {
+-	return EWMASnapshot(a.Rate())
+-}
+-
+-// Tick ticks the clock to update the moving average.  It assumes it is called
+-// every five seconds.
+-func (a *StandardEWMA) Tick() {
+-	count := atomic.LoadInt64(&a.uncounted)
+-	atomic.AddInt64(&a.uncounted, -count)
+-	instantRate := float64(count) / float64(5e9)
+-	a.mutex.Lock()
+-	defer a.mutex.Unlock()
+-	if a.init {
+-		a.rate += a.alpha * (instantRate - a.rate)
+-	} else {
+-		a.init = true
+-		a.rate = instantRate
+-	}
+-}
+-
+-// Update adds n uncounted events.
+-func (a *StandardEWMA) Update(n int64) {
+-	atomic.AddInt64(&a.uncounted, n)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/ewma_test.go b/third_party/github.com/rcrowley/go-metrics/ewma_test.go
+deleted file mode 100644
+index 0430fbd..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/ewma_test.go
++++ /dev/null
+@@ -1,225 +0,0 @@
+-package metrics
+-
+-import "testing"
+-
+-func BenchmarkEWMA(b *testing.B) {
+-	a := NewEWMA1()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		a.Update(1)
+-		a.Tick()
+-	}
+-}
+-
+-func TestEWMA1(t *testing.T) {
+-	a := NewEWMA1()
+-	a.Update(3)
+-	a.Tick()
+-	if rate := a.Rate(); 0.6 != rate {
+-		t.Errorf("initial a.Rate(): 0.6 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.22072766470286553 != rate {
+-		t.Errorf("1 minute a.Rate(): 0.22072766470286553 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.08120116994196772 != rate {
+-		t.Errorf("2 minute a.Rate(): 0.08120116994196772 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.029872241020718428 != rate {
+-		t.Errorf("3 minute a.Rate(): 0.029872241020718428 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.01098938333324054 != rate {
+-		t.Errorf("4 minute a.Rate(): 0.01098938333324054 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.004042768199451294 != rate {
+-		t.Errorf("5 minute a.Rate(): 0.004042768199451294 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.0014872513059998212 != rate {
+-		t.Errorf("6 minute a.Rate(): 0.0014872513059998212 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.0005471291793327122 != rate {
+-		t.Errorf("7 minute a.Rate(): 0.0005471291793327122 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.00020127757674150815 != rate {
+-		t.Errorf("8 minute a.Rate(): 0.00020127757674150815 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 7.404588245200814e-05 != rate {
+-		t.Errorf("9 minute a.Rate(): 7.404588245200814e-05 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 2.7239957857491083e-05 != rate {
+-		t.Errorf("10 minute a.Rate(): 2.7239957857491083e-05 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 1.0021020474147462e-05 != rate {
+-		t.Errorf("11 minute a.Rate(): 1.0021020474147462e-05 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 3.6865274119969525e-06 != rate {
+-		t.Errorf("12 minute a.Rate(): 3.6865274119969525e-06 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 1.3561976441886433e-06 != rate {
+-		t.Errorf("13 minute a.Rate(): 1.3561976441886433e-06 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 4.989172314621449e-07 != rate {
+-		t.Errorf("14 minute a.Rate(): 4.989172314621449e-07 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 1.8354139230109722e-07 != rate {
+-		t.Errorf("15 minute a.Rate(): 1.8354139230109722e-07 != %v\n", rate)
+-	}
+-}
+-
+-func TestEWMA5(t *testing.T) {
+-	a := NewEWMA5()
+-	a.Update(3)
+-	a.Tick()
+-	if rate := a.Rate(); 0.6 != rate {
+-		t.Errorf("initial a.Rate(): 0.6 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.49123845184678905 != rate {
+-		t.Errorf("1 minute a.Rate(): 0.49123845184678905 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.4021920276213837 != rate {
+-		t.Errorf("2 minute a.Rate(): 0.4021920276213837 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.32928698165641596 != rate {
+-		t.Errorf("3 minute a.Rate(): 0.32928698165641596 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.269597378470333 != rate {
+-		t.Errorf("4 minute a.Rate(): 0.269597378470333 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.2207276647028654 != rate {
+-		t.Errorf("5 minute a.Rate(): 0.2207276647028654 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.18071652714732128 != rate {
+-		t.Errorf("6 minute a.Rate(): 0.18071652714732128 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.14795817836496392 != rate {
+-		t.Errorf("7 minute a.Rate(): 0.14795817836496392 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.12113791079679326 != rate {
+-		t.Errorf("8 minute a.Rate(): 0.12113791079679326 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.09917933293295193 != rate {
+-		t.Errorf("9 minute a.Rate(): 0.09917933293295193 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.08120116994196763 != rate {
+-		t.Errorf("10 minute a.Rate(): 0.08120116994196763 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.06648189501740036 != rate {
+-		t.Errorf("11 minute a.Rate(): 0.06648189501740036 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.05443077197364752 != rate {
+-		t.Errorf("12 minute a.Rate(): 0.05443077197364752 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.04456414692860035 != rate {
+-		t.Errorf("13 minute a.Rate(): 0.04456414692860035 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.03648603757513079 != rate {
+-		t.Errorf("14 minute a.Rate(): 0.03648603757513079 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.0298722410207183831020718428 != rate {
+-		t.Errorf("15 minute a.Rate(): 0.0298722410207183831020718428 != %v\n", rate)
+-	}
+-}
+-
+-func TestEWMA15(t *testing.T) {
+-	a := NewEWMA15()
+-	a.Update(3)
+-	a.Tick()
+-	if rate := a.Rate(); 0.6 != rate {
+-		t.Errorf("initial a.Rate(): 0.6 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.5613041910189706 != rate {
+-		t.Errorf("1 minute a.Rate(): 0.5613041910189706 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.5251039914257684 != rate {
+-		t.Errorf("2 minute a.Rate(): 0.5251039914257684 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.4912384518467888184678905 != rate {
+-		t.Errorf("3 minute a.Rate(): 0.4912384518467888184678905 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.459557003018789 != rate {
+-		t.Errorf("4 minute a.Rate(): 0.459557003018789 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.4299187863442732 != rate {
+-		t.Errorf("5 minute a.Rate(): 0.4299187863442732 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.4021920276213831 != rate {
+-		t.Errorf("6 minute a.Rate(): 0.4021920276213831 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.37625345116383313 != rate {
+-		t.Errorf("7 minute a.Rate(): 0.37625345116383313 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.3519877317060185 != rate {
+-		t.Errorf("8 minute a.Rate(): 0.3519877317060185 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.3292869816564153165641596 != rate {
+-		t.Errorf("9 minute a.Rate(): 0.3292869816564153165641596 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.3080502714195546 != rate {
+-		t.Errorf("10 minute a.Rate(): 0.3080502714195546 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.2881831806538789 != rate {
+-		t.Errorf("11 minute a.Rate(): 0.2881831806538789 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.26959737847033216 != rate {
+-		t.Errorf("12 minute a.Rate(): 0.26959737847033216 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.2522102307052083 != rate {
+-		t.Errorf("13 minute a.Rate(): 0.2522102307052083 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.23594443252115815 != rate {
+-		t.Errorf("14 minute a.Rate(): 0.23594443252115815 != %v\n", rate)
+-	}
+-	elapseMinute(a)
+-	if rate := a.Rate(); 0.2207276647028646247028654470286553 != rate {
+-		t.Errorf("15 minute a.Rate(): 0.2207276647028646247028654470286553 != %v\n", rate)
+-	}
+-}
+-
+-func elapseMinute(a EWMA) {
+-	for i := 0; i < 12; i++ {
+-		a.Tick()
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/gauge.go b/third_party/github.com/rcrowley/go-metrics/gauge.go
+deleted file mode 100644
+index 66c5797..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/gauge.go
++++ /dev/null
+@@ -1,84 +0,0 @@
+-package metrics
+-
+-import "sync/atomic"
+-
+-// Gauges hold an int64 value that can be set arbitrarily.
+-type Gauge interface {
+-	Snapshot() Gauge
+-	Update(int64)
+-	Value() int64
+-}
+-
+-// GetOrRegisterGauge returns an existing Gauge or constructs and registers a
+-// new StandardGauge.
+-func GetOrRegisterGauge(name string, r Registry) Gauge {
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	return r.GetOrRegister(name, NewGauge()).(Gauge)
+-}
+-
+-// NewGauge constructs a new StandardGauge.
+-func NewGauge() Gauge {
+-	if UseNilMetrics {
+-		return NilGauge{}
+-	}
+-	return &StandardGauge{0}
+-}
+-
+-// NewRegisteredGauge constructs and registers a new StandardGauge.
+-func NewRegisteredGauge(name string, r Registry) Gauge {
+-	c := NewGauge()
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	r.Register(name, c)
+-	return c
+-}
+-
+-// GaugeSnapshot is a read-only copy of another Gauge.
+-type GaugeSnapshot int64
+-
+-// Snapshot returns the snapshot.
+-func (g GaugeSnapshot) Snapshot() Gauge { return g }
+-
+-// Update panics.
+-func (GaugeSnapshot) Update(int64) {
+-	panic("Update called on a GaugeSnapshot")
+-}
+-
+-// Value returns the value at the time the snapshot was taken.
+-func (g GaugeSnapshot) Value() int64 { return int64(g) }
+-
+-// NilGauge is a no-op Gauge.
+-type NilGauge struct{}
+-
+-// Snapshot is a no-op.
+-func (NilGauge) Snapshot() Gauge { return NilGauge{} }
+-
+-// Update is a no-op.
+-func (NilGauge) Update(v int64) {}
+-
+-// Value is a no-op.
+-func (NilGauge) Value() int64 { return 0 }
+-
+-// StandardGauge is the standard implementation of a Gauge and uses the
+-// sync/atomic package to manage a single int64 value.
+-type StandardGauge struct {
+-	value int64
+-}
+-
+-// Snapshot returns a read-only copy of the gauge.
+-func (g *StandardGauge) Snapshot() Gauge {
+-	return GaugeSnapshot(g.Value())
+-}
+-
+-// Update updates the gauge's value.
+-func (g *StandardGauge) Update(v int64) {
+-	atomic.StoreInt64(&g.value, v)
+-}
+-
+-// Value returns the gauge's current value.
+-func (g *StandardGauge) Value() int64 {
+-	return atomic.LoadInt64(&g.value)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/gauge_test.go b/third_party/github.com/rcrowley/go-metrics/gauge_test.go
+deleted file mode 100644
+index 5084962..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/gauge_test.go
++++ /dev/null
+@@ -1,37 +0,0 @@
+-package metrics
+-
+-import "testing"
+-
+-func BenchmarkGuage(b *testing.B) {
+-	g := NewGauge()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		g.Update(int64(i))
+-	}
+-}
+-
+-func TestGauge(t *testing.T) {
+-	g := NewGauge()
+-	g.Update(int64(47))
+-	if v := g.Value(); 47 != v {
+-		t.Errorf("g.Value(): 47 != %v\n", v)
+-	}
+-}
+-
+-func TestGaugeSnapshot(t *testing.T) {
+-	g := NewGauge()
+-	g.Update(int64(47))
+-	snapshot := g.Snapshot()
+-	g.Update(int64(0))
+-	if v := snapshot.Value(); 47 != v {
+-		t.Errorf("g.Value(): 47 != %v\n", v)
+-	}
+-}
+-
+-func TestGetOrRegisterGauge(t *testing.T) {
+-	r := NewRegistry()
+-	NewRegisteredGauge("foo", r).Update(47)
+-	if g := GetOrRegisterGauge("foo", r); 47 != g.Value() {
+-		t.Fatal(g)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/graphite.go b/third_party/github.com/rcrowley/go-metrics/graphite.go
+deleted file mode 100644
+index e706ad5..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/graphite.go
++++ /dev/null
+@@ -1,100 +0,0 @@
+-package metrics
+-
+-import (
+-	"bufio"
+-	"fmt"
+-	"log"
+-	"net"
+-	"time"
+-)
+-
+-// GraphiteConfig provides a container with configuration parameters for
+-// the Graphite exporter
+-type GraphiteConfig struct {
+-	Addr          *net.TCPAddr  // Network address to connect to
+-	Registry      Registry      // Registry to be exported
+-	FlushInterval time.Duration // Flush interval
+-	DurationUnit  time.Duration // Time conversion unit for durations
+-	Prefix        string        // Prefix to be prepended to metric names
+-}
+-
+-// Graphite is a blocking exporter function which reports metrics in r
+-// to a graphite server located at addr, flushing them every d duration
+-// and prepending metric names with prefix.
+-func Graphite(r Registry, d time.Duration, prefix string, addr *net.TCPAddr) {
+-	GraphiteWithConfig(GraphiteConfig{
+-		Addr:          addr,
+-		Registry:      r,
+-		FlushInterval: d,
+-		DurationUnit:  time.Nanosecond,
+-		Prefix:        prefix,
+-	})
+-}
+-
+-// GraphiteWithConfig is a blocking exporter function just like Graphite,
+-// but it takes a GraphiteConfig instead.
+-func GraphiteWithConfig(c GraphiteConfig) {
+-	for _ = range time.Tick(c.FlushInterval) {
+-		if err := graphite(&c); nil != err {
+-			log.Println(err)
+-		}
+-	}
+-}
+-
+-func graphite(c *GraphiteConfig) error {
+-	now := time.Now().Unix()
+-	du := float64(c.DurationUnit)
+-	conn, err := net.DialTCP("tcp", nil, c.Addr)
+-	if nil != err {
+-		return err
+-	}
+-	defer conn.Close()
+-	w := bufio.NewWriter(conn)
+-	c.Registry.Each(func(name string, i interface{}) {
+-		switch metric := i.(type) {
+-		case Counter:
+-			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, metric.Count(), now)
+-		case Gauge:
+-			fmt.Fprintf(w, "%s.%s.value %d %d\n", c.Prefix, name, metric.Value(), now)
+-		case Histogram:
+-			h := metric.Snapshot()
+-			ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, h.Count(), now)
+-			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, h.Min(), now)
+-			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, h.Max(), now)
+-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, h.Mean(), now)
+-			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, h.StdDev(), now)
+-			fmt.Fprintf(w, "%s.%s.50-percentile %.2f %d\n", c.Prefix, name, ps[0], now)
+-			fmt.Fprintf(w, "%s.%s.75-percentile %.2f %d\n", c.Prefix, name, ps[1], now)
+-			fmt.Fprintf(w, "%s.%s.95-percentile %.2f %d\n", c.Prefix, name, ps[2], now)
+-			fmt.Fprintf(w, "%s.%s.99-percentile %.2f %d\n", c.Prefix, name, ps[3], now)
+-			fmt.Fprintf(w, "%s.%s.999-percentile %.2f %d\n", c.Prefix, name, ps[4], now)
+-		case Meter:
+-			m := metric.Snapshot()
+-			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, m.Count(), now)
+-			fmt.Fprintf(w, "%s.%s.one-minute %.2f %d\n", c.Prefix, name, m.Rate1(), now)
+-			fmt.Fprintf(w, "%s.%s.five-minute %.2f %d\n", c.Prefix, name, m.Rate5(), now)
+-			fmt.Fprintf(w, "%s.%s.fifteen-minute %.2f %d\n", c.Prefix, name, m.Rate15(), now)
+-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, m.RateMean(), now)
+-		case Timer:
+-			t := metric.Snapshot()
+-			ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			fmt.Fprintf(w, "%s.%s.count %d %d\n", c.Prefix, name, t.Count(), now)
+-			fmt.Fprintf(w, "%s.%s.min %d %d\n", c.Prefix, name, int64(du)*t.Min(), now)
+-			fmt.Fprintf(w, "%s.%s.max %d %d\n", c.Prefix, name, int64(du)*t.Max(), now)
+-			fmt.Fprintf(w, "%s.%s.mean %.2f %d\n", c.Prefix, name, du*t.Mean(), now)
+-			fmt.Fprintf(w, "%s.%s.std-dev %.2f %d\n", c.Prefix, name, du*t.StdDev(), now)
+-			fmt.Fprintf(w, "%s.%s.50-percentile %.2f %d\n", c.Prefix, name, du*ps[0], now)
+-			fmt.Fprintf(w, "%s.%s.75-percentile %.2f %d\n", c.Prefix, name, du*ps[1], now)
+-			fmt.Fprintf(w, "%s.%s.95-percentile %.2f %d\n", c.Prefix, name, du*ps[2], now)
+-			fmt.Fprintf(w, "%s.%s.99-percentile %.2f %d\n", c.Prefix, name, du*ps[3], now)
+-			fmt.Fprintf(w, "%s.%s.999-percentile %.2f %d\n", c.Prefix, name, du*ps[4], now)
+-			fmt.Fprintf(w, "%s.%s.one-minute %.2f %d\n", c.Prefix, name, t.Rate1(), now)
+-			fmt.Fprintf(w, "%s.%s.five-minute %.2f %d\n", c.Prefix, name, t.Rate5(), now)
+-			fmt.Fprintf(w, "%s.%s.fifteen-minute %.2f %d\n", c.Prefix, name, t.Rate15(), now)
+-			fmt.Fprintf(w, "%s.%s.mean-rate %.2f %d\n", c.Prefix, name, t.RateMean(), now)
+-		}
+-		w.Flush()
+-	})
+-	return nil
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/graphite_test.go b/third_party/github.com/rcrowley/go-metrics/graphite_test.go
+deleted file mode 100644
+index 616ff64..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/graphite_test.go
++++ /dev/null
+@@ -1,21 +0,0 @@
+-package metrics
+-
+-import (
+-	"net"
+-	"time"
+-)
+-
+-func ExampleGraphite() {
+-	addr, _ := net.ResolveTCPAddr("net", ":2003")
+-	go Graphite(DefaultRegistry, 1*time.Second, "some.prefix", addr)
+-}
+-
+-func ExampleGraphiteWithConfig() {
+-	addr, _ := net.ResolveTCPAddr("net", ":2003")
+-	go GraphiteWithConfig(GraphiteConfig{
+-		Addr:          addr,
+-		Registry:      DefaultRegistry,
+-		FlushInterval: 1 * time.Second,
+-		DurationUnit:  time.Millisecond,
+-	})
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/healthcheck.go b/third_party/github.com/rcrowley/go-metrics/healthcheck.go
+deleted file mode 100644
+index 445131c..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/healthcheck.go
++++ /dev/null
+@@ -1,61 +0,0 @@
+-package metrics
+-
+-// Healthchecks hold an error value describing an arbitrary up/down status.
+-type Healthcheck interface {
+-	Check()
+-	Error() error
+-	Healthy()
+-	Unhealthy(error)
+-}
+-
+-// NewHealthcheck constructs a new Healthcheck which will use the given
+-// function to update its status.
+-func NewHealthcheck(f func(Healthcheck)) Healthcheck {
+-	if UseNilMetrics {
+-		return NilHealthcheck{}
+-	}
+-	return &StandardHealthcheck{nil, f}
+-}
+-
+-// NilHealthcheck is a no-op.
+-type NilHealthcheck struct{}
+-
+-// Check is a no-op.
+-func (NilHealthcheck) Check() {}
+-
+-// Error is a no-op.
+-func (NilHealthcheck) Error() error { return nil }
+-
+-// Healthy is a no-op.
+-func (NilHealthcheck) Healthy() {}
+-
+-// Unhealthy is a no-op.
+-func (NilHealthcheck) Unhealthy(error) {}
+-
+-// StandardHealthcheck is the standard implementation of a Healthcheck and
+-// stores the status and a function to call to update the status.
+-type StandardHealthcheck struct {
+-	err error
+-	f   func(Healthcheck)
+-}
+-
+-// Check runs the healthcheck function to update the healthcheck's status.
+-func (h *StandardHealthcheck) Check() {
+-	h.f(h)
+-}
+-
+-// Error returns the healthcheck's status, which will be nil if it is healthy.
+-func (h *StandardHealthcheck) Error() error {
+-	return h.err
+-}
+-
+-// Healthy marks the healthcheck as healthy.
+-func (h *StandardHealthcheck) Healthy() {
+-	h.err = nil
+-}
+-
+-// Unhealthy marks the healthcheck as unhealthy.  The error is stored and
+-// may be retrieved by the Error method.
+-func (h *StandardHealthcheck) Unhealthy(err error) {
+-	h.err = err
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/histogram.go b/third_party/github.com/rcrowley/go-metrics/histogram.go
+deleted file mode 100644
+index b45a7f8..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/histogram.go
++++ /dev/null
+@@ -1,192 +0,0 @@
+-package metrics
+-
+-// Histograms calculate distribution statistics from a series of int64 values.
+-type Histogram interface {
+-	Clear()
+-	Count() int64
+-	Max() int64
+-	Mean() float64
+-	Min() int64
+-	Percentile(float64) float64
+-	Percentiles([]float64) []float64
+-	Sample() Sample
+-	Snapshot() Histogram
+-	StdDev() float64
+-	Update(int64)
+-	Variance() float64
+-}
+-
+-// GetOrRegisterHistogram returns an existing Histogram or constructs and
+-// registers a new StandardHistogram.
+-func GetOrRegisterHistogram(name string, r Registry, s Sample) Histogram {
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	return r.GetOrRegister(name, NewHistogram(s)).(Histogram)
+-}
+-
+-// NewHistogram constructs a new StandardHistogram from a Sample.
+-func NewHistogram(s Sample) Histogram {
+-	if UseNilMetrics {
+-		return NilHistogram{}
+-	}
+-	return &StandardHistogram{sample: s}
+-}
+-
+-// NewRegisteredHistogram constructs and registers a new StandardHistogram from
+-// a Sample.
+-func NewRegisteredHistogram(name string, r Registry, s Sample) Histogram {
+-	c := NewHistogram(s)
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	r.Register(name, c)
+-	return c
+-}
+-
+-// HistogramSnapshot is a read-only copy of another Histogram.
+-type HistogramSnapshot struct {
+-	sample *SampleSnapshot
+-}
+-
+-// Clear panics.
+-func (*HistogramSnapshot) Clear() {
+-	panic("Clear called on a HistogramSnapshot")
+-}
+-
+-// Count returns the number of samples recorded at the time the snapshot was
+-// taken.
+-func (h *HistogramSnapshot) Count() int64 { return h.sample.Count() }
+-
+-// Max returns the maximum value in the sample at the time the snapshot was
+-// taken.
+-func (h *HistogramSnapshot) Max() int64 { return h.sample.Max() }
+-
+-// Mean returns the mean of the values in the sample at the time the snapshot
+-// was taken.
+-func (h *HistogramSnapshot) Mean() float64 { return h.sample.Mean() }
+-
+-// Min returns the minimum value in the sample at the time the snapshot was
+-// taken.
+-func (h *HistogramSnapshot) Min() int64 { return h.sample.Min() }
+-
+-// Percentile returns an arbitrary percentile of values in the sample at the
+-// time the snapshot was taken.
+-func (h *HistogramSnapshot) Percentile(p float64) float64 {
+-	return h.sample.Percentile(p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of values in the sample
+-// at the time the snapshot was taken.
+-func (h *HistogramSnapshot) Percentiles(ps []float64) []float64 {
+-	return h.sample.Percentiles(ps)
+-}
+-
+-// Sample returns the Sample underlying the histogram.
+-func (h *HistogramSnapshot) Sample() Sample { return h.sample }
+-
+-// Snapshot returns the snapshot.
+-func (h *HistogramSnapshot) Snapshot() Histogram { return h }
+-
+-// StdDev returns the standard deviation of the values in the sample at the
+-// time the snapshot was taken.
+-func (h *HistogramSnapshot) StdDev() float64 { return h.sample.StdDev() }
+-
+-// Update panics.
+-func (*HistogramSnapshot) Update(int64) {
+-	panic("Update called on a HistogramSnapshot")
+-}
+-
+-// Variance returns the variance of inputs at the time the snapshot was taken.
+-func (h *HistogramSnapshot) Variance() float64 { return h.sample.Variance() }
+-
+-// NilHistogram is a no-op Histogram.
+-type NilHistogram struct{}
+-
+-// Clear is a no-op.
+-func (NilHistogram) Clear() {}
+-
+-// Count is a no-op.
+-func (NilHistogram) Count() int64 { return 0 }
+-
+-// Max is a no-op.
+-func (NilHistogram) Max() int64 { return 0 }
+-
+-// Mean is a no-op.
+-func (NilHistogram) Mean() float64 { return 0.0 }
+-
+-// Min is a no-op.
+-func (NilHistogram) Min() int64 { return 0 }
+-
+-// Percentile is a no-op.
+-func (NilHistogram) Percentile(p float64) float64 { return 0.0 }
+-
+-// Percentiles is a no-op.
+-func (NilHistogram) Percentiles(ps []float64) []float64 {
+-	return make([]float64, len(ps))
+-}
+-
+-// Sample is a no-op.
+-func (NilHistogram) Sample() Sample { return NilSample{} }
+-
+-// Snapshot is a no-op.
+-func (NilHistogram) Snapshot() Histogram { return NilHistogram{} }
+-
+-// StdDev is a no-op.
+-func (NilHistogram) StdDev() float64 { return 0.0 }
+-
+-// Update is a no-op.
+-func (NilHistogram) Update(v int64) {}
+-
+-// Variance is a no-op.
+-func (NilHistogram) Variance() float64 { return 0.0 }
+-
+-// StandardHistogram is the standard implementation of a Histogram and uses a
+-// Sample to bound its memory use.
+-type StandardHistogram struct {
+-	sample Sample
+-}
+-
+-// Clear clears the histogram and its sample.
+-func (h *StandardHistogram) Clear() { h.sample.Clear() }
+-
+-// Count returns the number of samples recorded since the histogram was last
+-// cleared.
+-func (h *StandardHistogram) Count() int64 { return h.sample.Count() }
+-
+-// Max returns the maximum value in the sample.
+-func (h *StandardHistogram) Max() int64 { return h.sample.Max() }
+-
+-// Mean returns the mean of the values in the sample.
+-func (h *StandardHistogram) Mean() float64 { return h.sample.Mean() }
+-
+-// Min returns the minimum value in the sample.
+-func (h *StandardHistogram) Min() int64 { return h.sample.Min() }
+-
+-// Percentile returns an arbitrary percentile of the values in the sample.
+-func (h *StandardHistogram) Percentile(p float64) float64 {
+-	return h.sample.Percentile(p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of the values in the
+-// sample.
+-func (h *StandardHistogram) Percentiles(ps []float64) []float64 {
+-	return h.sample.Percentiles(ps)
+-}
+-
+-// Sample returns the Sample underlying the histogram.
+-func (h *StandardHistogram) Sample() Sample { return h.sample }
+-
+-// Snapshot returns a read-only copy of the histogram.
+-func (h *StandardHistogram) Snapshot() Histogram {
+-	return &HistogramSnapshot{sample: h.sample.Snapshot().(*SampleSnapshot)}
+-}
+-
+-// StdDev returns the standard deviation of the values in the sample.
+-func (h *StandardHistogram) StdDev() float64 { return h.sample.StdDev() }
+-
+-// Update samples a new value.
+-func (h *StandardHistogram) Update(v int64) { h.sample.Update(v) }
+-
+-// Variance returns the variance of the values in the sample.
+-func (h *StandardHistogram) Variance() float64 { return h.sample.Variance() }
+diff --git a/third_party/github.com/rcrowley/go-metrics/histogram_test.go b/third_party/github.com/rcrowley/go-metrics/histogram_test.go
+deleted file mode 100644
+index d7f4f01..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/histogram_test.go
++++ /dev/null
+@@ -1,95 +0,0 @@
+-package metrics
+-
+-import "testing"
+-
+-func BenchmarkHistogram(b *testing.B) {
+-	h := NewHistogram(NewUniformSample(100))
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		h.Update(int64(i))
+-	}
+-}
+-
+-func TestGetOrRegisterHistogram(t *testing.T) {
+-	r := NewRegistry()
+-	s := NewUniformSample(100)
+-	NewRegisteredHistogram("foo", r, s).Update(47)
+-	if h := GetOrRegisterHistogram("foo", r, s); 1 != h.Count() {
+-		t.Fatal(h)
+-	}
+-}
+-
+-func TestHistogram10000(t *testing.T) {
+-	h := NewHistogram(NewUniformSample(100000))
+-	for i := 1; i <= 10000; i++ {
+-		h.Update(int64(i))
+-	}
+-	testHistogram10000(t, h)
+-}
+-
+-func TestHistogramEmpty(t *testing.T) {
+-	h := NewHistogram(NewUniformSample(100))
+-	if count := h.Count(); 0 != count {
+-		t.Errorf("h.Count(): 0 != %v\n", count)
+-	}
+-	if min := h.Min(); 0 != min {
+-		t.Errorf("h.Min(): 0 != %v\n", min)
+-	}
+-	if max := h.Max(); 0 != max {
+-		t.Errorf("h.Max(): 0 != %v\n", max)
+-	}
+-	if mean := h.Mean(); 0.0 != mean {
+-		t.Errorf("h.Mean(): 0.0 != %v\n", mean)
+-	}
+-	if stdDev := h.StdDev(); 0.0 != stdDev {
+-		t.Errorf("h.StdDev(): 0.0 != %v\n", stdDev)
+-	}
+-	ps := h.Percentiles([]float64{0.5, 0.75, 0.99})
+-	if 0.0 != ps[0] {
+-		t.Errorf("median: 0.0 != %v\n", ps[0])
+-	}
+-	if 0.0 != ps[1] {
+-		t.Errorf("75th percentile: 0.0 != %v\n", ps[1])
+-	}
+-	if 0.0 != ps[2] {
+-		t.Errorf("99th percentile: 0.0 != %v\n", ps[2])
+-	}
+-}
+-
+-func TestHistogramSnapshot(t *testing.T) {
+-	h := NewHistogram(NewUniformSample(100000))
+-	for i := 1; i <= 10000; i++ {
+-		h.Update(int64(i))
+-	}
+-	snapshot := h.Snapshot()
+-	h.Update(0)
+-	testHistogram10000(t, snapshot)
+-}
+-
+-func testHistogram10000(t *testing.T, h Histogram) {
+-	if count := h.Count(); 10000 != count {
+-		t.Errorf("h.Count(): 10000 != %v\n", count)
+-	}
+-	if min := h.Min(); 1 != min {
+-		t.Errorf("h.Min(): 1 != %v\n", min)
+-	}
+-	if max := h.Max(); 10000 != max {
+-		t.Errorf("h.Max(): 10000 != %v\n", max)
+-	}
+-	if mean := h.Mean(); 5000.5 != mean {
+-		t.Errorf("h.Mean(): 5000.5 != %v\n", mean)
+-	}
+-	if stdDev := h.StdDev(); 2886.751331514372 != stdDev {
+-		t.Errorf("h.StdDev(): 2886.751331514372 != %v\n", stdDev)
+-	}
+-	ps := h.Percentiles([]float64{0.5, 0.75, 0.99})
+-	if 5000.5 != ps[0] {
+-		t.Errorf("median: 5000.5 != %v\n", ps[0])
+-	}
+-	if 7500.75 != ps[1] {
+-		t.Errorf("75th percentile: 7500.75 != %v\n", ps[1])
+-	}
+-	if 9900.99 != ps[2] {
+-		t.Errorf("99th percentile: 9900.99 != %v\n", ps[2])
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/json.go b/third_party/github.com/rcrowley/go-metrics/json.go
+deleted file mode 100644
+index c0807c1..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/json.go
++++ /dev/null
+@@ -1,60 +0,0 @@
+-package metrics
+-
+-import "encoding/json"
+-
+-// MarshalJSON returns a byte slice containing a JSON representation of all
+-// the metrics in the Registry.
+-func (r StandardRegistry) MarshalJSON() ([]byte, error) {
+-	data := make(map[string]map[string]interface{})
+-	r.Each(func(name string, i interface{}) {
+-		values := make(map[string]interface{})
+-		switch metric := i.(type) {
+-		case Counter:
+-			values["count"] = metric.Count()
+-		case Gauge:
+-			values["value"] = metric.Value()
+-		case Healthcheck:
+-			metric.Check()
+-			values["error"] = metric.Error().Error()
+-		case Histogram:
+-			h := metric.Snapshot()
+-			ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			values["count"] = h.Count()
+-			values["min"] = h.Min()
+-			values["max"] = h.Max()
+-			values["mean"] = h.Mean()
+-			values["stddev"] = h.StdDev()
+-			values["median"] = ps[0]
+-			values["75%"] = ps[1]
+-			values["95%"] = ps[2]
+-			values["99%"] = ps[3]
+-			values["99.9%"] = ps[4]
+-		case Meter:
+-			m := metric.Snapshot()
+-			values["count"] = m.Count()
+-			values["1m.rate"] = m.Rate1()
+-			values["5m.rate"] = m.Rate5()
+-			values["15m.rate"] = m.Rate15()
+-			values["mean.rate"] = m.RateMean()
+-		case Timer:
+-			t := metric.Snapshot()
+-			ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			values["count"] = t.Count()
+-			values["min"] = t.Min()
+-			values["max"] = t.Max()
+-			values["mean"] = t.Mean()
+-			values["stddev"] = t.StdDev()
+-			values["median"] = ps[0]
+-			values["75%"] = ps[1]
+-			values["95%"] = ps[2]
+-			values["99%"] = ps[3]
+-			values["99.9%"] = ps[4]
+-			values["1m.rate"] = t.Rate1()
+-			values["5m.rate"] = t.Rate5()
+-			values["15m.rate"] = t.Rate15()
+-			values["mean.rate"] = t.RateMean()
+-		}
+-		data[name] = values
+-	})
+-	return json.Marshal(data)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/librato/client.go b/third_party/github.com/rcrowley/go-metrics/librato/client.go
+deleted file mode 100644
+index 0a7c03b..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/librato/client.go
++++ /dev/null
+@@ -1,103 +0,0 @@
+-package librato
+-
+-import (
+-	"bytes"
+-	"encoding/json"
+-	"fmt"
+-	"io/ioutil"
+-	"net/http"
+-)
+-
+-const Operations = "operations"
+-const OperationsShort = "ops"
+-
+-type LibratoClient struct {
+-	Email, Token string
+-}
+-
+-// property strings
+-const (
+-	// display attributes
+-	Color             = "color"
+-	DisplayMax        = "display_max"
+-	DisplayMin        = "display_min"
+-	DisplayUnitsLong  = "display_units_long"
+-	DisplayUnitsShort = "display_units_short"
+-	DisplayStacked    = "display_stacked"
+-	DisplayTransform  = "display_transform"
+-	// special gauge display attributes
+-	SummarizeFunction = "summarize_function"
+-	Aggregate         = "aggregate"
+-
+-	// metric keys
+-	Name        = "name"
+-	Period      = "period"
+-	Description = "description"
+-	DisplayName = "display_name"
+-	Attributes  = "attributes"
+-
+-	// measurement keys
+-	MeasureTime = "measure_time"
+-	Source      = "source"
+-	Value       = "value"
+-
+-	// special gauge keys
+-	Count      = "count"
+-	Sum        = "sum"
+-	Max        = "max"
+-	Min        = "min"
+-	SumSquares = "sum_squares"
+-
+-	// batch keys
+-	Counters = "counters"
+-	Gauges   = "gauges"
+-
+-	MetricsPostUrl = "https://metrics-api.librato.com/v1/metrics"
+-)
+-
+-type Measurement map[string]interface{}
+-type Metric map[string]interface{}
+-
+-type Batch struct {
+-	Gauges      []Measurement `json:"gauges,omitempty"`
+-	Counters    []Measurement `json:"counters,omitempty"`
+-	MeasureTime int64         `json:"measure_time"`
+-	Source      string        `json:"source"`
+-}
+-
+-func (self *LibratoClient) PostMetrics(batch Batch) (err error) {
+-	var (
+-		js   []byte
+-		req  *http.Request
+-		resp *http.Response
+-	)
+-
+-	if len(batch.Counters) == 0 && len(batch.Gauges) == 0 {
+-		return nil
+-	}
+-
+-	if js, err = json.Marshal(batch); err != nil {
+-		return
+-	}
+-
+-	if req, err = http.NewRequest("POST", MetricsPostUrl, bytes.NewBuffer(js)); err != nil {
+-		return
+-	}
+-
+-	req.Header.Set("Content-Type", "application/json")
+-	req.SetBasicAuth(self.Email, self.Token)
+-
+-	if resp, err = http.DefaultClient.Do(req); err != nil {
+-		return
+-	}
+-
+-	if resp.StatusCode != http.StatusOK {
+-		var body []byte
+-		var err error
+-		if body, err = ioutil.ReadAll(resp.Body); err != nil {
+-			body = []byte(fmt.Sprintf("(could not fetch response body for error: %s)", err))
+-		}
+-		err = fmt.Errorf("Unable to post to Librato: %d %s %s", resp.StatusCode, resp.Status, string(body))
+-	}
+-	return
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/librato/librato.go b/third_party/github.com/rcrowley/go-metrics/librato/librato.go
+deleted file mode 100644
+index 3b79f2f..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/librato/librato.go
++++ /dev/null
+@@ -1,220 +0,0 @@
+-package librato
+-
+-import (
+-	"fmt"
+-	"github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-	"log"
+-	"math"
+-	"regexp"
+-	"time"
+-)
+-
+-// a regexp for extracting the unit from time.Duration.String
+-var unitRegexp = regexp.MustCompile("[^\\d]+$")
+-
+-// a helper that turns a time.Duration into librato display attributes for timer metrics
+-func translateTimerAttributes(d time.Duration) (attrs map[string]interface{}) {
+-	attrs = make(map[string]interface{})
+-	attrs[DisplayTransform] = fmt.Sprintf("x/%d", int64(d))
+-	attrs[DisplayUnitsShort] = string(unitRegexp.Find([]byte(d.String())))
+-	return
+-}
+-
+-type Reporter struct {
+-	Email, Token	string
+-	Source		string
+-	Interval	time.Duration
+-	Registry	metrics.Registry
+-	Percentiles	[]float64		// percentiles to report on histogram metrics
+-	TimerAttributes	map[string]interface{}	// units in which timers will be displayed
+-}
+-
+-func NewReporter(r metrics.Registry, d time.Duration, e string, t string, s string, p []float64, u time.Duration) *Reporter {
+-	return &Reporter{e, t, s, d, r, p, translateTimerAttributes(u)}
+-}
+-
+-func Librato(r metrics.Registry, d time.Duration, e string, t string, s string, p []float64, u time.Duration) {
+-	NewReporter(r, d, e, t, s, p, u).Run()
+-}
+-
+-func (self *Reporter) Run() {
+-	ticker := time.Tick(self.Interval)
+-	metricsApi := &LibratoClient{self.Email, self.Token}
+-	for now := range ticker {
+-		var metrics Batch
+-		var err error
+-		if metrics, err = self.BuildRequest(now, self.Registry); err != nil {
+-			log.Printf("ERROR constructing librato request body %s", err)
+-		}
+-		if err := metricsApi.PostMetrics(metrics); err != nil {
+-			log.Printf("ERROR sending metrics to librato %s", err)
+-		}
+-	}
+-}
+-
+-// calculate sum of squares from data provided by metrics.Histogram
+-// see http://en.wikipedia.org/wiki/Standard_deviation#Rapid_calculation_methods
+-func sumSquares(s metrics.Sample) float64 {
+-	count := float64(s.Count())
+-	sumSquared := math.Pow(count*s.Mean(), 2)
+-	sumSquares := math.Pow(count*s.StdDev(), 2) + sumSquared/count
+-	if math.IsNaN(sumSquares) {
+-		return 0.0
+-	}
+-	return sumSquares
+-}
+-func sumSquaresTimer(t metrics.Timer) float64 {
+-	count := float64(t.Count())
+-	sumSquared := math.Pow(count*t.Mean(), 2)
+-	sumSquares := math.Pow(count*t.StdDev(), 2) + sumSquared/count
+-	if math.IsNaN(sumSquares) {
+-		return 0.0
+-	}
+-	return sumSquares
+-}
+-
+-func (self *Reporter) BuildRequest(now time.Time, r metrics.Registry) (snapshot Batch, err error) {
+-	snapshot = Batch{
+-		MeasureTime:	now.Unix(),
+-		Source:		self.Source,
+-	}
+-	snapshot.MeasureTime = now.Unix()
+-	snapshot.Gauges = make([]Measurement, 0)
+-	snapshot.Counters = make([]Measurement, 0)
+-	histogramGaugeCount := 1 + len(self.Percentiles)
+-	r.Each(func(name string, metric interface{}) {
+-		measurement := Measurement{}
+-		measurement[Period] = self.Interval.Seconds()
+-		switch m := metric.(type) {
+-		case metrics.Counter:
+-			measurement[Name] = fmt.Sprintf("%s.%s", name, "count")
+-			measurement[Value] = float64(m.Count())
+-			measurement[Attributes] = map[string]interface{}{
+-				DisplayUnitsLong:	Operations,
+-				DisplayUnitsShort:	OperationsShort,
+-				DisplayMin:		"0",
+-			}
+-			snapshot.Counters = append(snapshot.Counters, measurement)
+-		case metrics.Gauge:
+-			measurement[Name] = name
+-			measurement[Value] = float64(m.Value())
+-			snapshot.Gauges = append(snapshot.Gauges, measurement)
+-		case metrics.Histogram:
+-			if m.Count() > 0 {
+-				gauges := make([]Measurement, histogramGaugeCount, histogramGaugeCount)
+-				s := m.Sample()
+-				measurement[Name] = fmt.Sprintf("%s.%s", name, "hist")
+-				measurement[Count] = uint64(s.Count())
+-				measurement[Sum] = s.Sum()
+-				measurement[Max] = float64(s.Max())
+-				measurement[Min] = float64(s.Min())
+-				measurement[SumSquares] = sumSquares(s)
+-				gauges[0] = measurement
+-				for i, p := range self.Percentiles {
+-					gauges[i+1] = Measurement{
+-						Name:	fmt.Sprintf("%s.%.2f", measurement[Name], p),
+-						Value:	s.Percentile(p),
+-						Period:	measurement[Period],
+-					}
+-				}
+-				snapshot.Gauges = append(snapshot.Gauges, gauges...)
+-			}
+-		case metrics.Meter:
+-			measurement[Name] = name
+-			measurement[Value] = float64(m.Count())
+-			snapshot.Counters = append(snapshot.Counters, measurement)
+-			snapshot.Gauges = append(snapshot.Gauges,
+-				Measurement{
+-					Name:	fmt.Sprintf("%s.%s", name, "1min"),
+-					Value:	m.Rate1(),
+-					Period:	int64(self.Interval.Seconds()),
+-					Attributes: map[string]interface{}{
+-						DisplayUnitsLong:	Operations,
+-						DisplayUnitsShort:	OperationsShort,
+-						DisplayMin:		"0",
+-					},
+-				},
+-				Measurement{
+-					Name:	fmt.Sprintf("%s.%s", name, "5min"),
+-					Value:	m.Rate5(),
+-					Period:	int64(self.Interval.Seconds()),
+-					Attributes: map[string]interface{}{
+-						DisplayUnitsLong:	Operations,
+-						DisplayUnitsShort:	OperationsShort,
+-						DisplayMin:		"0",
+-					},
+-				},
+-				Measurement{
+-					Name:	fmt.Sprintf("%s.%s", name, "15min"),
+-					Value:	m.Rate15(),
+-					Period:	int64(self.Interval.Seconds()),
+-					Attributes: map[string]interface{}{
+-						DisplayUnitsLong:	Operations,
+-						DisplayUnitsShort:	OperationsShort,
+-						DisplayMin:		"0",
+-					},
+-				},
+-			)
+-		case metrics.Timer:
+-			measurement[Name] = name
+-			measurement[Value] = float64(m.Count())
+-			snapshot.Counters = append(snapshot.Counters, measurement)
+-			if m.Count() > 0 {
+-				libratoName := fmt.Sprintf("%s.%s", name, "timer.mean")
+-				gauges := make([]Measurement, histogramGaugeCount, histogramGaugeCount)
+-				gauges[0] = Measurement{
+-					Name:		libratoName,
+-					Count:		uint64(m.Count()),
+-					Sum:		m.Mean() * float64(m.Count()),
+-					Max:		float64(m.Max()),
+-					Min:		float64(m.Min()),
+-					SumSquares:	sumSquaresTimer(m),
+-					Period:		int64(self.Interval.Seconds()),
+-					Attributes:	self.TimerAttributes,
+-				}
+-				for i, p := range self.Percentiles {
+-					gauges[i+1] = Measurement{
+-						Name:		fmt.Sprintf("%s.timer.%2.0f", name, p*100),
+-						Value:		m.Percentile(p),
+-						Period:		int64(self.Interval.Seconds()),
+-						Attributes:	self.TimerAttributes,
+-					}
+-				}
+-				snapshot.Gauges = append(snapshot.Gauges, gauges...)
+-				snapshot.Gauges = append(snapshot.Gauges,
+-					Measurement{
+-						Name:	fmt.Sprintf("%s.%s", name, "rate.1min"),
+-						Value:	m.Rate1(),
+-						Period:	int64(self.Interval.Seconds()),
+-						Attributes: map[string]interface{}{
+-							DisplayUnitsLong:	Operations,
+-							DisplayUnitsShort:	OperationsShort,
+-							DisplayMin:		"0",
+-						},
+-					},
+-					Measurement{
+-						Name:	fmt.Sprintf("%s.%s", name, "rate.5min"),
+-						Value:	m.Rate5(),
+-						Period:	int64(self.Interval.Seconds()),
+-						Attributes: map[string]interface{}{
+-							DisplayUnitsLong:	Operations,
+-							DisplayUnitsShort:	OperationsShort,
+-							DisplayMin:		"0",
+-						},
+-					},
+-					Measurement{
+-						Name:	fmt.Sprintf("%s.%s", name, "rate.15min"),
+-						Value:	m.Rate15(),
+-						Period:	int64(self.Interval.Seconds()),
+-						Attributes: map[string]interface{}{
+-							DisplayUnitsLong:	Operations,
+-							DisplayUnitsShort:	OperationsShort,
+-							DisplayMin:		"0",
+-						},
+-					},
+-				)
+-			}
+-		}
+-	})
+-	return
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/log.go b/third_party/github.com/rcrowley/go-metrics/log.go
+deleted file mode 100644
+index 5d36b6e..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/log.go
++++ /dev/null
+@@ -1,68 +0,0 @@
+-package metrics
+-
+-import (
+-	"log"
+-	"time"
+-)
+-
+-// Output each metric in the given registry periodically using the given
+-// logger.
+-func Log(r Registry, d time.Duration, l *log.Logger) {
+-	for {
+-		r.Each(func(name string, i interface{}) {
+-			switch metric := i.(type) {
+-			case Counter:
+-				l.Printf("counter %s\n", name)
+-				l.Printf("  count:       %9d\n", metric.Count())
+-			case Gauge:
+-				l.Printf("gauge %s\n", name)
+-				l.Printf("  value:       %9d\n", metric.Value())
+-			case Healthcheck:
+-				metric.Check()
+-				l.Printf("healthcheck %s\n", name)
+-				l.Printf("  error:       %v\n", metric.Error())
+-			case Histogram:
+-				h := metric.Snapshot()
+-				ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-				l.Printf("histogram %s\n", name)
+-				l.Printf("  count:       %9d\n", h.Count())
+-				l.Printf("  min:         %9d\n", h.Min())
+-				l.Printf("  max:         %9d\n", h.Max())
+-				l.Printf("  mean:        %12.2f\n", h.Mean())
+-				l.Printf("  stddev:      %12.2f\n", h.StdDev())
+-				l.Printf("  median:      %12.2f\n", ps[0])
+-				l.Printf("  75%%:         %12.2f\n", ps[1])
+-				l.Printf("  95%%:         %12.2f\n", ps[2])
+-				l.Printf("  99%%:         %12.2f\n", ps[3])
+-				l.Printf("  99.9%%:       %12.2f\n", ps[4])
+-			case Meter:
+-				m := metric.Snapshot()
+-				l.Printf("meter %s\n", name)
+-				l.Printf("  count:       %9d\n", m.Count())
+-				l.Printf("  1-min rate:  %12.2f\n", m.Rate1())
+-				l.Printf("  5-min rate:  %12.2f\n", m.Rate5())
+-				l.Printf("  15-min rate: %12.2f\n", m.Rate15())
+-				l.Printf("  mean rate:   %12.2f\n", m.RateMean())
+-			case Timer:
+-				t := metric.Snapshot()
+-				ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-				l.Printf("timer %s\n", name)
+-				l.Printf("  count:       %9d\n", t.Count())
+-				l.Printf("  min:         %9d\n", t.Min())
+-				l.Printf("  max:         %9d\n", t.Max())
+-				l.Printf("  mean:        %12.2f\n", t.Mean())
+-				l.Printf("  stddev:      %12.2f\n", t.StdDev())
+-				l.Printf("  median:      %12.2f\n", ps[0])
+-				l.Printf("  75%%:         %12.2f\n", ps[1])
+-				l.Printf("  95%%:         %12.2f\n", ps[2])
+-				l.Printf("  99%%:         %12.2f\n", ps[3])
+-				l.Printf("  99.9%%:       %12.2f\n", ps[4])
+-				l.Printf("  1-min rate:  %12.2f\n", t.Rate1())
+-				l.Printf("  5-min rate:  %12.2f\n", t.Rate5())
+-				l.Printf("  15-min rate: %12.2f\n", t.Rate15())
+-				l.Printf("  mean rate:   %12.2f\n", t.RateMean())
+-			}
+-		})
+-		time.Sleep(d)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/memory.md b/third_party/github.com/rcrowley/go-metrics/memory.md
+deleted file mode 100644
+index 47454f5..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/memory.md
++++ /dev/null
+@@ -1,285 +0,0 @@
+-Memory usage
+-============
+-
+-(Highly unscientific.)
+-
+-Command used to gather static memory usage:
+-
+-```sh
+-grep ^Vm "/proc/$(ps fax | grep [m]etrics-bench | awk '{print $1}')/status"
+-```
+-
+-Program used to gather baseline memory usage:
+-
+-```go
+-package main
+-
+-import "time"
+-
+-func main() {
+-	time.Sleep(600e9)
+-}
+-```
+-
+-Baseline
+---------
+-
+-```
+-VmPeak:    42604 kB
+-VmSize:    42604 kB
+-VmLck:         0 kB
+-VmHWM:      1120 kB
+-VmRSS:      1120 kB
+-VmData:    35460 kB
+-VmStk:       136 kB
+-VmExe:      1020 kB
+-VmLib:      1848 kB
+-VmPTE:        36 kB
+-VmSwap:        0 kB
+-```
+-
+-Program used to gather metric memory usage (with other metrics being similar):
+-
+-```go
+-package main
+-
+-import (
+-	"fmt"
+-	"metrics"
+-	"time"
+-)
+-
+-func main() {
+-	fmt.Sprintf("foo")
+-	metrics.NewRegistry()
+-	time.Sleep(600e9)
+-}
+-```
+-
+-1000 counters registered
+-------------------------
+-
+-```
+-VmPeak:    44016 kB
+-VmSize:    44016 kB
+-VmLck:         0 kB
+-VmHWM:      1928 kB
+-VmRSS:      1928 kB
+-VmData:    36868 kB
+-VmStk:       136 kB
+-VmExe:      1024 kB
+-VmLib:      1848 kB
+-VmPTE:        40 kB
+-VmSwap:        0 kB
+-```
+-
+-**1.412 kB virtual, TODO 0.808 kB resident per counter.**
+-
+-100000 counters registered
+---------------------------
+-
+-```
+-VmPeak:    55024 kB
+-VmSize:    55024 kB
+-VmLck:         0 kB
+-VmHWM:     12440 kB
+-VmRSS:     12440 kB
+-VmData:    47876 kB
+-VmStk:       136 kB
+-VmExe:      1024 kB
+-VmLib:      1848 kB
+-VmPTE:        64 kB
+-VmSwap:        0 kB
+-```
+-
+-**0.1242 kB virtual, 0.1132 kB resident per counter.**
+-
+-1000 gauges registered
+-----------------------
+-
+-```
+-VmPeak:    44012 kB
+-VmSize:    44012 kB
+-VmLck:         0 kB
+-VmHWM:      1928 kB
+-VmRSS:      1928 kB
+-VmData:    36868 kB
+-VmStk:       136 kB
+-VmExe:      1020 kB
+-VmLib:      1848 kB
+-VmPTE:        40 kB
+-VmSwap:        0 kB
+-```
+-
+-**1.408 kB virtual, 0.808 kB resident per counter.**
+-
+-100000 gauges registered
+-------------------------
+-
+-```
+-VmPeak:    55020 kB
+-VmSize:    55020 kB
+-VmLck:         0 kB
+-VmHWM:     12432 kB
+-VmRSS:     12432 kB
+-VmData:    47876 kB
+-VmStk:       136 kB
+-VmExe:      1020 kB
+-VmLib:      1848 kB
+-VmPTE:        60 kB
+-VmSwap:        0 kB
+-```
+-
+-**0.12416 kB virtual, 0.11312 resident per gauge.**
+-
+-1000 histograms with a uniform sample size of 1028
+---------------------------------------------------
+-
+-```
+-VmPeak:    72272 kB
+-VmSize:    72272 kB
+-VmLck:         0 kB
+-VmHWM:     16204 kB
+-VmRSS:     16204 kB
+-VmData:    65100 kB
+-VmStk:       136 kB
+-VmExe:      1048 kB
+-VmLib:      1848 kB
+-VmPTE:        80 kB
+-VmSwap:        0 kB
+-```
+-
+-**29.668 kB virtual, TODO 15.084 resident per histogram.**
+-
+-10000 histograms with a uniform sample size of 1028
+----------------------------------------------------
+-
+-```
+-VmPeak:   256912 kB
+-VmSize:   256912 kB
+-VmLck:         0 kB
+-VmHWM:    146204 kB
+-VmRSS:    146204 kB
+-VmData:   249740 kB
+-VmStk:       136 kB
+-VmExe:      1048 kB
+-VmLib:      1848 kB
+-VmPTE:       448 kB
+-VmSwap:        0 kB
+-```
+-
+-**21.4308 kB virtual, 14.5084 kB resident per histogram.**
+-
+-50000 histograms with a uniform sample size of 1028
+----------------------------------------------------
+-
+-```
+-VmPeak:   908112 kB
+-VmSize:   908112 kB
+-VmLck:         0 kB
+-VmHWM:    645832 kB
+-VmRSS:    645588 kB
+-VmData:   900940 kB
+-VmStk:       136 kB
+-VmExe:      1048 kB
+-VmLib:      1848 kB
+-VmPTE:      1716 kB
+-VmSwap:     1544 kB
+-```
+-
+-**17.31016 kB virtual, 12.88936 kB resident per histogram.**
+-
+-1000 histograms with an exponentially-decaying sample size of 1028 and alpha of 0.015
+--------------------------------------------------------------------------------------
+-
+-```
+-VmPeak:    62480 kB
+-VmSize:    62480 kB
+-VmLck:         0 kB
+-VmHWM:     11572 kB
+-VmRSS:     11572 kB
+-VmData:    55308 kB
+-VmStk:       136 kB
+-VmExe:      1048 kB
+-VmLib:      1848 kB
+-VmPTE:        64 kB
+-VmSwap:        0 kB
+-```
+-
+-**19.876 kB virtual, 10.452 kB resident per histogram.**
+-
+-10000 histograms with an exponentially-decaying sample size of 1028 and alpha of 0.015
+---------------------------------------------------------------------------------------
+-
+-```
+-VmPeak:   153296 kB
+-VmSize:   153296 kB
+-VmLck:         0 kB
+-VmHWM:    101176 kB
+-VmRSS:    101176 kB
+-VmData:   146124 kB
+-VmStk:       136 kB
+-VmExe:      1048 kB
+-VmLib:      1848 kB
+-VmPTE:       240 kB
+-VmSwap:        0 kB
+-```
+-
+-**11.0692 kB virtual, 10.0056 kB resident per histogram.**
+-
+-50000 histograms with an exponentially-decaying sample size of 1028 and alpha of 0.015
+---------------------------------------------------------------------------------------
+-
+-```
+-VmPeak:   557264 kB
+-VmSize:   557264 kB
+-VmLck:         0 kB
+-VmHWM:    501056 kB
+-VmRSS:    501056 kB
+-VmData:   550092 kB
+-VmStk:       136 kB
+-VmExe:      1048 kB
+-VmLib:      1848 kB
+-VmPTE:      1032 kB
+-VmSwap:        0 kB
+-```
+-
+-**10.2932 kB virtual, 9.99872 kB resident per histogram.**
+-
+-1000 meters
+------------
+-
+-```
+-VmPeak:    74504 kB
+-VmSize:    74504 kB
+-VmLck:         0 kB
+-VmHWM:     24124 kB
+-VmRSS:     24124 kB
+-VmData:    67340 kB
+-VmStk:       136 kB
+-VmExe:      1040 kB
+-VmLib:      1848 kB
+-VmPTE:        92 kB
+-VmSwap:        0 kB
+-```
+-
+-**31.9 kB virtual, 23.004 kB resident per meter.**
+-
+-10000 meters
+-------------
+-
+-```
+-VmPeak:   278920 kB
+-VmSize:   278920 kB
+-VmLck:         0 kB
+-VmHWM:    227300 kB
+-VmRSS:    227300 kB
+-VmData:   271756 kB
+-VmStk:       136 kB
+-VmExe:      1040 kB
+-VmLib:      1848 kB
+-VmPTE:       488 kB
+-VmSwap:        0 kB
+-```
+-
+-**23.6316 kB virtual, 22.618 kB resident per meter.**
+diff --git a/third_party/github.com/rcrowley/go-metrics/meter.go b/third_party/github.com/rcrowley/go-metrics/meter.go
+deleted file mode 100644
+index 967e562..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/meter.go
++++ /dev/null
+@@ -1,183 +0,0 @@
+-package metrics
+-
+-import "time"
+-
+-// Meters count events to produce exponentially-weighted moving average rates
+-// at one-, five-, and fifteen-minutes and a mean rate.
+-type Meter interface {
+-	Count() int64
+-	Mark(int64)
+-	Rate1() float64
+-	Rate5() float64
+-	Rate15() float64
+-	RateMean() float64
+-	Snapshot() Meter
+-}
+-
+-// GetOrRegisterMeter returns an existing Meter or constructs and registers a
+-// new StandardMeter.
+-func GetOrRegisterMeter(name string, r Registry) Meter {
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	return r.GetOrRegister(name, NewMeter()).(Meter)
+-}
+-
+-// NewMeter constructs a new StandardMeter and launches a goroutine.
+-func NewMeter() Meter {
+-	if UseNilMetrics {
+-		return NilMeter{}
+-	}
+-	m := &StandardMeter{
+-		make(chan int64),
+-		make(chan *MeterSnapshot),
+-		time.NewTicker(5e9),
+-	}
+-	go m.arbiter()
+-	return m
+-}
+-
+-// NewMeter constructs and registers a new StandardMeter and launches a
+-// goroutine.
+-func NewRegisteredMeter(name string, r Registry) Meter {
+-	c := NewMeter()
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	r.Register(name, c)
+-	return c
+-}
+-
+-// MeterSnapshot is a read-only copy of another Meter.
+-type MeterSnapshot struct {
+-	count                          int64
+-	rate1, rate5, rate15, rateMean float64
+-}
+-
+-// Count returns the count of events at the time the snapshot was taken.
+-func (m *MeterSnapshot) Count() int64 { return m.count }
+-
+-// Mark panics.
+-func (*MeterSnapshot) Mark(n int64) {
+-	panic("Mark called on a MeterSnapshot")
+-}
+-
+-// Rate1 returns the one-minute moving average rate of events per second at the
+-// time the snapshot was taken.
+-func (m *MeterSnapshot) Rate1() float64 { return m.rate1 }
+-
+-// Rate5 returns the five-minute moving average rate of events per second at
+-// the time the snapshot was taken.
+-func (m *MeterSnapshot) Rate5() float64 { return m.rate5 }
+-
+-// Rate15 returns the fifteen-minute moving average rate of events per second
+-// at the time the snapshot was taken.
+-func (m *MeterSnapshot) Rate15() float64 { return m.rate15 }
+-
+-// RateMean returns the meter's mean rate of events per second at the time the
+-// snapshot was taken.
+-func (m *MeterSnapshot) RateMean() float64 { return m.rateMean }
+-
+-// Snapshot returns the snapshot.
+-func (m *MeterSnapshot) Snapshot() Meter { return m }
+-
+-// NilMeter is a no-op Meter.
+-type NilMeter struct{}
+-
+-// Count is a no-op.
+-func (NilMeter) Count() int64 { return 0 }
+-
+-// Mark is a no-op.
+-func (NilMeter) Mark(n int64) {}
+-
+-// Rate1 is a no-op.
+-func (NilMeter) Rate1() float64 { return 0.0 }
+-
+-// Rate5 is a no-op.
+-func (NilMeter) Rate5() float64 { return 0.0 }
+-
+-// Rate15is a no-op.
+-func (NilMeter) Rate15() float64 { return 0.0 }
+-
+-// RateMean is a no-op.
+-func (NilMeter) RateMean() float64 { return 0.0 }
+-
+-// Snapshot is a no-op.
+-func (NilMeter) Snapshot() Meter { return NilMeter{} }
+-
+-// StandardMeter is the standard implementation of a Meter and uses a
+-// goroutine to synchronize its calculations and a time.Ticker to pass time.
+-type StandardMeter struct {
+-	in     chan int64
+-	out    chan *MeterSnapshot
+-	ticker *time.Ticker
+-}
+-
+-// Count returns the number of events recorded.
+-func (m *StandardMeter) Count() int64 {
+-	return (<-m.out).count
+-}
+-
+-// Mark records the occurance of n events.
+-func (m *StandardMeter) Mark(n int64) {
+-	m.in <- n
+-}
+-
+-// Rate1 returns the one-minute moving average rate of events per second.
+-func (m *StandardMeter) Rate1() float64 {
+-	return (<-m.out).rate1
+-}
+-
+-// Rate5 returns the five-minute moving average rate of events per second.
+-func (m *StandardMeter) Rate5() float64 {
+-	return (<-m.out).rate5
+-}
+-
+-// Rate15 returns the fifteen-minute moving average rate of events per second.
+-func (m *StandardMeter) Rate15() float64 {
+-	return (<-m.out).rate15
+-}
+-
+-// RateMean returns the meter's mean rate of events per second.
+-func (m *StandardMeter) RateMean() float64 {
+-	return (<-m.out).rateMean
+-}
+-
+-// Snapshot returns a read-only copy of the meter.
+-func (m *StandardMeter) Snapshot() Meter {
+-	snapshot := *<-m.out
+-	return &snapshot
+-}
+-
+-// arbiter receives inputs and sends outputs.  It counts each input and updates
+-// the various moving averages and the mean rate of events.  It sends a copy of
+-// the meterV as output.
+-func (m *StandardMeter) arbiter() {
+-	snapshot := &MeterSnapshot{}
+-	a1 := NewEWMA1()
+-	a5 := NewEWMA5()
+-	a15 := NewEWMA15()
+-	t := time.Now()
+-	for {
+-		select {
+-		case n := <-m.in:
+-			snapshot.count += n
+-			a1.Update(n)
+-			a5.Update(n)
+-			a15.Update(n)
+-			snapshot.rate1 = a1.Rate()
+-			snapshot.rate5 = a5.Rate()
+-			snapshot.rate15 = a15.Rate()
+-			snapshot.rateMean = float64(1e9*snapshot.count) / float64(time.Since(t))
+-		case m.out <- snapshot:
+-		case <-m.ticker.C:
+-			a1.Tick()
+-			a5.Tick()
+-			a15.Tick()
+-			snapshot.rate1 = a1.Rate()
+-			snapshot.rate5 = a5.Rate()
+-			snapshot.rate15 = a15.Rate()
+-			snapshot.rateMean = float64(1e9*snapshot.count) / float64(time.Since(t))
+-		}
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/meter_test.go b/third_party/github.com/rcrowley/go-metrics/meter_test.go
+deleted file mode 100644
+index 62479f9..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/meter_test.go
++++ /dev/null
+@@ -1,60 +0,0 @@
+-package metrics
+-
+-import (
+-	"testing"
+-	"time"
+-)
+-
+-func BenchmarkMeter(b *testing.B) {
+-	m := NewMeter()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		m.Mark(1)
+-	}
+-}
+-
+-func TestGetOrRegisterMeter(t *testing.T) {
+-	r := NewRegistry()
+-	NewRegisteredMeter("foo", r).Mark(47)
+-	if m := GetOrRegisterMeter("foo", r); 47 != m.Count() {
+-		t.Fatal(m)
+-	}
+-}
+-
+-func TestMeterDecay(t *testing.T) {
+-	m := &StandardMeter{
+-		make(chan int64),
+-		make(chan *MeterSnapshot),
+-		time.NewTicker(1),
+-	}
+-	go m.arbiter()
+-	m.Mark(1)
+-	rateMean := m.RateMean()
+-	time.Sleep(1)
+-	if m.RateMean() >= rateMean {
+-		t.Error("m.RateMean() didn't decrease")
+-	}
+-}
+-
+-func TestMeterNonzero(t *testing.T) {
+-	m := NewMeter()
+-	m.Mark(3)
+-	if count := m.Count(); 3 != count {
+-		t.Errorf("m.Count(): 3 != %v\n", count)
+-	}
+-}
+-
+-func TestMeterSnapshot(t *testing.T) {
+-	m := NewMeter()
+-	m.Mark(1)
+-	if snapshot := m.Snapshot(); m.RateMean() != snapshot.RateMean() {
+-		t.Fatal(snapshot)
+-	}
+-}
+-
+-func TestMeterZero(t *testing.T) {
+-	m := NewMeter()
+-	if count := m.Count(); 0 != count {
+-		t.Errorf("m.Count(): 0 != %v\n", count)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/metrics.go b/third_party/github.com/rcrowley/go-metrics/metrics.go
+deleted file mode 100644
+index b97a49e..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/metrics.go
++++ /dev/null
+@@ -1,13 +0,0 @@
+-// Go port of Coda Hale's Metrics library
+-//
+-// <https://github.com/rcrowley/go-metrics>
+-//
+-// Coda Hale's original work: <https://github.com/codahale/metrics>
+-package metrics
+-
+-// UseNilMetrics is checked by the constructor functions for all of the
+-// standard metrics.  If it is true, the metric returned is a stub.
+-//
+-// This global kill-switch helps quantify the observer effect and makes
+-// for less cluttered pprof profiles.
+-var UseNilMetrics bool = false
+diff --git a/third_party/github.com/rcrowley/go-metrics/metrics_test.go b/third_party/github.com/rcrowley/go-metrics/metrics_test.go
+deleted file mode 100644
+index 8d03d3e..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/metrics_test.go
++++ /dev/null
+@@ -1,105 +0,0 @@
+-package metrics
+-
+-import (
+-	"io/ioutil"
+-	"log"
+-	"sync"
+-	"testing"
+-)
+-
+-const FANOUT = 128
+-
+-// Stop the compiler from complaining during debugging.
+-var (
+-	_ = ioutil.Discard
+-	_ = log.LstdFlags
+-)
+-
+-func BenchmarkMetrics(b *testing.B) {
+-	r := NewRegistry()
+-	c := NewRegisteredCounter("counter", r)
+-	g := NewRegisteredGauge("gauge", r)
+-	h := NewRegisteredHistogram("histogram", r, NewUniformSample(100))
+-	m := NewRegisteredMeter("meter", r)
+-	t := NewRegisteredTimer("timer", r)
+-	RegisterDebugGCStats(r)
+-	RegisterRuntimeMemStats(r)
+-	b.ResetTimer()
+-	ch := make(chan bool)
+-
+-	wgD := &sync.WaitGroup{}
+-	/*
+-		wgD.Add(1)
+-		go func() {
+-			defer wgD.Done()
+-			//log.Println("go CaptureDebugGCStats")
+-			for {
+-				select {
+-				case <-ch:
+-					//log.Println("done CaptureDebugGCStats")
+-					return
+-				default:
+-					CaptureDebugGCStatsOnce(r)
+-				}
+-			}
+-		}()
+-	//*/
+-
+-	wgR := &sync.WaitGroup{}
+-	//*
+-	wgR.Add(1)
+-	go func() {
+-		defer wgR.Done()
+-		//log.Println("go CaptureRuntimeMemStats")
+-		for {
+-			select {
+-			case <-ch:
+-				//log.Println("done CaptureRuntimeMemStats")
+-				return
+-			default:
+-				CaptureRuntimeMemStatsOnce(r)
+-			}
+-		}
+-	}()
+-	//*/
+-
+-	wgW := &sync.WaitGroup{}
+-	/*
+-		wgW.Add(1)
+-		go func() {
+-			defer wgW.Done()
+-			//log.Println("go Write")
+-			for {
+-				select {
+-				case <-ch:
+-					//log.Println("done Write")
+-					return
+-				default:
+-					WriteOnce(r, ioutil.Discard)
+-				}
+-			}
+-		}()
+-	//*/
+-
+-	wg := &sync.WaitGroup{}
+-	wg.Add(FANOUT)
+-	for i := 0; i < FANOUT; i++ {
+-		go func(i int) {
+-			defer wg.Done()
+-			//log.Println("go", i)
+-			for i := 0; i < b.N; i++ {
+-				c.Inc(1)
+-				g.Update(int64(i))
+-				h.Update(int64(i))
+-				m.Mark(1)
+-				t.Update(1)
+-			}
+-			//log.Println("done", i)
+-		}(i)
+-	}
+-	wg.Wait()
+-	close(ch)
+-	wgD.Wait()
+-	wgR.Wait()
+-	wgW.Wait()
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/registry.go b/third_party/github.com/rcrowley/go-metrics/registry.go
+deleted file mode 100644
+index d6b4803..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/registry.go
++++ /dev/null
+@@ -1,142 +0,0 @@
+-package metrics
+-
+-import "sync"
+-
+-// A Registry holds references to a set of metrics by name and can iterate
+-// over them, calling callback functions provided by the user.
+-//
+-// This is an interface so as to encourage other structs to implement
+-// the Registry API as appropriate.
+-type Registry interface {
+-
+-	// Call the given function for each registered metric.
+-	Each(func(string, interface{}))
+-
+-	// Get the metric by the given name or nil if none is registered.
+-	Get(string) interface{}
+-
+-	// Gets an existing metric or creates and registers a new one.
+-	GetOrRegister(string, interface{}) interface{}
+-
+-	// Register the given metric under the given name.
+-	Register(string, interface{})
+-
+-	// Run all registered healthchecks.
+-	RunHealthchecks()
+-
+-	// Unregister the metric with the given name.
+-	Unregister(string)
+-}
+-
+-// The standard implementation of a Registry is a mutex-protected map
+-// of names to metrics.
+-type StandardRegistry struct {
+-	metrics map[string]interface{}
+-	mutex   sync.Mutex
+-}
+-
+-// Create a new registry.
+-func NewRegistry() Registry {
+-	return &StandardRegistry{metrics: make(map[string]interface{})}
+-}
+-
+-// Call the given function for each registered metric.
+-func (r *StandardRegistry) Each(f func(string, interface{})) {
+-	for name, i := range r.registered() {
+-		f(name, i)
+-	}
+-}
+-
+-// Get the metric by the given name or nil if none is registered.
+-func (r *StandardRegistry) Get(name string) interface{} {
+-	r.mutex.Lock()
+-	defer r.mutex.Unlock()
+-	return r.metrics[name]
+-}
+-
+-// Gets an existing metric or creates and registers a new one. Threadsafe
+-// alternative to calling Get and Register on failure.
+-func (r *StandardRegistry) GetOrRegister(name string, i interface{}) interface{} {
+-	r.mutex.Lock()
+-	defer r.mutex.Unlock()
+-	if metric, ok := r.metrics[name]; ok {
+-		return metric
+-	}
+-	r.register(name, i)
+-	return i
+-}
+-
+-// Register the given metric under the given name.
+-func (r *StandardRegistry) Register(name string, i interface{}) {
+-	r.mutex.Lock()
+-	defer r.mutex.Unlock()
+-	r.register(name, i)
+-}
+-
+-// Run all registered healthchecks.
+-func (r *StandardRegistry) RunHealthchecks() {
+-	r.mutex.Lock()
+-	defer r.mutex.Unlock()
+-	for _, i := range r.metrics {
+-		if h, ok := i.(Healthcheck); ok {
+-			h.Check()
+-		}
+-	}
+-}
+-
+-// Unregister the metric with the given name.
+-func (r *StandardRegistry) Unregister(name string) {
+-	r.mutex.Lock()
+-	defer r.mutex.Unlock()
+-	delete(r.metrics, name)
+-}
+-
+-func (r *StandardRegistry) register(name string, i interface{}) {
+-	switch i.(type) {
+-	case Counter, Gauge, Healthcheck, Histogram, Meter, Timer:
+-		r.metrics[name] = i
+-	}
+-}
+-
+-func (r *StandardRegistry) registered() map[string]interface{} {
+-	metrics := make(map[string]interface{}, len(r.metrics))
+-	r.mutex.Lock()
+-	defer r.mutex.Unlock()
+-	for name, i := range r.metrics {
+-		metrics[name] = i
+-	}
+-	return metrics
+-}
+-
+-var DefaultRegistry Registry = NewRegistry()
+-
+-// Call the given function for each registered metric.
+-func Each(f func(string, interface{})) {
+-	DefaultRegistry.Each(f)
+-}
+-
+-// Get the metric by the given name or nil if none is registered.
+-func Get(name string) interface{} {
+-	return DefaultRegistry.Get(name)
+-}
+-
+-// Gets an existing metric or creates and registers a new one. Threadsafe
+-// alternative to calling Get and Register on failure.
+-func GetOrRegister(name string, i interface{}) interface{} {
+-	return DefaultRegistry.GetOrRegister(name, i)
+-}
+-
+-// Register the given metric under the given name.
+-func Register(name string, i interface{}) {
+-	DefaultRegistry.Register(name, i)
+-}
+-
+-// Run all registered healthchecks.
+-func RunHealthchecks() {
+-	DefaultRegistry.RunHealthchecks()
+-}
+-
+-// Unregister the metric with the given name.
+-func Unregister(name string) {
+-	DefaultRegistry.Unregister(name)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/registry_test.go b/third_party/github.com/rcrowley/go-metrics/registry_test.go
+deleted file mode 100644
+index aa07e62..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/registry_test.go
++++ /dev/null
+@@ -1,73 +0,0 @@
+-package metrics
+-
+-import "testing"
+-
+-func BenchmarkRegistry(b *testing.B) {
+-	r := NewRegistry()
+-	r.Register("foo", NewCounter())
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		r.Each(func(string, interface{}) {})
+-	}
+-}
+-
+-func TestRegistry(t *testing.T) {
+-	r := NewRegistry()
+-	r.Register("foo", NewCounter())
+-	i := 0
+-	r.Each(func(name string, iface interface{}) {
+-		i++
+-		if "foo" != name {
+-			t.Fatal(name)
+-		}
+-		if _, ok := iface.(Counter); !ok {
+-			t.Fatal(iface)
+-		}
+-	})
+-	if 1 != i {
+-		t.Fatal(i)
+-	}
+-	r.Unregister("foo")
+-	i = 0
+-	r.Each(func(string, interface{}) { i++ })
+-	if 0 != i {
+-		t.Fatal(i)
+-	}
+-}
+-
+-func TestRegistryGet(t *testing.T) {
+-	r := NewRegistry()
+-	r.Register("foo", NewCounter())
+-	if count := r.Get("foo").(Counter).Count(); 0 != count {
+-		t.Fatal(count)
+-	}
+-	r.Get("foo").(Counter).Inc(1)
+-	if count := r.Get("foo").(Counter).Count(); 1 != count {
+-		t.Fatal(count)
+-	}
+-}
+-
+-func TestRegistryGetOrRegister(t *testing.T) {
+-	r := NewRegistry()
+-
+-	// First metric wins with GetOrRegister
+-	_ = r.GetOrRegister("foo", NewCounter())
+-	m := r.GetOrRegister("foo", NewGauge())
+-	if _, ok := m.(Counter); !ok {
+-		t.Fatal(m)
+-	}
+-
+-	i := 0
+-	r.Each(func(name string, iface interface{}) {
+-		i++
+-		if name != "foo" {
+-			t.Fatal(name)
+-		}
+-		if _, ok := iface.(Counter); !ok {
+-			t.Fatal(iface)
+-		}
+-	})
+-	if i != 1 {
+-		t.Fatal(i)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/runtime.go b/third_party/github.com/rcrowley/go-metrics/runtime.go
+deleted file mode 100644
+index 6bec674..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/runtime.go
++++ /dev/null
+@@ -1,171 +0,0 @@
+-package metrics
+-
+-import (
+-	"runtime"
+-	"time"
+-)
+-
+-var (
+-	memStats       runtime.MemStats
+-	runtimeMetrics struct {
+-		MemStats struct {
+-			Alloc        Gauge
+-			BuckHashSys  Gauge
+-			DebugGC      Gauge
+-			EnableGC     Gauge
+-			Frees        Gauge
+-			HeapAlloc    Gauge
+-			HeapIdle     Gauge
+-			HeapInuse    Gauge
+-			HeapObjects  Gauge
+-			HeapReleased Gauge
+-			HeapSys      Gauge
+-			LastGC       Gauge
+-			Lookups      Gauge
+-			Mallocs      Gauge
+-			MCacheInuse  Gauge
+-			MCacheSys    Gauge
+-			MSpanInuse   Gauge
+-			MSpanSys     Gauge
+-			NextGC       Gauge
+-			NumGC        Gauge
+-			PauseNs      Histogram
+-			PauseTotalNs Gauge
+-			StackInuse   Gauge
+-			StackSys     Gauge
+-			Sys          Gauge
+-			TotalAlloc   Gauge
+-		}
+-		NumCgoCall   Gauge
+-		NumGoroutine Gauge
+-		ReadMemStats Timer
+-	}
+-	numGC uint32
+-)
+-
+-// Capture new values for the Go runtime statistics exported in
+-// runtime.MemStats.  This is designed to be called as a goroutine.
+-func CaptureRuntimeMemStats(r Registry, d time.Duration) {
+-	for {
+-		CaptureRuntimeMemStatsOnce(r)
+-		time.Sleep(d)
+-	}
+-}
+-
+-// Capture new values for the Go runtime statistics exported in
+-// runtime.MemStats.  This is designed to be called in a background
+-// goroutine.  Giving a registry which has not been given to
+-// RegisterRuntimeMemStats will panic.
+-//
+-// Be very careful with this because runtime.ReadMemStats calls the C
+-// functions runtime·semacquire(&runtime·worldsema) and runtime·stoptheworld()
+-// and that last one does what it says on the tin.
+-func CaptureRuntimeMemStatsOnce(r Registry) {
+-	t := time.Now()
+-	runtime.ReadMemStats(&memStats) // This takes 50-200us.
+-	runtimeMetrics.ReadMemStats.UpdateSince(t)
+-
+-	runtimeMetrics.MemStats.Alloc.Update(int64(memStats.Alloc))
+-	runtimeMetrics.MemStats.BuckHashSys.Update(int64(memStats.BuckHashSys))
+-	if memStats.DebugGC {
+-		runtimeMetrics.MemStats.DebugGC.Update(1)
+-	} else {
+-		runtimeMetrics.MemStats.DebugGC.Update(0)
+-	}
+-	if memStats.EnableGC {
+-		runtimeMetrics.MemStats.EnableGC.Update(1)
+-	} else {
+-		runtimeMetrics.MemStats.EnableGC.Update(0)
+-	}
+-	runtimeMetrics.MemStats.Frees.Update(int64(memStats.Frees))
+-	runtimeMetrics.MemStats.HeapAlloc.Update(int64(memStats.HeapAlloc))
+-	runtimeMetrics.MemStats.HeapIdle.Update(int64(memStats.HeapIdle))
+-	runtimeMetrics.MemStats.HeapInuse.Update(int64(memStats.HeapInuse))
+-	runtimeMetrics.MemStats.HeapObjects.Update(int64(memStats.HeapObjects))
+-	runtimeMetrics.MemStats.HeapReleased.Update(int64(memStats.HeapReleased))
+-	runtimeMetrics.MemStats.HeapSys.Update(int64(memStats.HeapSys))
+-	runtimeMetrics.MemStats.LastGC.Update(int64(memStats.LastGC))
+-	runtimeMetrics.MemStats.Lookups.Update(int64(memStats.Lookups))
+-	runtimeMetrics.MemStats.Mallocs.Update(int64(memStats.Mallocs))
+-	runtimeMetrics.MemStats.MCacheInuse.Update(int64(memStats.MCacheInuse))
+-	runtimeMetrics.MemStats.MCacheSys.Update(int64(memStats.MCacheSys))
+-	runtimeMetrics.MemStats.MSpanInuse.Update(int64(memStats.MSpanInuse))
+-	runtimeMetrics.MemStats.MSpanSys.Update(int64(memStats.MSpanSys))
+-	runtimeMetrics.MemStats.NextGC.Update(int64(memStats.NextGC))
+-	runtimeMetrics.MemStats.NumGC.Update(int64(memStats.NumGC))
+-	for i := uint32(1); i <= memStats.NumGC-numGC; i++ {
+-		runtimeMetrics.MemStats.PauseNs.Update(int64(memStats.PauseNs[(memStats.NumGC%256-i)%256])) // <https://code.google.com/p/go/source/browse/src/pkg/runtime/mgc0.c>
+-	}
+-	runtimeMetrics.MemStats.PauseTotalNs.Update(int64(memStats.PauseTotalNs))
+-	runtimeMetrics.MemStats.StackInuse.Update(int64(memStats.StackInuse))
+-	runtimeMetrics.MemStats.StackSys.Update(int64(memStats.StackSys))
+-	runtimeMetrics.MemStats.Sys.Update(int64(memStats.Sys))
+-	runtimeMetrics.MemStats.TotalAlloc.Update(int64(memStats.TotalAlloc))
+-	runtimeMetrics.NumCgoCall.Update(int64(runtime.NumCgoCall()))
+-	runtimeMetrics.NumGoroutine.Update(int64(runtime.NumGoroutine()))
+-}
+-
+-// Register runtimeMetrics for the Go runtime statistics exported in runtime and
+-// specifically runtime.MemStats.  The runtimeMetrics are named by their
+-// fully-qualified Go symbols, i.e. runtime.MemStats.Alloc.
+-func RegisterRuntimeMemStats(r Registry) {
+-	runtimeMetrics.MemStats.Alloc = NewGauge()
+-	runtimeMetrics.MemStats.BuckHashSys = NewGauge()
+-	runtimeMetrics.MemStats.DebugGC = NewGauge()
+-	runtimeMetrics.MemStats.EnableGC = NewGauge()
+-	runtimeMetrics.MemStats.Frees = NewGauge()
+-	runtimeMetrics.MemStats.HeapAlloc = NewGauge()
+-	runtimeMetrics.MemStats.HeapIdle = NewGauge()
+-	runtimeMetrics.MemStats.HeapInuse = NewGauge()
+-	runtimeMetrics.MemStats.HeapObjects = NewGauge()
+-	runtimeMetrics.MemStats.HeapReleased = NewGauge()
+-	runtimeMetrics.MemStats.HeapSys = NewGauge()
+-	runtimeMetrics.MemStats.LastGC = NewGauge()
+-	runtimeMetrics.MemStats.Lookups = NewGauge()
+-	runtimeMetrics.MemStats.Mallocs = NewGauge()
+-	runtimeMetrics.MemStats.MCacheInuse = NewGauge()
+-	runtimeMetrics.MemStats.MCacheSys = NewGauge()
+-	runtimeMetrics.MemStats.MSpanInuse = NewGauge()
+-	runtimeMetrics.MemStats.MSpanSys = NewGauge()
+-	runtimeMetrics.MemStats.NextGC = NewGauge()
+-	runtimeMetrics.MemStats.NumGC = NewGauge()
+-	runtimeMetrics.MemStats.PauseNs = NewHistogram(NewExpDecaySample(1028, 0.015))
+-	runtimeMetrics.MemStats.PauseTotalNs = NewGauge()
+-	runtimeMetrics.MemStats.StackInuse = NewGauge()
+-	runtimeMetrics.MemStats.StackSys = NewGauge()
+-	runtimeMetrics.MemStats.Sys = NewGauge()
+-	runtimeMetrics.MemStats.TotalAlloc = NewGauge()
+-	runtimeMetrics.NumCgoCall = NewGauge()
+-	runtimeMetrics.NumGoroutine = NewGauge()
+-	runtimeMetrics.ReadMemStats = NewTimer()
+-
+-	r.Register("runtime.MemStats.Alloc", runtimeMetrics.MemStats.Alloc)
+-	r.Register("runtime.MemStats.BuckHashSys", runtimeMetrics.MemStats.BuckHashSys)
+-	r.Register("runtime.MemStats.DebugGC", runtimeMetrics.MemStats.DebugGC)
+-	r.Register("runtime.MemStats.EnableGC", runtimeMetrics.MemStats.EnableGC)
+-	r.Register("runtime.MemStats.Frees", runtimeMetrics.MemStats.Frees)
+-	r.Register("runtime.MemStats.HeapAlloc", runtimeMetrics.MemStats.HeapAlloc)
+-	r.Register("runtime.MemStats.HeapIdle", runtimeMetrics.MemStats.HeapIdle)
+-	r.Register("runtime.MemStats.HeapInuse", runtimeMetrics.MemStats.HeapInuse)
+-	r.Register("runtime.MemStats.HeapObjects", runtimeMetrics.MemStats.HeapObjects)
+-	r.Register("runtime.MemStats.HeapReleased", runtimeMetrics.MemStats.HeapReleased)
+-	r.Register("runtime.MemStats.HeapSys", runtimeMetrics.MemStats.HeapSys)
+-	r.Register("runtime.MemStats.LastGC", runtimeMetrics.MemStats.LastGC)
+-	r.Register("runtime.MemStats.Lookups", runtimeMetrics.MemStats.Lookups)
+-	r.Register("runtime.MemStats.Mallocs", runtimeMetrics.MemStats.Mallocs)
+-	r.Register("runtime.MemStats.MCacheInuse", runtimeMetrics.MemStats.MCacheInuse)
+-	r.Register("runtime.MemStats.MCacheSys", runtimeMetrics.MemStats.MCacheSys)
+-	r.Register("runtime.MemStats.MSpanInuse", runtimeMetrics.MemStats.MSpanInuse)
+-	r.Register("runtime.MemStats.MSpanSys", runtimeMetrics.MemStats.MSpanSys)
+-	r.Register("runtime.MemStats.NextGC", runtimeMetrics.MemStats.NextGC)
+-	r.Register("runtime.MemStats.NumGC", runtimeMetrics.MemStats.NumGC)
+-	r.Register("runtime.MemStats.PauseNs", runtimeMetrics.MemStats.PauseNs)
+-	r.Register("runtime.MemStats.PauseTotalNs", runtimeMetrics.MemStats.PauseTotalNs)
+-	r.Register("runtime.MemStats.StackInuse", runtimeMetrics.MemStats.StackInuse)
+-	r.Register("runtime.MemStats.StackSys", runtimeMetrics.MemStats.StackSys)
+-	r.Register("runtime.MemStats.Sys", runtimeMetrics.MemStats.Sys)
+-	r.Register("runtime.MemStats.TotalAlloc", runtimeMetrics.MemStats.TotalAlloc)
+-	r.Register("runtime.NumCgoCall", runtimeMetrics.NumCgoCall)
+-	r.Register("runtime.NumGoroutine", runtimeMetrics.NumGoroutine)
+-	r.Register("runtime.ReadMemStats", runtimeMetrics.ReadMemStats)
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/runtime_test.go b/third_party/github.com/rcrowley/go-metrics/runtime_test.go
+deleted file mode 100644
+index b5478ed..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/runtime_test.go
++++ /dev/null
+@@ -1,46 +0,0 @@
+-package metrics
+-
+-import (
+-	"runtime"
+-	"testing"
+-	"time"
+-)
+-
+-func BenchmarkRuntimeMemStats(b *testing.B) {
+-	r := NewRegistry()
+-	RegisterRuntimeMemStats(r)
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		CaptureRuntimeMemStatsOnce(r)
+-	}
+-}
+-
+-func TestRuntimeMemStatsBlocking(t *testing.T) {
+-	if g := runtime.GOMAXPROCS(0); g < 2 {
+-		t.Skipf("skipping TestRuntimeMemStatsBlocking with GOMAXPROCS=%d\n", g)
+-	}
+-	ch := make(chan int)
+-	go testRuntimeMemStatsBlocking(ch)
+-	var memStats runtime.MemStats
+-	t0 := time.Now()
+-	runtime.ReadMemStats(&memStats)
+-	t1 := time.Now()
+-	t.Log("i++ during runtime.ReadMemStats:", <-ch)
+-	go testRuntimeMemStatsBlocking(ch)
+-	d := t1.Sub(t0)
+-	t.Log(d)
+-	time.Sleep(d)
+-	t.Log("i++ during time.Sleep:", <-ch)
+-}
+-
+-func testRuntimeMemStatsBlocking(ch chan int) {
+-	i := 0
+-	for {
+-		select {
+-		case ch <- i:
+-			return
+-		default:
+-			i++
+-		}
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/sample.go b/third_party/github.com/rcrowley/go-metrics/sample.go
+deleted file mode 100644
+index 907a850..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/sample.go
++++ /dev/null
+@@ -1,562 +0,0 @@
+-package metrics
+-
+-import (
+-	"container/heap"
+-	"math"
+-	"math/rand"
+-	"sort"
+-	"sync"
+-	"sync/atomic"
+-	"time"
+-)
+-
+-const rescaleThreshold = time.Hour
+-
+-// Samples maintain a statistically-significant selection of values from
+-// a stream.
+-type Sample interface {
+-	Clear()
+-	Count() int64
+-	Max() int64
+-	Mean() float64
+-	Min() int64
+-	Percentile(float64) float64
+-	Percentiles([]float64) []float64
+-	Size() int
+-	Snapshot() Sample
+-	StdDev() float64
+-	Sum() int64
+-	Update(int64)
+-	Values() []int64
+-	Variance() float64
+-}
+-
+-// ExpDecaySample is an exponentially-decaying sample using a forward-decaying
+-// priority reservoir.  See Cormode et al's "Forward Decay: A Practical Time
+-// Decay Model for Streaming Systems".
+-//
+-// <http://www.research.att.com/people/Cormode_Graham/library/publications/CormodeShkapenyukSrivastavaXu09.pdf>
+-type ExpDecaySample struct {
+-	alpha         float64
+-	count         int64
+-	mutex         sync.Mutex
+-	reservoirSize int
+-	t0, t1        time.Time
+-	values        expDecaySampleHeap
+-}
+-
+-// NewExpDecaySample constructs a new exponentially-decaying sample with the
+-// given reservoir size and alpha.
+-func NewExpDecaySample(reservoirSize int, alpha float64) Sample {
+-	if UseNilMetrics {
+-		return NilSample{}
+-	}
+-	s := &ExpDecaySample{
+-		alpha:         alpha,
+-		reservoirSize: reservoirSize,
+-		t0:            time.Now(),
+-		values:        make(expDecaySampleHeap, 0, reservoirSize),
+-	}
+-	s.t1 = time.Now().Add(rescaleThreshold)
+-	return s
+-}
+-
+-// Clear clears all samples.
+-func (s *ExpDecaySample) Clear() {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	s.count = 0
+-	s.t0 = time.Now()
+-	s.t1 = s.t0.Add(rescaleThreshold)
+-	s.values = make(expDecaySampleHeap, 0, s.reservoirSize)
+-}
+-
+-// Count returns the number of samples recorded, which may exceed the
+-// reservoir size.
+-func (s *ExpDecaySample) Count() int64 {
+-	return atomic.LoadInt64(&s.count)
+-}
+-
+-// Max returns the maximum value in the sample, which may not be the maximum
+-// value ever to be part of the sample.
+-func (s *ExpDecaySample) Max() int64 {
+-	return SampleMax(s.Values())
+-}
+-
+-// Mean returns the mean of the values in the sample.
+-func (s *ExpDecaySample) Mean() float64 {
+-	return SampleMean(s.Values())
+-}
+-
+-// Min returns the minimum value in the sample, which may not be the minimum
+-// value ever to be part of the sample.
+-func (s *ExpDecaySample) Min() int64 {
+-	return SampleMin(s.Values())
+-}
+-
+-// Percentile returns an arbitrary percentile of values in the sample.
+-func (s *ExpDecaySample) Percentile(p float64) float64 {
+-	return SamplePercentile(s.Values(), p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of values in the
+-// sample.
+-func (s *ExpDecaySample) Percentiles(ps []float64) []float64 {
+-	return SamplePercentiles(s.Values(), ps)
+-}
+-
+-// Size returns the size of the sample, which is at most the reservoir size.
+-func (s *ExpDecaySample) Size() int {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return len(s.values)
+-}
+-
+-// Snapshot returns a read-only copy of the sample.
+-func (s *ExpDecaySample) Snapshot() Sample {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	values := make([]int64, len(s.values))
+-	for i, v := range s.values {
+-		values[i] = v.v
+-	}
+-	return &SampleSnapshot{
+-		count:  s.count,
+-		values: values,
+-	}
+-}
+-
+-// StdDev returns the standard deviation of the values in the sample.
+-func (s *ExpDecaySample) StdDev() float64 {
+-	return SampleStdDev(s.Values())
+-}
+-
+-// Sum returns the sum of the values in the sample.
+-func (s *ExpDecaySample) Sum() int64 {
+-	return SampleSum(s.Values())
+-}
+-
+-// Update samples a new value.
+-func (s *ExpDecaySample) Update(v int64) {
+-	s.update(time.Now(), v)
+-}
+-
+-// Values returns a copy of the values in the sample.
+-func (s *ExpDecaySample) Values() []int64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	values := make([]int64, len(s.values))
+-	for i, v := range s.values {
+-		values[i] = v.v
+-	}
+-	return values
+-}
+-
+-// Variance returns the variance of the values in the sample.
+-func (s *ExpDecaySample) Variance() float64 {
+-	return SampleVariance(s.Values())
+-}
+-
+-// update samples a new value at a particular timestamp.  This is a method all
+-// its own to facilitate testing.
+-func (s *ExpDecaySample) update(t time.Time, v int64) {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	s.count++
+-	if len(s.values) == s.reservoirSize {
+-		heap.Pop(&s.values)
+-	}
+-	heap.Push(&s.values, expDecaySample{
+-		k: math.Exp(t.Sub(s.t0).Seconds()*s.alpha) / rand.Float64(),
+-		v: v,
+-	})
+-	if t.After(s.t1) {
+-		values := s.values
+-		t0 := s.t0
+-		s.values = make(expDecaySampleHeap, 0, s.reservoirSize)
+-		s.t0 = t
+-		s.t1 = s.t0.Add(rescaleThreshold)
+-		for _, v := range values {
+-			v.k = v.k * math.Exp(-s.alpha*float64(s.t0.Sub(t0)))
+-			heap.Push(&s.values, v)
+-		}
+-	}
+-}
+-
+-// NilSample is a no-op Sample.
+-type NilSample struct{}
+-
+-// Clear is a no-op.
+-func (NilSample) Clear() {}
+-
+-// Count is a no-op.
+-func (NilSample) Count() int64 { return 0 }
+-
+-// Max is a no-op.
+-func (NilSample) Max() int64 { return 0 }
+-
+-// Mean is a no-op.
+-func (NilSample) Mean() float64 { return 0.0 }
+-
+-// Min is a no-op.
+-func (NilSample) Min() int64 { return 0 }
+-
+-// Percentile is a no-op.
+-func (NilSample) Percentile(p float64) float64 { return 0.0 }
+-
+-// Percentiles is a no-op.
+-func (NilSample) Percentiles(ps []float64) []float64 {
+-	return make([]float64, len(ps))
+-}
+-
+-// Size is a no-op.
+-func (NilSample) Size() int { return 0 }
+-
+-// Sample is a no-op.
+-func (NilSample) Snapshot() Sample { return NilSample{} }
+-
+-// StdDev is a no-op.
+-func (NilSample) StdDev() float64 { return 0.0 }
+-
+-// Sum is a no-op.
+-func (NilSample) Sum() int64 { return 0 }
+-
+-// Update is a no-op.
+-func (NilSample) Update(v int64) {}
+-
+-// Values is a no-op.
+-func (NilSample) Values() []int64 { return []int64{} }
+-
+-// Variance is a no-op.
+-func (NilSample) Variance() float64 { return 0.0 }
+-
+-// SampleMax returns the maximum value of the slice of int64.
+-func SampleMax(values []int64) int64 {
+-	if 0 == len(values) {
+-		return 0
+-	}
+-	var max int64 = math.MinInt64
+-	for _, v := range values {
+-		if max < v {
+-			max = v
+-		}
+-	}
+-	return max
+-}
+-
+-// SampleMean returns the mean value of the slice of int64.
+-func SampleMean(values []int64) float64 {
+-	if 0 == len(values) {
+-		return 0.0
+-	}
+-	return float64(SampleSum(values)) / float64(len(values))
+-}
+-
+-// SampleMin returns the minimum value of the slice of int64.
+-func SampleMin(values []int64) int64 {
+-	if 0 == len(values) {
+-		return 0
+-	}
+-	var min int64 = math.MaxInt64
+-	for _, v := range values {
+-		if min > v {
+-			min = v
+-		}
+-	}
+-	return min
+-}
+-
+-// SamplePercentiles returns an arbitrary percentile of the slice of int64.
+-func SamplePercentile(values int64Slice, p float64) float64 {
+-	return SamplePercentiles(values, []float64{p})[0]
+-}
+-
+-// SamplePercentiles returns a slice of arbitrary percentiles of the slice of
+-// int64.
+-func SamplePercentiles(values int64Slice, ps []float64) []float64 {
+-	scores := make([]float64, len(ps))
+-	size := len(values)
+-	if size > 0 {
+-		sort.Sort(values)
+-		for i, p := range ps {
+-			pos := p * float64(size+1)
+-			if pos < 1.0 {
+-				scores[i] = float64(values[0])
+-			} else if pos >= float64(size) {
+-				scores[i] = float64(values[size-1])
+-			} else {
+-				lower := float64(values[int(pos)-1])
+-				upper := float64(values[int(pos)])
+-				scores[i] = lower + (pos-math.Floor(pos))*(upper-lower)
+-			}
+-		}
+-	}
+-	return scores
+-}
+-
+-// SampleSnapshot is a read-only copy of another Sample.
+-type SampleSnapshot struct {
+-	count  int64
+-	values []int64
+-}
+-
+-// Clear panics.
+-func (*SampleSnapshot) Clear() {
+-	panic("Clear called on a SampleSnapshot")
+-}
+-
+-// Count returns the count of inputs at the time the snapshot was taken.
+-func (s *SampleSnapshot) Count() int64 { return s.count }
+-
+-// Max returns the maximal value at the time the snapshot was taken.
+-func (s *SampleSnapshot) Max() int64 { return SampleMax(s.values) }
+-
+-// Mean returns the mean value at the time the snapshot was taken.
+-func (s *SampleSnapshot) Mean() float64 { return SampleMean(s.values) }
+-
+-// Min returns the minimal value at the time the snapshot was taken.
+-func (s *SampleSnapshot) Min() int64 { return SampleMin(s.values) }
+-
+-// Percentile returns an arbitrary percentile of values at the time the
+-// snapshot was taken.
+-func (s *SampleSnapshot) Percentile(p float64) float64 {
+-	return SamplePercentile(s.values, p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of values at the time
+-// the snapshot was taken.
+-func (s *SampleSnapshot) Percentiles(ps []float64) []float64 {
+-	return SamplePercentiles(s.values, ps)
+-}
+-
+-// Size returns the size of the sample at the time the snapshot was taken.
+-func (s *SampleSnapshot) Size() int { return len(s.values) }
+-
+-// Snapshot returns the snapshot.
+-func (s *SampleSnapshot) Snapshot() Sample { return s }
+-
+-// StdDev returns the standard deviation of values at the time the snapshot was
+-// taken.
+-func (s *SampleSnapshot) StdDev() float64 { return SampleStdDev(s.values) }
+-
+-// Sum returns the sum of values at the time the snapshot was taken.
+-func (s *SampleSnapshot) Sum() int64 { return SampleSum(s.values) }
+-
+-// Update panics.
+-func (*SampleSnapshot) Update(int64) {
+-	panic("Update called on a SampleSnapshot")
+-}
+-
+-// Values returns a copy of the values in the sample.
+-func (s *SampleSnapshot) Values() []int64 {
+-	values := make([]int64, len(s.values))
+-	copy(values, s.values)
+-	return values
+-}
+-
+-// Variance returns the variance of values at the time the snapshot was taken.
+-func (s *SampleSnapshot) Variance() float64 { return SampleVariance(s.values) }
+-
+-// SampleStdDev returns the standard deviation of the slice of int64.
+-func SampleStdDev(values []int64) float64 {
+-	return math.Sqrt(SampleVariance(values))
+-}
+-
+-// SampleSum returns the sum of the slice of int64.
+-func SampleSum(values []int64) int64 {
+-	var sum int64
+-	for _, v := range values {
+-		sum += v
+-	}
+-	return sum
+-}
+-
+-// SampleVariance returns the variance of the slice of int64.
+-func SampleVariance(values []int64) float64 {
+-	if 0 == len(values) {
+-		return 0.0
+-	}
+-	m := SampleMean(values)
+-	var sum float64
+-	for _, v := range values {
+-		d := float64(v) - m
+-		sum += d * d
+-	}
+-	return sum / float64(len(values))
+-}
+-
+-// A uniform sample using Vitter's Algorithm R.
+-//
+-// <http://www.cs.umd.edu/~samir/498/vitter.pdf>
+-type UniformSample struct {
+-	count         int64
+-	mutex         sync.Mutex
+-	reservoirSize int
+-	values        []int64
+-}
+-
+-// NewUniformSample constructs a new uniform sample with the given reservoir
+-// size.
+-func NewUniformSample(reservoirSize int) Sample {
+-	if UseNilMetrics {
+-		return NilSample{}
+-	}
+-	return &UniformSample{reservoirSize: reservoirSize}
+-}
+-
+-// Clear clears all samples.
+-func (s *UniformSample) Clear() {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	s.count = 0
+-	s.values = make([]int64, 0, s.reservoirSize)
+-}
+-
+-// Count returns the number of samples recorded, which may exceed the
+-// reservoir size.
+-func (s *UniformSample) Count() int64 {
+-	return atomic.LoadInt64(&s.count)
+-}
+-
+-// Max returns the maximum value in the sample, which may not be the maximum
+-// value ever to be part of the sample.
+-func (s *UniformSample) Max() int64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SampleMax(s.values)
+-}
+-
+-// Mean returns the mean of the values in the sample.
+-func (s *UniformSample) Mean() float64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SampleMean(s.values)
+-}
+-
+-// Min returns the minimum value in the sample, which may not be the minimum
+-// value ever to be part of the sample.
+-func (s *UniformSample) Min() int64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SampleMin(s.values)
+-}
+-
+-// Percentile returns an arbitrary percentile of values in the sample.
+-func (s *UniformSample) Percentile(p float64) float64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SamplePercentile(s.values, p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of values in the
+-// sample.
+-func (s *UniformSample) Percentiles(ps []float64) []float64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SamplePercentiles(s.values, ps)
+-}
+-
+-// Size returns the size of the sample, which is at most the reservoir size.
+-func (s *UniformSample) Size() int {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return len(s.values)
+-}
+-
+-// Snapshot returns a read-only copy of the sample.
+-func (s *UniformSample) Snapshot() Sample {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	values := make([]int64, len(s.values))
+-	copy(values, s.values)
+-	return &SampleSnapshot{
+-		count:  s.count,
+-		values: values,
+-	}
+-}
+-
+-// StdDev returns the standard deviation of the values in the sample.
+-func (s *UniformSample) StdDev() float64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SampleStdDev(s.values)
+-}
+-
+-// Sum returns the sum of the values in the sample.
+-func (s *UniformSample) Sum() int64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SampleSum(s.values)
+-}
+-
+-// Update samples a new value.
+-func (s *UniformSample) Update(v int64) {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	s.count++
+-	if len(s.values) < s.reservoirSize {
+-		s.values = append(s.values, v)
+-	} else {
+-		s.values[rand.Intn(s.reservoirSize)] = v
+-	}
+-}
+-
+-// Values returns a copy of the values in the sample.
+-func (s *UniformSample) Values() []int64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	values := make([]int64, len(s.values))
+-	copy(values, s.values)
+-	return values
+-}
+-
+-// Variance returns the variance of the values in the sample.
+-func (s *UniformSample) Variance() float64 {
+-	s.mutex.Lock()
+-	defer s.mutex.Unlock()
+-	return SampleVariance(s.values)
+-}
+-
+-// expDecaySample represents an individual sample in a heap.
+-type expDecaySample struct {
+-	k float64
+-	v int64
+-}
+-
+-// expDecaySampleHeap is a min-heap of expDecaySamples.
+-type expDecaySampleHeap []expDecaySample
+-
+-func (q expDecaySampleHeap) Len() int {
+-	return len(q)
+-}
+-
+-func (q expDecaySampleHeap) Less(i, j int) bool {
+-	return q[i].k < q[j].k
+-}
+-
+-func (q *expDecaySampleHeap) Pop() interface{} {
+-	q_ := *q
+-	n := len(q_)
+-	i := q_[n-1]
+-	q_ = q_[0 : n-1]
+-	*q = q_
+-	return i
+-}
+-
+-func (q *expDecaySampleHeap) Push(x interface{}) {
+-	q_ := *q
+-	n := len(q_)
+-	q_ = q_[0 : n+1]
+-	q_[n] = x.(expDecaySample)
+-	*q = q_
+-}
+-
+-func (q expDecaySampleHeap) Swap(i, j int) {
+-	q[i], q[j] = q[j], q[i]
+-}
+-
+-type int64Slice []int64
+-
+-func (p int64Slice) Len() int           { return len(p) }
+-func (p int64Slice) Less(i, j int) bool { return p[i] < p[j] }
+-func (p int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+diff --git a/third_party/github.com/rcrowley/go-metrics/sample_test.go b/third_party/github.com/rcrowley/go-metrics/sample_test.go
+deleted file mode 100644
+index 50db8e1..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/sample_test.go
++++ /dev/null
+@@ -1,321 +0,0 @@
+-package metrics
+-
+-import (
+-	"math/rand"
+-	"runtime"
+-	"testing"
+-	"time"
+-)
+-
+-// Benchmark{Compute,Copy}{1000,1000000} demonstrate that, even for relatively
+-// expensive computations like Variance, the cost of copying the Sample, as
+-// approximated by a make and copy, is much greater than the cost of the
+-// computation for small samples and only slightly less for large samples.
+-func BenchmarkCompute1000(b *testing.B) {
+-	s := make([]int64, 1000)
+-	for i := 0; i < len(s); i++ {
+-		s[i] = int64(i)
+-	}
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		SampleVariance(s)
+-	}
+-}
+-func BenchmarkCompute1000000(b *testing.B) {
+-	s := make([]int64, 1000000)
+-	for i := 0; i < len(s); i++ {
+-		s[i] = int64(i)
+-	}
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		SampleVariance(s)
+-	}
+-}
+-func BenchmarkCopy1000(b *testing.B) {
+-	s := make([]int64, 1000)
+-	for i := 0; i < len(s); i++ {
+-		s[i] = int64(i)
+-	}
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		sCopy := make([]int64, len(s))
+-		copy(sCopy, s)
+-	}
+-}
+-func BenchmarkCopy1000000(b *testing.B) {
+-	s := make([]int64, 1000000)
+-	for i := 0; i < len(s); i++ {
+-		s[i] = int64(i)
+-	}
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		sCopy := make([]int64, len(s))
+-		copy(sCopy, s)
+-	}
+-}
+-
+-func BenchmarkExpDecaySample257(b *testing.B) {
+-	benchmarkSample(b, NewExpDecaySample(257, 0.015))
+-}
+-
+-func BenchmarkExpDecaySample514(b *testing.B) {
+-	benchmarkSample(b, NewExpDecaySample(514, 0.015))
+-}
+-
+-func BenchmarkExpDecaySample1028(b *testing.B) {
+-	benchmarkSample(b, NewExpDecaySample(1028, 0.015))
+-}
+-
+-func BenchmarkUniformSample257(b *testing.B) {
+-	benchmarkSample(b, NewUniformSample(257))
+-}
+-
+-func BenchmarkUniformSample514(b *testing.B) {
+-	benchmarkSample(b, NewUniformSample(514))
+-}
+-
+-func BenchmarkUniformSample1028(b *testing.B) {
+-	benchmarkSample(b, NewUniformSample(1028))
+-}
+-
+-func TestExpDecaySample10(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewExpDecaySample(100, 0.99)
+-	for i := 0; i < 10; i++ {
+-		s.Update(int64(i))
+-	}
+-	if size := s.Count(); 10 != size {
+-		t.Errorf("s.Count(): 10 != %v\n", size)
+-	}
+-	if size := s.Size(); 10 != size {
+-		t.Errorf("s.Size(): 10 != %v\n", size)
+-	}
+-	if l := len(s.Values()); 10 != l {
+-		t.Errorf("len(s.Values()): 10 != %v\n", l)
+-	}
+-	for _, v := range s.Values() {
+-		if v > 10 || v < 0 {
+-			t.Errorf("out of range [0, 10): %v\n", v)
+-		}
+-	}
+-}
+-
+-func TestExpDecaySample100(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewExpDecaySample(1000, 0.01)
+-	for i := 0; i < 100; i++ {
+-		s.Update(int64(i))
+-	}
+-	if size := s.Count(); 100 != size {
+-		t.Errorf("s.Count(): 100 != %v\n", size)
+-	}
+-	if size := s.Size(); 100 != size {
+-		t.Errorf("s.Size(): 100 != %v\n", size)
+-	}
+-	if l := len(s.Values()); 100 != l {
+-		t.Errorf("len(s.Values()): 100 != %v\n", l)
+-	}
+-	for _, v := range s.Values() {
+-		if v > 100 || v < 0 {
+-			t.Errorf("out of range [0, 100): %v\n", v)
+-		}
+-	}
+-}
+-
+-func TestExpDecaySample1000(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewExpDecaySample(100, 0.99)
+-	for i := 0; i < 1000; i++ {
+-		s.Update(int64(i))
+-	}
+-	if size := s.Count(); 1000 != size {
+-		t.Errorf("s.Count(): 1000 != %v\n", size)
+-	}
+-	if size := s.Size(); 100 != size {
+-		t.Errorf("s.Size(): 100 != %v\n", size)
+-	}
+-	if l := len(s.Values()); 100 != l {
+-		t.Errorf("len(s.Values()): 100 != %v\n", l)
+-	}
+-	for _, v := range s.Values() {
+-		if v > 1000 || v < 0 {
+-			t.Errorf("out of range [0, 1000): %v\n", v)
+-		}
+-	}
+-}
+-
+-// This test makes sure that the sample's priority is not amplified by using
+-// nanosecond duration since start rather than second duration since start.
+-// The priority becomes +Inf quickly after starting if this is done,
+-// effectively freezing the set of samples until a rescale step happens.
+-func TestExpDecaySampleNanosecondRegression(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewExpDecaySample(100, 0.99)
+-	for i := 0; i < 100; i++ {
+-		s.Update(10)
+-	}
+-	time.Sleep(1 * time.Millisecond)
+-	for i := 0; i < 100; i++ {
+-		s.Update(20)
+-	}
+-	v := s.Values()
+-	avg := float64(0)
+-	for i := 0; i < len(v); i++ {
+-		avg += float64(v[i])
+-	}
+-	avg /= float64(len(v))
+-	if avg > 16 || avg < 14 {
+-		t.Errorf("out of range [14, 16]: %v\n", avg)
+-	}
+-}
+-
+-func TestExpDecaySampleSnapshot(t *testing.T) {
+-	now := time.Now()
+-	rand.Seed(1)
+-	s := NewExpDecaySample(100, 0.99)
+-	for i := 1; i <= 10000; i++ {
+-		s.(*ExpDecaySample).update(now.Add(time.Duration(i)), int64(i))
+-	}
+-	snapshot := s.Snapshot()
+-	s.Update(1)
+-	testExpDecaySampleStatistics(t, snapshot)
+-}
+-
+-func TestExpDecaySampleStatistics(t *testing.T) {
+-	now := time.Now()
+-	rand.Seed(1)
+-	s := NewExpDecaySample(100, 0.99)
+-	for i := 1; i <= 10000; i++ {
+-		s.(*ExpDecaySample).update(now.Add(time.Duration(i)), int64(i))
+-	}
+-	testExpDecaySampleStatistics(t, s)
+-}
+-
+-func TestUniformSample(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewUniformSample(100)
+-	for i := 0; i < 1000; i++ {
+-		s.Update(int64(i))
+-	}
+-	if size := s.Count(); 1000 != size {
+-		t.Errorf("s.Count(): 1000 != %v\n", size)
+-	}
+-	if size := s.Size(); 100 != size {
+-		t.Errorf("s.Size(): 100 != %v\n", size)
+-	}
+-	if l := len(s.Values()); 100 != l {
+-		t.Errorf("len(s.Values()): 100 != %v\n", l)
+-	}
+-	for _, v := range s.Values() {
+-		if v > 1000 || v < 0 {
+-			t.Errorf("out of range [0, 100): %v\n", v)
+-		}
+-	}
+-}
+-
+-func TestUniformSampleIncludesTail(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewUniformSample(100)
+-	max := 100
+-	for i := 0; i < max; i++ {
+-		s.Update(int64(i))
+-	}
+-	v := s.Values()
+-	sum := 0
+-	exp := (max - 1) * max / 2
+-	for i := 0; i < len(v); i++ {
+-		sum += int(v[i])
+-	}
+-	if exp != sum {
+-		t.Errorf("sum: %v != %v\n", exp, sum)
+-	}
+-}
+-
+-func TestUniformSampleSnapshot(t *testing.T) {
+-	s := NewUniformSample(100)
+-	for i := 1; i <= 10000; i++ {
+-		s.Update(int64(i))
+-	}
+-	snapshot := s.Snapshot()
+-	s.Update(1)
+-	testUniformSampleStatistics(t, snapshot)
+-}
+-
+-func TestUniformSampleStatistics(t *testing.T) {
+-	rand.Seed(1)
+-	s := NewUniformSample(100)
+-	for i := 1; i <= 10000; i++ {
+-		s.Update(int64(i))
+-	}
+-	testUniformSampleStatistics(t, s)
+-}
+-
+-func benchmarkSample(b *testing.B, s Sample) {
+-	var memStats runtime.MemStats
+-	runtime.ReadMemStats(&memStats)
+-	pauseTotalNs := memStats.PauseTotalNs
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		s.Update(1)
+-	}
+-	b.StopTimer()
+-	runtime.GC()
+-	runtime.ReadMemStats(&memStats)
+-	b.Logf("GC cost: %d ns/op", int(memStats.PauseTotalNs-pauseTotalNs)/b.N)
+-}
+-
+-func testExpDecaySampleStatistics(t *testing.T, s Sample) {
+-	if count := s.Count(); 10000 != count {
+-		t.Errorf("s.Count(): 10000 != %v\n", count)
+-	}
+-	if min := s.Min(); 107 != min {
+-		t.Errorf("s.Min(): 107 != %v\n", min)
+-	}
+-	if max := s.Max(); 10000 != max {
+-		t.Errorf("s.Max(): 10000 != %v\n", max)
+-	}
+-	if mean := s.Mean(); 4965.98 != mean {
+-		t.Errorf("s.Mean(): 4965.98 != %v\n", mean)
+-	}
+-	if stdDev := s.StdDev(); 2959.825156930727 != stdDev {
+-		t.Errorf("s.StdDev(): 2959.825156930727 != %v\n", stdDev)
+-	}
+-	ps := s.Percentiles([]float64{0.5, 0.75, 0.99})
+-	if 4615 != ps[0] {
+-		t.Errorf("median: 4615 != %v\n", ps[0])
+-	}
+-	if 7672 != ps[1] {
+-		t.Errorf("75th percentile: 7672 != %v\n", ps[1])
+-	}
+-	if 9998.99 != ps[2] {
+-		t.Errorf("99th percentile: 9998.99 != %v\n", ps[2])
+-	}
+-}
+-
+-func testUniformSampleStatistics(t *testing.T, s Sample) {
+-	if count := s.Count(); 10000 != count {
+-		t.Errorf("s.Count(): 10000 != %v\n", count)
+-	}
+-	if min := s.Min(); 9412 != min {
+-		t.Errorf("s.Min(): 9412 != %v\n", min)
+-	}
+-	if max := s.Max(); 10000 != max {
+-		t.Errorf("s.Max(): 10000 != %v\n", max)
+-	}
+-	if mean := s.Mean(); 9902.26 != mean {
+-		t.Errorf("s.Mean(): 9902.26 != %v\n", mean)
+-	}
+-	if stdDev := s.StdDev(); 101.8667384380201 != stdDev {
+-		t.Errorf("s.StdDev(): 101.8667384380201 != %v\n", stdDev)
+-	}
+-	ps := s.Percentiles([]float64{0.5, 0.75, 0.99})
+-	if 9930.5 != ps[0] {
+-		t.Errorf("median: 9930.5 != %v\n", ps[0])
+-	}
+-	if 9973.75 != ps[1] {
+-		t.Errorf("75th percentile: 9973.75 != %v\n", ps[1])
+-	}
+-	if 9999.99 != ps[2] {
+-		t.Errorf("99th percentile: 9999.99 != %v\n", ps[2])
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/stathat/stathat.go b/third_party/github.com/rcrowley/go-metrics/stathat/stathat.go
+deleted file mode 100644
+index 1f96837..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/stathat/stathat.go
++++ /dev/null
+@@ -1,67 +0,0 @@
+-// Metrics output to StatHat.
+-package stathat
+-
+-import (
+-	"github.com/coreos/etcd/third_party/github.com/rcrowley/go-metrics"
+-	"github.com/stathat/go"
+-	"log"
+-	"time"
+-)
+-
+-func Stathat(r metrics.Registry, d time.Duration, userkey string) {
+-	for {
+-		if err := sh(r, userkey); nil != err {
+-			log.Println(err)
+-		}
+-		time.Sleep(d)
+-	}
+-}
+-
+-func sh(r metrics.Registry, userkey string) error {
+-	r.Each(func(name string, i interface{}) {
+-		switch metric := i.(type) {
+-		case metrics.Counter:
+-			stathat.PostEZCount(name, userkey, int(metric.Count()))
+-		case metrics.Gauge:
+-			stathat.PostEZValue(name, userkey, float64(metric.Value()))
+-		case metrics.Histogram:
+-			h := metric.Snapshot()
+-			ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			stathat.PostEZCount(name+".count", userkey, int(h.Count()))
+-			stathat.PostEZValue(name+".min", userkey, float64(h.Min()))
+-			stathat.PostEZValue(name+".max", userkey, float64(h.Max()))
+-			stathat.PostEZValue(name+".mean", userkey, float64(h.Mean()))
+-			stathat.PostEZValue(name+".std-dev", userkey, float64(h.StdDev()))
+-			stathat.PostEZValue(name+".50-percentile", userkey, float64(ps[0]))
+-			stathat.PostEZValue(name+".75-percentile", userkey, float64(ps[1]))
+-			stathat.PostEZValue(name+".95-percentile", userkey, float64(ps[2]))
+-			stathat.PostEZValue(name+".99-percentile", userkey, float64(ps[3]))
+-			stathat.PostEZValue(name+".999-percentile", userkey, float64(ps[4]))
+-		case metrics.Meter:
+-			m := metric.Snapshot()
+-			stathat.PostEZCount(name+".count", userkey, int(m.Count()))
+-			stathat.PostEZValue(name+".one-minute", userkey, float64(m.Rate1()))
+-			stathat.PostEZValue(name+".five-minute", userkey, float64(m.Rate5()))
+-			stathat.PostEZValue(name+".fifteen-minute", userkey, float64(m.Rate15()))
+-			stathat.PostEZValue(name+".mean", userkey, float64(m.RateMean()))
+-		case metrics.Timer:
+-			t := metric.Snapshot()
+-			ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			stathat.PostEZCount(name+".count", userkey, int(t.Count()))
+-			stathat.PostEZValue(name+".min", userkey, float64(t.Min()))
+-			stathat.PostEZValue(name+".max", userkey, float64(t.Max()))
+-			stathat.PostEZValue(name+".mean", userkey, float64(t.Mean()))
+-			stathat.PostEZValue(name+".std-dev", userkey, float64(t.StdDev()))
+-			stathat.PostEZValue(name+".50-percentile", userkey, float64(ps[0]))
+-			stathat.PostEZValue(name+".75-percentile", userkey, float64(ps[1]))
+-			stathat.PostEZValue(name+".95-percentile", userkey, float64(ps[2]))
+-			stathat.PostEZValue(name+".99-percentile", userkey, float64(ps[3]))
+-			stathat.PostEZValue(name+".999-percentile", userkey, float64(ps[4]))
+-			stathat.PostEZValue(name+".one-minute", userkey, float64(t.Rate1()))
+-			stathat.PostEZValue(name+".five-minute", userkey, float64(t.Rate5()))
+-			stathat.PostEZValue(name+".fifteen-minute", userkey, float64(t.Rate15()))
+-			stathat.PostEZValue(name+".mean-rate", userkey, float64(t.RateMean()))
+-		}
+-	})
+-	return nil
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/syslog.go b/third_party/github.com/rcrowley/go-metrics/syslog.go
+deleted file mode 100644
+index ff07bb4..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/syslog.go
++++ /dev/null
+@@ -1,77 +0,0 @@
+-// +build !windows
+-
+-package metrics
+-
+-import (
+-	"fmt"
+-	"log/syslog"
+-	"time"
+-)
+-
+-// Output each metric in the given registry to syslog periodically using
+-// the given syslogger.
+-func Syslog(r Registry, d time.Duration, w *syslog.Writer) {
+-	for {
+-		r.Each(func(name string, i interface{}) {
+-			switch metric := i.(type) {
+-			case Counter:
+-				w.Info(fmt.Sprintf("counter %s: count: %d", name, metric.Count()))
+-			case Gauge:
+-				w.Info(fmt.Sprintf("gauge %s: value: %d", name, metric.Value()))
+-			case Healthcheck:
+-				metric.Check()
+-				w.Info(fmt.Sprintf("healthcheck %s: error: %v", name, metric.Error()))
+-			case Histogram:
+-				h := metric.Snapshot()
+-				ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-				w.Info(fmt.Sprintf(
+-					"histogram %s: count: %d min: %d max: %d mean: %.2f stddev: %.2f median: %.2f 75%%: %.2f 95%%: %.2f 99%%: %.2f 99.9%%: %.2f",
+-					name,
+-					h.Count(),
+-					h.Min(),
+-					h.Max(),
+-					h.Mean(),
+-					h.StdDev(),
+-					ps[0],
+-					ps[1],
+-					ps[2],
+-					ps[3],
+-					ps[4],
+-				))
+-			case Meter:
+-				m := metric.Snapshot()
+-				w.Info(fmt.Sprintf(
+-					"meter %s: count: %d 1-min: %.2f 5-min: %.2f 15-min: %.2f mean: %.2f",
+-					name,
+-					m.Count(),
+-					m.Rate1(),
+-					m.Rate5(),
+-					m.Rate15(),
+-					m.RateMean(),
+-				))
+-			case Timer:
+-				t := metric.Snapshot()
+-				ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-				w.Info(fmt.Sprintf(
+-					"timer %s: count: %d min: %d max: %d mean: %.2f stddev: %.2f median: %.2f 75%%: %.2f 95%%: %.2f 99%%: %.2f 99.9%%: %.2f 1-min: %.2f 5-min: %.2f 15-min: %.2f mean-rate: %.2f",
+-					name,
+-					t.Count(),
+-					t.Min(),
+-					t.Max(),
+-					t.Mean(),
+-					t.StdDev(),
+-					ps[0],
+-					ps[1],
+-					ps[2],
+-					ps[3],
+-					ps[4],
+-					t.Rate1(),
+-					t.Rate5(),
+-					t.Rate15(),
+-					t.RateMean(),
+-				))
+-			}
+-		})
+-		time.Sleep(d)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/timer.go b/third_party/github.com/rcrowley/go-metrics/timer.go
+deleted file mode 100644
+index 3b65236..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/timer.go
++++ /dev/null
+@@ -1,299 +0,0 @@
+-package metrics
+-
+-import (
+-	"sync"
+-	"time"
+-)
+-
+-// Timers capture the duration and rate of events.
+-type Timer interface {
+-	Count() int64
+-	Max() int64
+-	Mean() float64
+-	Min() int64
+-	Percentile(float64) float64
+-	Percentiles([]float64) []float64
+-	Rate1() float64
+-	Rate5() float64
+-	Rate15() float64
+-	RateMean() float64
+-	Snapshot() Timer
+-	StdDev() float64
+-	Time(func())
+-	Update(time.Duration)
+-	UpdateSince(time.Time)
+-	Variance() float64
+-}
+-
+-// GetOrRegisterTimer returns an existing Timer or constructs and registers a
+-// new StandardTimer.
+-func GetOrRegisterTimer(name string, r Registry) Timer {
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	return r.GetOrRegister(name, NewTimer()).(Timer)
+-}
+-
+-// NewCustomTimer constructs a new StandardTimer from a Histogram and a Meter.
+-func NewCustomTimer(h Histogram, m Meter) Timer {
+-	if UseNilMetrics {
+-		return NilTimer{}
+-	}
+-	return &StandardTimer{
+-		histogram: h,
+-		meter:     m,
+-	}
+-}
+-
+-// NewRegisteredTimer constructs and registers a new StandardTimer.
+-func NewRegisteredTimer(name string, r Registry) Timer {
+-	c := NewTimer()
+-	if nil == r {
+-		r = DefaultRegistry
+-	}
+-	r.Register(name, c)
+-	return c
+-}
+-
+-// NewTimer constructs a new StandardTimer using an exponentially-decaying
+-// sample with the same reservoir size and alpha as UNIX load averages.
+-func NewTimer() Timer {
+-	if UseNilMetrics {
+-		return NilTimer{}
+-	}
+-	return &StandardTimer{
+-		histogram: NewHistogram(NewExpDecaySample(1028, 0.015)),
+-		meter:     NewMeter(),
+-	}
+-}
+-
+-// NilTimer is a no-op Timer.
+-type NilTimer struct {
+-	h Histogram
+-	m Meter
+-}
+-
+-// Count is a no-op.
+-func (NilTimer) Count() int64 { return 0 }
+-
+-// Max is a no-op.
+-func (NilTimer) Max() int64 { return 0 }
+-
+-// Mean is a no-op.
+-func (NilTimer) Mean() float64 { return 0.0 }
+-
+-// Min is a no-op.
+-func (NilTimer) Min() int64 { return 0 }
+-
+-// Percentile is a no-op.
+-func (NilTimer) Percentile(p float64) float64 { return 0.0 }
+-
+-// Percentiles is a no-op.
+-func (NilTimer) Percentiles(ps []float64) []float64 {
+-	return make([]float64, len(ps))
+-}
+-
+-// Rate1 is a no-op.
+-func (NilTimer) Rate1() float64 { return 0.0 }
+-
+-// Rate5 is a no-op.
+-func (NilTimer) Rate5() float64 { return 0.0 }
+-
+-// Rate15 is a no-op.
+-func (NilTimer) Rate15() float64 { return 0.0 }
+-
+-// RateMean is a no-op.
+-func (NilTimer) RateMean() float64 { return 0.0 }
+-
+-// Snapshot is a no-op.
+-func (NilTimer) Snapshot() Timer { return NilTimer{} }
+-
+-// StdDev is a no-op.
+-func (NilTimer) StdDev() float64 { return 0.0 }
+-
+-// Time is a no-op.
+-func (NilTimer) Time(func()) {}
+-
+-// Update is a no-op.
+-func (NilTimer) Update(time.Duration) {}
+-
+-// UpdateSince is a no-op.
+-func (NilTimer) UpdateSince(time.Time) {}
+-
+-// Variance is a no-op.
+-func (NilTimer) Variance() float64 { return 0.0 }
+-
+-// StandardTimer is the standard implementation of a Timer and uses a Histogram
+-// and Meter.
+-type StandardTimer struct {
+-	histogram Histogram
+-	meter     Meter
+-	mutex     sync.Mutex
+-}
+-
+-// Count returns the number of events recorded.
+-func (t *StandardTimer) Count() int64 {
+-	return t.histogram.Count()
+-}
+-
+-// Max returns the maximum value in the sample.
+-func (t *StandardTimer) Max() int64 {
+-	return t.histogram.Max()
+-}
+-
+-// Mean returns the mean of the values in the sample.
+-func (t *StandardTimer) Mean() float64 {
+-	return t.histogram.Mean()
+-}
+-
+-// Min returns the minimum value in the sample.
+-func (t *StandardTimer) Min() int64 {
+-	return t.histogram.Min()
+-}
+-
+-// Percentile returns an arbitrary percentile of the values in the sample.
+-func (t *StandardTimer) Percentile(p float64) float64 {
+-	return t.histogram.Percentile(p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of the values in the
+-// sample.
+-func (t *StandardTimer) Percentiles(ps []float64) []float64 {
+-	return t.histogram.Percentiles(ps)
+-}
+-
+-// Rate1 returns the one-minute moving average rate of events per second.
+-func (t *StandardTimer) Rate1() float64 {
+-	return t.meter.Rate1()
+-}
+-
+-// Rate5 returns the five-minute moving average rate of events per second.
+-func (t *StandardTimer) Rate5() float64 {
+-	return t.meter.Rate5()
+-}
+-
+-// Rate15 returns the fifteen-minute moving average rate of events per second.
+-func (t *StandardTimer) Rate15() float64 {
+-	return t.meter.Rate15()
+-}
+-
+-// RateMean returns the meter's mean rate of events per second.
+-func (t *StandardTimer) RateMean() float64 {
+-	return t.meter.RateMean()
+-}
+-
+-// Snapshot returns a read-only copy of the timer.
+-func (t *StandardTimer) Snapshot() Timer {
+-	t.mutex.Lock()
+-	defer t.mutex.Unlock()
+-	return &TimerSnapshot{
+-		histogram: t.histogram.Snapshot().(*HistogramSnapshot),
+-		meter:     t.meter.Snapshot().(*MeterSnapshot),
+-	}
+-}
+-
+-// StdDev returns the standard deviation of the values in the sample.
+-func (t *StandardTimer) StdDev() float64 {
+-	return t.histogram.StdDev()
+-}
+-
+-// Record the duration of the execution of the given function.
+-func (t *StandardTimer) Time(f func()) {
+-	ts := time.Now()
+-	f()
+-	t.Update(time.Since(ts))
+-}
+-
+-// Record the duration of an event.
+-func (t *StandardTimer) Update(d time.Duration) {
+-	t.mutex.Lock()
+-	defer t.mutex.Unlock()
+-	t.histogram.Update(int64(d))
+-	t.meter.Mark(1)
+-}
+-
+-// Record the duration of an event that started at a time and ends now.
+-func (t *StandardTimer) UpdateSince(ts time.Time) {
+-	t.mutex.Lock()
+-	defer t.mutex.Unlock()
+-	t.histogram.Update(int64(time.Since(ts)))
+-	t.meter.Mark(1)
+-}
+-
+-// Variance returns the variance of the values in the sample.
+-func (t *StandardTimer) Variance() float64 {
+-	return t.histogram.Variance()
+-}
+-
+-// TimerSnapshot is a read-only copy of another Timer.
+-type TimerSnapshot struct {
+-	histogram *HistogramSnapshot
+-	meter     *MeterSnapshot
+-}
+-
+-// Count returns the number of events recorded at the time the snapshot was
+-// taken.
+-func (t *TimerSnapshot) Count() int64 { return t.histogram.Count() }
+-
+-// Max returns the maximum value at the time the snapshot was taken.
+-func (t *TimerSnapshot) Max() int64 { return t.histogram.Max() }
+-
+-// Mean returns the mean value at the time the snapshot was taken.
+-func (t *TimerSnapshot) Mean() float64 { return t.histogram.Mean() }
+-
+-// Min returns the minimum value at the time the snapshot was taken.
+-func (t *TimerSnapshot) Min() int64 { return t.histogram.Min() }
+-
+-// Percentile returns an arbitrary percentile of sampled values at the time the
+-// snapshot was taken.
+-func (t *TimerSnapshot) Percentile(p float64) float64 {
+-	return t.histogram.Percentile(p)
+-}
+-
+-// Percentiles returns a slice of arbitrary percentiles of sampled values at
+-// the time the snapshot was taken.
+-func (t *TimerSnapshot) Percentiles(ps []float64) []float64 {
+-	return t.histogram.Percentiles(ps)
+-}
+-
+-// Rate1 returns the one-minute moving average rate of events per second at the
+-// time the snapshot was taken.
+-func (t *TimerSnapshot) Rate1() float64 { return t.meter.Rate1() }
+-
+-// Rate5 returns the five-minute moving average rate of events per second at
+-// the time the snapshot was taken.
+-func (t *TimerSnapshot) Rate5() float64 { return t.meter.Rate5() }
+-
+-// Rate15 returns the fifteen-minute moving average rate of events per second
+-// at the time the snapshot was taken.
+-func (t *TimerSnapshot) Rate15() float64 { return t.meter.Rate15() }
+-
+-// RateMean returns the meter's mean rate of events per second at the time the
+-// snapshot was taken.
+-func (t *TimerSnapshot) RateMean() float64 { return t.meter.RateMean() }
+-
+-// Snapshot returns the snapshot.
+-func (t *TimerSnapshot) Snapshot() Timer { return t }
+-
+-// StdDev returns the standard deviation of the values at the time the snapshot
+-// was taken.
+-func (t *TimerSnapshot) StdDev() float64 { return t.histogram.StdDev() }
+-
+-// Time panics.
+-func (*TimerSnapshot) Time(func()) {
+-	panic("Time called on a TimerSnapshot")
+-}
+-
+-// Update panics.
+-func (*TimerSnapshot) Update(time.Duration) {
+-	panic("Update called on a TimerSnapshot")
+-}
+-
+-// UpdateSince panics.
+-func (*TimerSnapshot) UpdateSince(time.Time) {
+-	panic("UpdateSince called on a TimerSnapshot")
+-}
+-
+-// Variance returns the variance of the values at the time the snapshot was
+-// taken.
+-func (t *TimerSnapshot) Variance() float64 { return t.histogram.Variance() }
+diff --git a/third_party/github.com/rcrowley/go-metrics/timer_test.go b/third_party/github.com/rcrowley/go-metrics/timer_test.go
+deleted file mode 100644
+index 2fa415d..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/timer_test.go
++++ /dev/null
+@@ -1,81 +0,0 @@
+-package metrics
+-
+-import (
+-	"math"
+-	"testing"
+-	"time"
+-)
+-
+-func BenchmarkTimer(b *testing.B) {
+-	tm := NewTimer()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		tm.Update(1)
+-	}
+-}
+-
+-func TestGetOrRegisterTimer(t *testing.T) {
+-	r := NewRegistry()
+-	NewRegisteredTimer("foo", r).Update(47)
+-	if tm := GetOrRegisterTimer("foo", r); 1 != tm.Count() {
+-		t.Fatal(tm)
+-	}
+-}
+-
+-func TestTimerExtremes(t *testing.T) {
+-	tm := NewTimer()
+-	tm.Update(math.MaxInt64)
+-	tm.Update(0)
+-	if stdDev := tm.StdDev(); 4.611686018427388e+18 != stdDev {
+-		t.Errorf("tm.StdDev(): 4.611686018427388e+18 != %v\n", stdDev)
+-	}
+-}
+-
+-func TestTimerFunc(t *testing.T) {
+-	tm := NewTimer()
+-	tm.Time(func() { time.Sleep(50e6) })
+-	if max := tm.Max(); 45e6 > max || max > 55e6 {
+-		t.Errorf("tm.Max(): 45e6 > %v || %v > 55e6\n", max, max)
+-	}
+-}
+-
+-func TestTimerZero(t *testing.T) {
+-	tm := NewTimer()
+-	if count := tm.Count(); 0 != count {
+-		t.Errorf("tm.Count(): 0 != %v\n", count)
+-	}
+-	if min := tm.Min(); 0 != min {
+-		t.Errorf("tm.Min(): 0 != %v\n", min)
+-	}
+-	if max := tm.Max(); 0 != max {
+-		t.Errorf("tm.Max(): 0 != %v\n", max)
+-	}
+-	if mean := tm.Mean(); 0.0 != mean {
+-		t.Errorf("tm.Mean(): 0.0 != %v\n", mean)
+-	}
+-	if stdDev := tm.StdDev(); 0.0 != stdDev {
+-		t.Errorf("tm.StdDev(): 0.0 != %v\n", stdDev)
+-	}
+-	ps := tm.Percentiles([]float64{0.5, 0.75, 0.99})
+-	if 0.0 != ps[0] {
+-		t.Errorf("median: 0.0 != %v\n", ps[0])
+-	}
+-	if 0.0 != ps[1] {
+-		t.Errorf("75th percentile: 0.0 != %v\n", ps[1])
+-	}
+-	if 0.0 != ps[2] {
+-		t.Errorf("99th percentile: 0.0 != %v\n", ps[2])
+-	}
+-	if rate1 := tm.Rate1(); 0.0 != rate1 {
+-		t.Errorf("tm.Rate1(): 0.0 != %v\n", rate1)
+-	}
+-	if rate5 := tm.Rate5(); 0.0 != rate5 {
+-		t.Errorf("tm.Rate5(): 0.0 != %v\n", rate5)
+-	}
+-	if rate15 := tm.Rate15(); 0.0 != rate15 {
+-		t.Errorf("tm.Rate15(): 0.0 != %v\n", rate15)
+-	}
+-	if rateMean := tm.RateMean(); 0.0 != rateMean {
+-		t.Errorf("tm.RateMean(): 0.0 != %v\n", rateMean)
+-	}
+-}
+diff --git a/third_party/github.com/rcrowley/go-metrics/writer.go b/third_party/github.com/rcrowley/go-metrics/writer.go
+deleted file mode 100644
+index 8abd5cc..0000000
+--- a/third_party/github.com/rcrowley/go-metrics/writer.go
++++ /dev/null
+@@ -1,73 +0,0 @@
+-package metrics
+-
+-import (
+-	"fmt"
+-	"io"
+-	"time"
+-)
+-
+-// Output each metric in the given registry periodically using the given
+-// io.Writer.
+-func Write(r Registry, d time.Duration, w io.Writer) {
+-	for {
+-		WriteOnce(r, w)
+-		time.Sleep(d)
+-	}
+-}
+-
+-func WriteOnce(r Registry, w io.Writer) {
+-	r.Each(func(name string, i interface{}) {
+-		switch metric := i.(type) {
+-		case Counter:
+-			fmt.Fprintf(w, "counter %s\n", name)
+-			fmt.Fprintf(w, "  count:       %9d\n", metric.Count())
+-		case Gauge:
+-			fmt.Fprintf(w, "gauge %s\n", name)
+-			fmt.Fprintf(w, "  value:       %9d\n", metric.Value())
+-		case Healthcheck:
+-			metric.Check()
+-			fmt.Fprintf(w, "healthcheck %s\n", name)
+-			fmt.Fprintf(w, "  error:       %v\n", metric.Error())
+-		case Histogram:
+-			h := metric.Snapshot()
+-			ps := h.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			fmt.Fprintf(w, "histogram %s\n", name)
+-			fmt.Fprintf(w, "  count:       %9d\n", h.Count())
+-			fmt.Fprintf(w, "  min:         %9d\n", h.Min())
+-			fmt.Fprintf(w, "  max:         %9d\n", h.Max())
+-			fmt.Fprintf(w, "  mean:        %12.2f\n", h.Mean())
+-			fmt.Fprintf(w, "  stddev:      %12.2f\n", h.StdDev())
+-			fmt.Fprintf(w, "  median:      %12.2f\n", ps[0])
+-			fmt.Fprintf(w, "  75%%:         %12.2f\n", ps[1])
+-			fmt.Fprintf(w, "  95%%:         %12.2f\n", ps[2])
+-			fmt.Fprintf(w, "  99%%:         %12.2f\n", ps[3])
+-			fmt.Fprintf(w, "  99.9%%:       %12.2f\n", ps[4])
+-		case Meter:
+-			m := metric.Snapshot()
+-			fmt.Fprintf(w, "meter %s\n", name)
+-			fmt.Fprintf(w, "  count:       %9d\n", m.Count())
+-			fmt.Fprintf(w, "  1-min rate:  %12.2f\n", m.Rate1())
+-			fmt.Fprintf(w, "  5-min rate:  %12.2f\n", m.Rate5())
+-			fmt.Fprintf(w, "  15-min rate: %12.2f\n", m.Rate15())
+-			fmt.Fprintf(w, "  mean rate:   %12.2f\n", m.RateMean())
+-		case Timer:
+-			t := metric.Snapshot()
+-			ps := t.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
+-			fmt.Fprintf(w, "timer %s\n", name)
+-			fmt.Fprintf(w, "  count:       %9d\n", t.Count())
+-			fmt.Fprintf(w, "  min:         %9d\n", t.Min())
+-			fmt.Fprintf(w, "  max:         %9d\n", t.Max())
+-			fmt.Fprintf(w, "  mean:        %12.2f\n", t.Mean())
+-			fmt.Fprintf(w, "  stddev:      %12.2f\n", t.StdDev())
+-			fmt.Fprintf(w, "  median:      %12.2f\n", ps[0])
+-			fmt.Fprintf(w, "  75%%:         %12.2f\n", ps[1])
+-			fmt.Fprintf(w, "  95%%:         %12.2f\n", ps[2])
+-			fmt.Fprintf(w, "  99%%:         %12.2f\n", ps[3])
+-			fmt.Fprintf(w, "  99.9%%:       %12.2f\n", ps[4])
+-			fmt.Fprintf(w, "  1-min rate:  %12.2f\n", t.Rate1())
+-			fmt.Fprintf(w, "  5-min rate:  %12.2f\n", t.Rate5())
+-			fmt.Fprintf(w, "  15-min rate: %12.2f\n", t.Rate15())
+-			fmt.Fprintf(w, "  mean rate:   %12.2f\n", t.RateMean())
+-		}
+-	})
+-}

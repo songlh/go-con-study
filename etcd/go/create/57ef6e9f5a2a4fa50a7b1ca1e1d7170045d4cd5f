@@ -1,0 +1,190 @@
+commit 57ef6e9f5a2a4fa50a7b1ca1e1d7170045d4cd5f
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Mon Aug 19 10:46:16 2013 -0700
+
+    add killallAndReocery test
+
+diff --git a/command.go b/command.go
+index e2fa002..c9afd07 100644
+--- a/command.go
++++ b/command.go
+@@ -118,17 +118,17 @@ func (c *WatchCommand) Apply(server *raft.Server) (interface{}, error) {
+ // JoinCommand
+ type JoinCommand struct {
+ 	RaftVersion string `json:"raftVersion"`
+-	Name    string `json:"name"`
+-	RaftURL string `json:"raftURL"`
+-	EtcdURL string `json:"etcdURL"`
++	Name        string `json:"name"`
++	RaftURL     string `json:"raftURL"`
++	EtcdURL     string `json:"etcdURL"`
+ }
+ 
+ func newJoinCommand() *JoinCommand {
+ 	return &JoinCommand{
+ 		RaftVersion: r.version,
+-		Name:    r.name,
+-		RaftURL: r.url,
+-		EtcdURL: e.url,
++		Name:        r.name,
++		RaftURL:     r.url,
++		EtcdURL:     e.url,
+ 	}
+ }
+ 
+diff --git a/etcd_test.go b/etcd_test.go
+index 786c6a7..ab6a1e8 100644
+--- a/etcd_test.go
++++ b/etcd_test.go
+@@ -78,7 +78,7 @@ func TestInternalVersionFail(t *testing.T) {
+ 
+ 	procAttr := new(os.ProcAttr)
+ 	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
+-	args := []string{"etcd", "-n=node1", "-f", "-d=/tmp/node1", "-vv", "-C="+fakeURL.Host}
++	args := []string{"etcd", "-n=node1", "-f", "-d=/tmp/node1", "-vv", "-C=" + fakeURL.Host}
+ 
+ 	process, err := os.StartProcess("etcd", args, procAttr)
+ 	if err != nil {
+@@ -102,7 +102,6 @@ func TestInternalVersionFail(t *testing.T) {
+ 	}
+ }
+ 
+-
+ // This test creates a single node and then set a value to it.
+ // Then this test kills the node and restart it and tries to get the value again.
+ func TestSingleNodeRecovery(t *testing.T) {
+@@ -215,8 +214,72 @@ func TestSimpleMultiNodeTls(t *testing.T) {
+ }
+ 
+ // Create a five nodes
++// Kill all the nodes and restart
++func TestMultiNodeKillAllAndRecovery(t *testing.T) {
++	procAttr := new(os.ProcAttr)
++	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
++
++	clusterSize := 5
++	argGroup, etcds, err := test.CreateCluster(clusterSize, procAttr, false)
++
++	if err != nil {
++		t.Fatal("cannot create cluster")
++	}
++
++	c := etcd.NewClient()
++
++	c.SyncCluster()
++
++	time.Sleep(time.Second)
++
++	// send 10 commands
++	for i := 0; i < 10; i++ {
++		// Test Set
++		_, err := c.Set("foo", "bar", 0)
++		if err != nil {
++			panic(err)
++		}
++	}
++
++	time.Sleep(time.Second)
++
++	// kill all
++	test.DestroyCluster(etcds)
++
++	time.Sleep(time.Second)
++
++	stop := make(chan bool)
++	leaderChan := make(chan string, 1)
++	all := make(chan bool, 1)
++
++	time.Sleep(time.Second)
++
++	for i := 0; i < clusterSize; i++ {
++		etcds[i], err = os.StartProcess("etcd", argGroup[i], procAttr)
++	}
++
++	go test.Monitor(clusterSize, 1, leaderChan, all, stop)
++
++	<-all
++	<-leaderChan
++
++	result, err := c.Set("foo", "bar", 0)
++
++	if err != nil {
++		panic(err)
++	}
++
++	if result.Index != 18 {
++		t.Fatalf("recovery failed! [%d/18]", result.Index)
++	}
++
++	// kill all
++	test.DestroyCluster(etcds)
++}
++
++// Create a five nodes
+ // Randomly kill one of the node and keep on sending set command to the cluster
+-func TestMultiNodeRecovery(t *testing.T) {
++func TestMultiNodeKillOne(t *testing.T) {
+ 	procAttr := new(os.ProcAttr)
+ 	procAttr.Files = []*os.File{nil, os.Stdout, os.Stderr}
+ 
+diff --git a/name_url_map.go b/name_url_map.go
+index dd339d8..0e5abb1 100644
+--- a/name_url_map.go
++++ b/name_url_map.go
+@@ -8,8 +8,8 @@ import (
+ // we map node name to url
+ type nodeInfo struct {
+ 	raftVersion string
+-	raftURL string
+-	etcdURL string
++	raftURL     string
++	etcdURL     string
+ }
+ 
+ var namesMap = make(map[string]*nodeInfo)
+@@ -43,8 +43,8 @@ func nameToRaftURL(name string) (string, bool) {
+ func addNameToURL(name string, version string, raftURL string, etcdURL string) {
+ 	namesMap[name] = &nodeInfo{
+ 		raftVersion: raftVersion,
+-		raftURL: raftURL,
+-		etcdURL: etcdURL,
++		raftURL:     raftURL,
++		etcdURL:     etcdURL,
+ 	}
+ }
+ 
+diff --git a/raft_server.go b/raft_server.go
+index 6a778bb..148dafc 100644
+--- a/raft_server.go
++++ b/raft_server.go
+@@ -4,10 +4,10 @@ import (
+ 	"bytes"
+ 	"crypto/tls"
+ 	"encoding/json"
+-	"io/ioutil"
+ 	"fmt"
+ 	etcdErr "github.com/coreos/etcd/error"
+ 	"github.com/coreos/go-raft"
++	"io/ioutil"
+ 	"net/http"
+ 	"net/url"
+ 	"time"
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/client.go b/third_party/github.com/coreos/go-etcd/etcd/client.go
+index 7624c6a..723e0eb 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/client.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/client.go
+@@ -170,7 +170,13 @@ func (c *Client) getHttpPath(s ...string) string {
+ 
+ func (c *Client) updateLeader(httpPath string) {
+ 	u, _ := url.Parse(httpPath)
+-	leader := u.Host
++
++	var leader string
++	if u.Scheme == "" {
++		leader = "http://" + u.Host
++	} else {
++		leader = u.Scheme + "://" + u.Host
++	}
+ 
+ 	logger.Debugf("update.leader[%s,%s]", c.cluster.Leader, leader)
+ 	c.cluster.Leader = leader

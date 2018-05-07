@@ -1,0 +1,223 @@
+commit 43221f0b7af904e213cbc6faeb25338be98f0c35
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Fri Mar 18 16:09:51 2016 -0700
+
+    etcdctlv3: implement endpoint-health command
+    
+    endpoint-health checks endpoint.
+    
+    It can generate 3 outputs:
+    
+    1. cannot connect to the member through endpoint
+    
+    2. connected to the member, but member failed to commit any proposals
+    
+    3. connected to the member, and member committed a proposal
+
+diff --git a/etcdctlv3/command/ep_health_command.go b/etcdctlv3/command/ep_health_command.go
+new file mode 100644
+index 0000000..98f3a87
+--- /dev/null
++++ b/etcdctlv3/command/ep_health_command.go
+@@ -0,0 +1,80 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"fmt"
++	"sync"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
++	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
++	"github.com/coreos/etcd/clientv3"
++)
++
++// NewEpHealthCommand returns the cobra command for "endpoint-health".
++func NewEpHealthCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "endpoint-health",
++		Short: "endpoint-health checks the healthiness of endpoints specified in `--endpoints` flag",
++		Run:   epHealthCommandFunc,
++	}
++	return cmd
++}
++
++// epHealthCommandFunc executes the "endpoint-health" command.
++func epHealthCommandFunc(cmd *cobra.Command, args []string) {
++	endpoints, err := cmd.Flags().GetStringSlice("endpoints")
++	if err != nil {
++		ExitWithError(ExitError, err)
++	}
++
++	cert, key, cacert := keyAndCertFromCmd(cmd)
++	dt := dialTimeoutFromCmd(cmd)
++	cfgs := []*clientv3.Config{}
++	for _, ep := range endpoints {
++		cfg, err := newClientCfg([]string{ep}, dt, cert, key, cacert)
++		if err != nil {
++			ExitWithError(ExitBadArgs, err)
++		}
++		cfgs = append(cfgs, cfg)
++	}
++
++	var wg sync.WaitGroup
++
++	for _, cfg := range cfgs {
++		wg.Add(1)
++		go func(cfg *clientv3.Config) {
++			defer wg.Done()
++			ep := cfg.Endpoints[0]
++			cli, err := clientv3.New(*cfg)
++			if err != nil {
++				fmt.Printf("%s is unhealthy: failed to connect: %v\n", ep, err)
++				return
++			}
++			st := time.Now()
++			// get a random key. As long as we can get the response without an error, the
++			// endpoint is health.
++			_, err = cli.Get(context.TODO(), "health")
++			if err != nil {
++				fmt.Printf("%s is unhealthy: failed to commit proposal: %v\n", ep, err)
++			} else {
++				fmt.Printf("%s is healthy: successfully committed proposal: took = %v\n", ep, time.Since(st))
++			}
++		}(cfg)
++	}
++
++	wg.Wait()
++}
+diff --git a/etcdctlv3/command/global.go b/etcdctlv3/command/global.go
+index cbdb79e..e65ebf6 100644
+--- a/etcdctlv3/command/global.go
++++ b/etcdctlv3/command/global.go
+@@ -44,38 +44,27 @@ func mustClientFromCmd(cmd *cobra.Command) *clientv3.Client {
+ 	if err != nil {
+ 		ExitWithError(ExitError, err)
+ 	}
+-
+ 	dialTimeout := dialTimeoutFromCmd(cmd)
++	cert, key, cacert := keyAndCertFromCmd(cmd)
+ 
+-	var cert, key, cacert string
+-	if cert, err = cmd.Flags().GetString("cert"); err != nil {
+-		ExitWithError(ExitBadArgs, err)
+-	} else if cert == "" && cmd.Flags().Changed("cert") {
+-		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --cert option"))
+-	}
+-
+-	if key, err = cmd.Flags().GetString("key"); err != nil {
+-		ExitWithError(ExitBadArgs, err)
+-	} else if key == "" && cmd.Flags().Changed("key") {
+-		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --key option"))
+-	}
++	return mustClient(endpoints, dialTimeout, cert, key, cacert)
++}
+ 
+-	if cacert, err = cmd.Flags().GetString("cacert"); err != nil {
++func mustClient(endpoints []string, dialTimeout time.Duration, cert, key, cacert string) *clientv3.Client {
++	cfg, err := newClientCfg(endpoints, dialTimeout, cert, key, cacert)
++	if err != nil {
+ 		ExitWithError(ExitBadArgs, err)
+-	} else if cacert == "" && cmd.Flags().Changed("cacert") {
+-		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --cacert option"))
+ 	}
+ 
+-	isHex, _ := cmd.Flags().GetBool("hex")
+-	outputType, _ := cmd.Flags().GetString("write-out")
+-	if display = NewPrinter(outputType, isHex); display == nil {
+-		ExitWithError(ExitBadFeature, errors.New("unsupported output format"))
++	client, err := clientv3.New(*cfg)
++	if err != nil {
++		ExitWithError(ExitBadConnection, err)
+ 	}
+ 
+-	return mustClient(endpoints, dialTimeout, cert, key, cacert)
++	return client
+ }
+ 
+-func mustClient(endpoints []string, dialTimeout time.Duration, cert, key, cacert string) *clientv3.Client {
++func newClientCfg(endpoints []string, dialTimeout time.Duration, cert, key, cacert string) (*clientv3.Config, error) {
+ 	// set tls if any one tls option set
+ 	var cfgtls *transport.TLSInfo
+ 	tls := transport.TLSInfo{}
+@@ -95,24 +84,19 @@ func mustClient(endpoints []string, dialTimeout time.Duration, cert, key, cacert
+ 		cfgtls = &tls
+ 	}
+ 
+-	cfg := clientv3.Config{
++	cfg := &clientv3.Config{
+ 		Endpoints:   endpoints,
+ 		DialTimeout: dialTimeout,
+ 	}
+ 	if cfgtls != nil {
+ 		clientTLS, err := cfgtls.ClientConfig()
+ 		if err != nil {
+-			ExitWithError(ExitBadArgs, err)
++			return nil, err
+ 		}
+ 		cfg.TLS = clientTLS
+ 	}
+ 
+-	client, err := clientv3.New(cfg)
+-	if err != nil {
+-		ExitWithError(ExitBadConnection, err)
+-	}
+-
+-	return client
++	return cfg, nil
+ }
+ 
+ func argOrStdin(args []string, stdin io.Reader, i int) (string, error) {
+@@ -133,3 +117,26 @@ func dialTimeoutFromCmd(cmd *cobra.Command) time.Duration {
+ 	}
+ 	return dialTimeout
+ }
++
++func keyAndCertFromCmd(cmd *cobra.Command) (cert, key, cacert string) {
++	var err error
++	if cert, err = cmd.Flags().GetString("cert"); err != nil {
++		ExitWithError(ExitBadArgs, err)
++	} else if cert == "" && cmd.Flags().Changed("cert") {
++		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --cert option"))
++	}
++
++	if key, err = cmd.Flags().GetString("key"); err != nil {
++		ExitWithError(ExitBadArgs, err)
++	} else if key == "" && cmd.Flags().Changed("key") {
++		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --key option"))
++	}
++
++	if cacert, err = cmd.Flags().GetString("cacert"); err != nil {
++		ExitWithError(ExitBadArgs, err)
++	} else if cacert == "" && cmd.Flags().Changed("cacert") {
++		ExitWithError(ExitBadArgs, errors.New("empty string is passed to --cacert option"))
++	}
++
++	return cert, key, cacert
++}
+diff --git a/etcdctlv3/main.go b/etcdctlv3/main.go
+index 4322948..b46ff22 100644
+--- a/etcdctlv3/main.go
++++ b/etcdctlv3/main.go
+@@ -66,6 +66,7 @@ func init() {
+ 		command.NewVersionCommand(),
+ 		command.NewLeaseCommand(),
+ 		command.NewMemberCommand(),
++		command.NewEpHealthCommand(),
+ 		command.NewSnapshotCommand(),
+ 		command.NewMakeMirrorCommand(),
+ 		command.NewLockCommand(),

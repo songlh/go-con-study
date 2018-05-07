@@ -1,0 +1,167 @@
+commit 54b07d7974d020c0d202a8cd419a816076ddbb9a
+Author: Ben Darnell <bdarnell@squareup.com>
+Date:   Wed Nov 12 18:31:19 2014 -0500
+
+    Remove raft.loadEnts and the ents parameter to raft.RestartNode.
+    
+    The initial entries are now provided via the Storage interface.
+
+diff --git a/etcdserver/force_cluster.go b/etcdserver/force_cluster.go
+index 2336485..c409ff0 100644
+--- a/etcdserver/force_cluster.go
++++ b/etcdserver/force_cluster.go
+@@ -54,7 +54,8 @@ func restartAsStandaloneNode(cfg *ServerConfig, index uint64, snapshot *raftpb.S
+ 
+ 	log.Printf("etcdserver: forcing restart of member %s in cluster %s at commit index %d", id, cfg.Cluster.ID(), st.Commit)
+ 	s := raft.NewMemoryStorage()
+-	n := raft.RestartNode(uint64(id), 10, 1, snapshot, st, ents, s)
++	s.Append(ents)
++	n := raft.RestartNode(uint64(id), 10, 1, snapshot, st, s)
+ 	return id, n, s, w
+ }
+ 
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 2411594..6bf0a4e 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -773,7 +773,8 @@ func restartNode(cfg *ServerConfig, index uint64, snapshot *raftpb.Snapshot) (ty
+ 
+ 	log.Printf("etcdserver: restart member %s in cluster %s at commit index %d", id, cfg.Cluster.ID(), st.Commit)
+ 	s := raft.NewMemoryStorage()
+-	n := raft.RestartNode(uint64(id), 10, 1, snapshot, st, ents, s)
++	s.Append(ents)
++	n := raft.RestartNode(uint64(id), 10, 1, snapshot, st, s)
+ 	return id, n, s, w
+ }
+ 
+diff --git a/raft/log.go b/raft/log.go
+index c1dcdbb..1203bcb 100644
+--- a/raft/log.go
++++ b/raft/log.go
+@@ -64,17 +64,6 @@ func newLog(storage Storage) *raftLog {
+ 	return log
+ }
+ 
+-func (l *raftLog) load(ents []pb.Entry) {
+-	// TODO(bdarnell): does this method need to support other Storage impls or does it go away?
+-	ms := l.storage.(*MemoryStorage)
+-	if ms.offset != ents[0].Index {
+-		panic("entries loaded don't match offset index")
+-	}
+-	ms.ents = ents
+-	l.unstable = ms.offset + uint64(len(ents))
+-	l.unstableEnts = nil
+-}
+-
+ func (l *raftLog) String() string {
+ 	return fmt.Sprintf("unstable=%d committed=%d applied=%d", l.unstable, l.committed, l.applied)
+ 
+diff --git a/raft/node.go b/raft/node.go
+index c607dd2..411085a 100644
+--- a/raft/node.go
++++ b/raft/node.go
+@@ -168,7 +168,7 @@ func StartNode(id uint64, peers []Peer, election, heartbeat int, storage Storage
+ // log.
+ // TODO(bdarnell): remove args that are unnecessary with storage.
+ // Maybe this function goes away and is replaced by StartNode with a non-empty Storage.
+-func RestartNode(id uint64, election, heartbeat int, snapshot *pb.Snapshot, st pb.HardState, ents []pb.Entry, storage Storage) Node {
++func RestartNode(id uint64, election, heartbeat int, snapshot *pb.Snapshot, st pb.HardState, storage Storage) Node {
+ 	n := newNode()
+ 	r := newRaft(id, nil, election, heartbeat, storage)
+ 	if snapshot != nil {
+@@ -177,9 +177,6 @@ func RestartNode(id uint64, election, heartbeat int, snapshot *pb.Snapshot, st p
+ 	if !isHardStateEqual(st, emptyState) {
+ 		r.loadState(st)
+ 	}
+-	if len(ents) != 0 {
+-		r.loadEnts(ents)
+-	}
+ 	go n.run(r)
+ 	return &n
+ }
+diff --git a/raft/node_test.go b/raft/node_test.go
+index ea68277..9639581 100644
+--- a/raft/node_test.go
++++ b/raft/node_test.go
+@@ -233,7 +233,7 @@ func TestNodeRestart(t *testing.T) {
+ 
+ 	storage := NewMemoryStorage()
+ 	storage.Append(entries)
+-	n := RestartNode(1, 10, 1, nil, st, nil, storage)
++	n := RestartNode(1, 10, 1, nil, st, storage)
+ 	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
+ 		t.Errorf("g = %+v,\n             w   %+v", g, want)
+ 	} else {
+diff --git a/raft/raft.go b/raft/raft.go
+index 81214fc..b98b0af 100644
+--- a/raft/raft.go
++++ b/raft/raft.go
+@@ -549,10 +549,6 @@ func (r *raft) promotable() bool {
+ 	return ok
+ }
+ 
+-func (r *raft) loadEnts(ents []pb.Entry) {
+-	r.raftLog.load(ents)
+-}
+-
+ func (r *raft) loadState(state pb.HardState) {
+ 	r.raftLog.committed = state.Commit
+ 	r.Term = state.Term
+diff --git a/raft/raft_paper_test.go b/raft/raft_paper_test.go
+index 3a54d15..8433010 100644
+--- a/raft/raft_paper_test.go
++++ b/raft/raft_paper_test.go
+@@ -605,8 +605,9 @@ func TestFollowerCheckMsgApp(t *testing.T) {
+ 		{3, 3, true},
+ 	}
+ 	for i, tt := range tests {
+-		r := newRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+-		r.loadEnts(ents)
++		storage := NewMemoryStorage()
++		storage.Append(ents)
++		r := newRaft(1, []uint64{1, 2, 3}, 10, 1, storage)
+ 		r.loadState(pb.HardState{Commit: 2})
+ 		r.becomeFollower(2, 2)
+ 
+@@ -729,11 +730,13 @@ func TestLeaderSyncFollowerLog(t *testing.T) {
+ 		},
+ 	}
+ 	for i, tt := range tests {
+-		lead := newRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+-		lead.loadEnts(ents)
++		leadStorage := NewMemoryStorage()
++		leadStorage.Append(ents)
++		lead := newRaft(1, []uint64{1, 2, 3}, 10, 1, leadStorage)
+ 		lead.loadState(pb.HardState{Commit: lead.raftLog.lastIndex(), Term: term})
+-		follower := newRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+-		follower.loadEnts(tt)
++		followerStorage := NewMemoryStorage()
++		followerStorage.Append(tt)
++		follower := newRaft(2, []uint64{1, 2, 3}, 10, 1, followerStorage)
+ 		follower.loadState(pb.HardState{Term: term - 1})
+ 		// It is necessary to have a three-node cluster.
+ 		// The second may have more up-to-date log than the first one, so the
+@@ -823,8 +826,9 @@ func TestVoter(t *testing.T) {
+ 		{[]pb.Entry{{}, {Term: 2, Index: 1}, {Term: 1, Index: 2}}, 1, 1, true},
+ 	}
+ 	for i, tt := range tests {
+-		r := newRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
+-		r.loadEnts(tt.ents)
++		storage := NewMemoryStorage()
++		storage.Append(tt.ents)
++		r := newRaft(1, []uint64{1, 2}, 10, 1, storage)
+ 
+ 		r.Step(pb.Message{From: 2, To: 1, Type: pb.MsgVote, Term: 3, LogTerm: tt.logterm, Index: tt.index})
+ 
+@@ -858,8 +862,9 @@ func TestLeaderOnlyCommitsLogFromCurrentTerm(t *testing.T) {
+ 		{3, 3},
+ 	}
+ 	for i, tt := range tests {
+-		r := newRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
+-		r.loadEnts(ents)
++		storage := NewMemoryStorage()
++		storage.Append(ents)
++		r := newRaft(1, []uint64{1, 2}, 10, 1, storage)
+ 		r.loadState(pb.HardState{Term: 2})
+ 		// become leader at term 3
+ 		r.becomeCandidate()

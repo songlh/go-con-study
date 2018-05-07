@@ -1,0 +1,49 @@
+commit e6a789d54177807a9f90e4ec90b6c098c16cefc8
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Mon Apr 17 13:37:12 2017 -0700
+
+    integration: permit dropping intermediate leader values on observe
+    
+    Weaken TestV3ElectionObserve so it only checks that it observes a strictly
+    monotonically ascending leader transition sequence following the first
+    observed leader. First, the Observe will issue the leader channel before
+    getting a response for its first get; the election revision is only bound
+    after returning the channel. So, Observe can't be expected to always
+    return the leader at the time it was started.  Second, Observe fetches
+    the current leader based on its create revision, but begins watching on its
+    ModRevision; this is important so that elections still work in case the
+    leader issues proclamations following a compaction that exceeds its
+    creation revision. So, Observe can't be expected to return the entire
+    proclamation sequence for a single leader.
+    
+    Fixes #7749
+
+diff --git a/integration/v3election_grpc_test.go b/integration/v3election_grpc_test.go
+index f92c41d..b573b6e 100644
+--- a/integration/v3election_grpc_test.go
++++ b/integration/v3election_grpc_test.go
+@@ -96,7 +96,7 @@ func TestV3ElectionObserve(t *testing.T) {
+ 
+ 	lc := epb.NewElectionClient(clus.Client(0).ActiveConnection())
+ 
+-	// observe 10 leadership events
++	// observe leadership events
+ 	observec := make(chan struct{})
+ 	go func() {
+ 		defer close(observec)
+@@ -110,9 +110,13 @@ func TestV3ElectionObserve(t *testing.T) {
+ 			if rerr != nil {
+ 				t.Fatal(rerr)
+ 			}
+-			if string(resp.Kv.Value) != fmt.Sprintf("%d", i) {
+-				t.Fatalf(`got observe value %q, expected "%d"`, string(resp.Kv.Value), i)
++			respV := 0
++			fmt.Sscanf(string(resp.Kv.Value), "%d", &respV)
++			// leader transitions should not go backwards
++			if respV < i {
++				t.Fatalf(`got observe value %q, expected >= "%d"`, string(resp.Kv.Value), i)
+ 			}
++			i = respV
+ 		}
+ 	}()
+ 

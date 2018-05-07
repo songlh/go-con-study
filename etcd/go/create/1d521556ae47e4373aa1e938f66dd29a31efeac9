@@ -1,0 +1,203 @@
+commit 1d521556ae47e4373aa1e938f66dd29a31efeac9
+Author: fanmin shi <fanmin.shi@coreos.com>
+Date:   Mon Jan 30 15:59:28 2017 -0800
+
+    e2e: modify e2e to run code coverage
+
+diff --git a/e2e/etcd_spawn_cov.go.go b/e2e/etcd_spawn_cov.go.go
+new file mode 100644
+index 0000000..94717e2
+--- /dev/null
++++ b/e2e/etcd_spawn_cov.go.go
+@@ -0,0 +1,76 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build cov
++
++package e2e
++
++import (
++	"fmt"
++	"os"
++	"strings"
++	"time"
++
++	"path/filepath"
++
++	"github.com/coreos/etcd/pkg/expect"
++	"github.com/coreos/etcd/pkg/fileutil"
++	"github.com/coreos/etcd/pkg/flags"
++)
++
++func spawnCmd(args []string) (*expect.ExpectProcess, error) {
++	if args[0] == binPath {
++		coverPath := os.Getenv("COVERDIR")
++		if !filepath.IsAbs(coverPath) {
++			// COVERDIR is relative to etcd root but e2e test has its path set to be relative to the e2e folder.
++			// adding ".." in front of COVERDIR ensures that e2e saves coverage reports to the correct location.
++			coverPath = filepath.Join("..", coverPath)
++		}
++		if !fileutil.Exist(coverPath) {
++			return nil, fmt.Errorf("could not find coverage folder")
++		}
++		covArgs := []string{
++			fmt.Sprintf("-test.coverprofile=e2e.%v.coverprofile", time.Now().UnixNano()),
++			"-test.outputdir=" + coverPath,
++		}
++		return expect.NewExpectWithEnv(binDir+"/etcd_test", covArgs, args2env(args[1:]))
++	}
++	return expect.NewExpect(args[0], args[1:]...)
++}
++
++func args2env(args []string) []string {
++	var covEnvs []string
++	for i := range args[1:] {
++		if !strings.HasPrefix(args[i], "--") {
++			continue
++		}
++		flag := strings.Split(args[i], "--")[1]
++		val := "true"
++		// split the flag that has "="
++		// e.g --auto-tls=true" => flag=auto-tls and val=true
++		if strings.Contains(args[i], "=") {
++			split := strings.Split(flag, "=")
++			flag = split[0]
++			val = split[1]
++		}
++
++		if i+1 < len(args) {
++			if !strings.HasPrefix(args[i+1], "--") {
++				val = args[i+1]
++			}
++		}
++		covEnvs = append(covEnvs, flags.FlagToEnv("ETCD", flag)+"="+val)
++	}
++	return covEnvs
++}
+diff --git a/e2e/etcd_spawn_nocov.go b/e2e/etcd_spawn_nocov.go
+new file mode 100644
+index 0000000..1205432
+--- /dev/null
++++ b/e2e/etcd_spawn_nocov.go
+@@ -0,0 +1,23 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build !cov
++
++package e2e
++
++import "github.com/coreos/etcd/pkg/expect"
++
++func spawnCmd(args []string) (*expect.ExpectProcess, error) {
++	return expect.NewExpect(args[0], args[1:]...)
++}
+diff --git a/e2e/etcd_test.go b/e2e/etcd_test.go
+index bebc52f..01702c6 100644
+--- a/e2e/etcd_test.go
++++ b/e2e/etcd_test.go
+@@ -494,10 +494,6 @@ func waitReadyExpectProc(exproc *expect.ExpectProcess, isProxy bool) error {
+ 	return err
+ }
+ 
+-func spawnCmd(args []string) (*expect.ExpectProcess, error) {
+-	return expect.NewExpect(args[0], args[1:]...)
+-}
+-
+ func spawnWithExpect(args []string, expected string) error {
+ 	return spawnWithExpects(args, []string{expected}...)
+ }
+diff --git a/main_test.go b/main_test.go
+new file mode 100644
+index 0000000..0f5dfb9
+--- /dev/null
++++ b/main_test.go
+@@ -0,0 +1,35 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++import (
++	"os"
++	"os/signal"
++	"strings"
++	"syscall"
++	"testing"
++)
++
++func TestMain(t *testing.T) {
++	// don't launch etcd server when invoked via go test
++	if strings.HasSuffix(os.Args[0], "etcd.test") {
++		return
++	}
++
++	notifier := make(chan os.Signal, 1)
++	signal.Notify(notifier, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
++	go main()
++	<-notifier
++}
+diff --git a/pkg/expect/expect.go b/pkg/expect/expect.go
+index 3322b11..94650f3 100644
+--- a/pkg/expect/expect.go
++++ b/pkg/expect/expect.go
+@@ -44,7 +44,15 @@ var printDebugLines = os.Getenv("EXPECT_DEBUG") != ""
+ 
+ // NewExpect creates a new process for expect testing.
+ func NewExpect(name string, arg ...string) (ep *ExpectProcess, err error) {
+-	ep = &ExpectProcess{cmd: exec.Command(name, arg...)}
++	// if env[] is nil, use current system env
++	return NewExpectWithEnv(name, arg, nil)
++}
++
++// NewExpectWithEnv creates a new process with user defined env variables for expect testing.
++func NewExpectWithEnv(name string, args []string, env []string) (ep *ExpectProcess, err error) {
++	cmd := exec.Command(name, args...)
++	cmd.Env = env
++	ep = &ExpectProcess{cmd: cmd}
+ 	ep.cond = sync.NewCond(&ep.mu)
+ 	ep.cmd.Stderr = ep.cmd.Stdout
+ 	ep.cmd.Stdin = nil
+@@ -132,7 +140,7 @@ func (ep *ExpectProcess) close(kill bool) error {
+ 		return ep.err
+ 	}
+ 	if kill {
+-		ep.cmd.Process.Kill()
++		ep.Signal(os.Interrupt)
+ 	}
+ 
+ 	err := ep.cmd.Wait()

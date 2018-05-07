@@ -1,0 +1,2203 @@
+commit b7854354ff5cacdd66b5ed1858133c4d2fa71706
+Author: Ben Johnson <benbjohnson@yahoo.com>
+Date:   Fri Dec 20 15:39:29 2013 -0700
+
+    bump(code.google.com/p/go.net): a1b606ad6242
+
+diff --git a/third_party/code.google.com/p/go.net/codereview.cfg b/third_party/code.google.com/p/go.net/codereview.cfg
+index e3eb47c..43dbf3c 100644
+--- a/third_party/code.google.com/p/go.net/codereview.cfg
++++ b/third_party/code.google.com/p/go.net/codereview.cfg
+@@ -1,2 +1,2 @@
+-defaultcc: golang-dev@googlegroups.com
++defaultcc: golang-codereviews@googlegroups.com
+ contributors: http://go.googlecode.com/hg/CONTRIBUTORS
+diff --git a/third_party/code.google.com/p/go.net/html/charset/charset.go b/third_party/code.google.com/p/go.net/html/charset/charset.go
+new file mode 100644
+index 0000000..39dc268
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/charset.go
+@@ -0,0 +1,227 @@
++// Package charset provides common text encodings for HTML documents.
++//
++// The mapping from encoding labels to encodings is defined at
++// http://encoding.spec.whatwg.org.
++package charset
++
++import (
++	"bytes"
++	"io"
++	"mime"
++	"strings"
++	"unicode/utf8"
++
++	"code.google.com/p/go.net/html"
++	"code.google.com/p/go.text/encoding"
++	"code.google.com/p/go.text/encoding/charmap"
++	"code.google.com/p/go.text/transform"
++)
++
++// Lookup returns the encoding with the specified label, and its canonical
++// name. It returns nil and the empty string if label is not one of the
++// standard encodings for HTML. Matching is case-insensitive and ignores
++// leading and trailing whitespace.
++func Lookup(label string) (e encoding.Encoding, name string) {
++	label = strings.ToLower(strings.Trim(label, "\t\n\r\f "))
++	enc := encodings[label]
++	return enc.e, enc.name
++}
++
++// DetermineEncoding determines the encoding of an HTML document by examining
++// up to the first 1024 bytes of content and the declared Content-Type.
++//
++// See http://www.whatwg.org/specs/web-apps/current-work/multipage/parsing.html#determining-the-character-encoding
++func DetermineEncoding(content []byte, contentType string) (e encoding.Encoding, name string, certain bool) {
++	if len(content) > 1024 {
++		content = content[:1024]
++	}
++
++	for _, b := range boms {
++		if bytes.HasPrefix(content, b.bom) {
++			e, name = Lookup(b.enc)
++			return e, name, true
++		}
++	}
++
++	if _, params, err := mime.ParseMediaType(contentType); err == nil {
++		if cs, ok := params["charset"]; ok {
++			if e, name = Lookup(cs); e != nil {
++				return e, name, true
++			}
++		}
++	}
++
++	if len(content) > 0 {
++		e, name = prescan(content)
++		if e != nil {
++			return e, name, false
++		}
++	}
++
++	// Try to detect UTF-8.
++	// First eliminate any partial rune at the end.
++	for i := len(content) - 1; i >= 0 && i > len(content)-4; i-- {
++		b := content[i]
++		if b < 0x80 {
++			break
++		}
++		if utf8.RuneStart(b) {
++			content = content[:i]
++			break
++		}
++	}
++	hasHighBit := false
++	for _, c := range content {
++		if c >= 0x80 {
++			hasHighBit = true
++			break
++		}
++	}
++	if hasHighBit && utf8.Valid(content) {
++		return encoding.Nop, "utf-8", false
++	}
++
++	// TODO: change default depending on user's locale?
++	return charmap.Windows1252, "windows-1252", false
++}
++
++// NewReader returns an io.Reader that converts the content of r to UTF-8.
++// It calls DetermineEncoding to find out what r's encoding is.
++func NewReader(r io.Reader, contentType string) (io.Reader, error) {
++	preview := make([]byte, 1024)
++	n, err := io.ReadFull(r, preview)
++	switch {
++	case err == io.ErrUnexpectedEOF:
++		preview = preview[:n]
++		r = bytes.NewReader(preview)
++	case err != nil:
++		return nil, err
++	default:
++		r = io.MultiReader(bytes.NewReader(preview), r)
++	}
++
++	if e, _, _ := DetermineEncoding(preview, contentType); e != encoding.Nop {
++		r = transform.NewReader(r, e.NewDecoder())
++	}
++	return r, nil
++}
++
++func prescan(content []byte) (e encoding.Encoding, name string) {
++	z := html.NewTokenizer(bytes.NewReader(content))
++	for {
++		switch z.Next() {
++		case html.ErrorToken:
++			return nil, ""
++
++		case html.StartTagToken, html.SelfClosingTagToken:
++			tagName, hasAttr := z.TagName()
++			if !bytes.Equal(tagName, []byte("meta")) {
++				continue
++			}
++			attrList := make(map[string]bool)
++			gotPragma := false
++
++			const (
++				dontKnow = iota
++				doNeedPragma
++				doNotNeedPragma
++			)
++			needPragma := dontKnow
++
++			name = ""
++			e = nil
++			for hasAttr {
++				var key, val []byte
++				key, val, hasAttr = z.TagAttr()
++				ks := string(key)
++				if attrList[ks] {
++					continue
++				}
++				attrList[ks] = true
++				for i, c := range val {
++					if 'A' <= c && c <= 'Z' {
++						val[i] = c + 0x20
++					}
++				}
++
++				switch ks {
++				case "http-equiv":
++					if bytes.Equal(val, []byte("content-type")) {
++						gotPragma = true
++					}
++
++				case "content":
++					if e == nil {
++						name = fromMetaElement(string(val))
++						if name != "" {
++							e, name = Lookup(name)
++							if e != nil {
++								needPragma = doNeedPragma
++							}
++						}
++					}
++
++				case "charset":
++					e, name = Lookup(string(val))
++					needPragma = doNotNeedPragma
++				}
++			}
++
++			if needPragma == dontKnow || needPragma == doNeedPragma && !gotPragma {
++				continue
++			}
++
++			if strings.HasPrefix(name, "utf-16") {
++				name = "utf-8"
++				e = encoding.Nop
++			}
++
++			if e != nil {
++				return e, name
++			}
++		}
++	}
++}
++
++func fromMetaElement(s string) string {
++	for s != "" {
++		csLoc := strings.Index(s, "charset")
++		if csLoc == -1 {
++			return ""
++		}
++		s = s[csLoc+len("charset"):]
++		s = strings.TrimLeft(s, " \t\n\f\r")
++		if !strings.HasPrefix(s, "=") {
++			continue
++		}
++		s = s[1:]
++		s = strings.TrimLeft(s, " \t\n\f\r")
++		if s == "" {
++			return ""
++		}
++		if q := s[0]; q == '"' || q == '\'' {
++			s = s[1:]
++			closeQuote := strings.IndexRune(s, rune(q))
++			if closeQuote == -1 {
++				return ""
++			}
++			return s[:closeQuote]
++		}
++
++		end := strings.IndexAny(s, "; \t\n\f\r")
++		if end == -1 {
++			end = len(s)
++		}
++		return s[:end]
++	}
++	return ""
++}
++
++var boms = []struct {
++	bom []byte
++	enc string
++}{
++	{[]byte{0xfe, 0xff}, "utf-16be"},
++	{[]byte{0xff, 0xfe}, "utf-16le"},
++	{[]byte{0xef, 0xbb, 0xbf}, "utf-8"},
++}
+diff --git a/third_party/code.google.com/p/go.net/html/charset/charset_test.go b/third_party/code.google.com/p/go.net/html/charset/charset_test.go
+new file mode 100644
+index 0000000..a656dd9
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/charset_test.go
+@@ -0,0 +1,200 @@
++package charset
++
++import (
++	"bytes"
++	"io/ioutil"
++	"strings"
++	"testing"
++
++	"code.google.com/p/go.text/transform"
++)
++
++func transformString(t transform.Transformer, s string) (string, error) {
++	r := transform.NewReader(strings.NewReader(s), t)
++	b, err := ioutil.ReadAll(r)
++	return string(b), err
++}
++
++var testCases = []struct {
++	utf8, other, otherEncoding string
++}{
++	{"Résumé", "Résumé", "utf8"},
++	{"Résumé", "R\xe9sum\xe9", "latin1"},
++	{"これは漢字です。", "S0\x8c0o0\"oW[g0Y0\x020", "UTF-16LE"},
++	{"これは漢字です。", "0S0\x8c0oo\"[W0g0Y0\x02", "UTF-16BE"},
++	{"Hello, world", "Hello, world", "ASCII"},
++	{"Gdańsk", "Gda\xf1sk", "ISO-8859-2"},
++	{"Ââ Čč Đđ Ŋŋ Õõ Šš Žž Åå Ää", "\xc2\xe2 \xc8\xe8 \xa9\xb9 \xaf\xbf \xd5\xf5 \xaa\xba \xac\xbc \xc5\xe5 \xc4\xe4", "ISO-8859-10"},
++	{"สำหรับ", "\xca\xd3\xcb\xc3\u047a", "ISO-8859-11"},
++	{"latviešu", "latvie\xf0u", "ISO-8859-13"},
++	{"Seònaid", "Se\xf2naid", "ISO-8859-14"},
++	{"€1 is cheap", "\xa41 is cheap", "ISO-8859-15"},
++	{"românește", "rom\xe2ne\xbate", "ISO-8859-16"},
++	{"nutraĵo", "nutra\xbco", "ISO-8859-3"},
++	{"Kalâdlit", "Kal\xe2dlit", "ISO-8859-4"},
++	{"русский", "\xe0\xe3\xe1\xe1\xda\xd8\xd9", "ISO-8859-5"},
++	{"ελληνικά", "\xe5\xeb\xeb\xe7\xed\xe9\xea\xdc", "ISO-8859-7"},
++	{"Kağan", "Ka\xf0an", "ISO-8859-9"},
++	{"Résumé", "R\x8esum\x8e", "macintosh"},
++	{"Gdańsk", "Gda\xf1sk", "windows-1250"},
++	{"русский", "\xf0\xf3\xf1\xf1\xea\xe8\xe9", "windows-1251"},
++	{"Résumé", "R\xe9sum\xe9", "windows-1252"},
++	{"ελληνικά", "\xe5\xeb\xeb\xe7\xed\xe9\xea\xdc", "windows-1253"},
++	{"Kağan", "Ka\xf0an", "windows-1254"},
++	{"עִבְרִית", "\xf2\xc4\xe1\xc0\xf8\xc4\xe9\xfa", "windows-1255"},
++	{"العربية", "\xc7\xe1\xda\xd1\xc8\xed\xc9", "windows-1256"},
++	{"latviešu", "latvie\xf0u", "windows-1257"},
++	{"Việt", "Vi\xea\xf2t", "windows-1258"},
++	{"สำหรับ", "\xca\xd3\xcb\xc3\u047a", "windows-874"},
++	{"русский", "\xd2\xd5\xd3\xd3\xcb\xc9\xca", "KOI8-R"},
++	{"українська", "\xd5\xcb\xd2\xc1\xa7\xce\xd3\xd8\xcb\xc1", "KOI8-U"},
++	{"Hello 常用國字標準字體表", "Hello \xb1`\xa5\u03b0\xea\xa6r\xbc\u0437\u01e6r\xc5\xe9\xaa\xed", "big5"},
++	{"Hello 常用國字標準字體表", "Hello \xb3\xa3\xd3\xc3\x87\xf8\xd7\xd6\x98\xcb\x9c\xca\xd7\xd6\xf3\x77\xb1\xed", "gbk"},
++	{"Hello 常用國字標準字體表", "Hello \xb3\xa3\xd3\xc3\x87\xf8\xd7\xd6\x98\xcb\x9c\xca\xd7\xd6\xf3\x77\xb1\xed", "gb18030"},
++	{"עִבְרִית", "\x81\x30\xfb\x30\x81\x30\xf6\x34\x81\x30\xf9\x33\x81\x30\xf6\x30\x81\x30\xfb\x36\x81\x30\xf6\x34\x81\x30\xfa\x31\x81\x30\xfb\x38", "gb18030"},
++	{"㧯", "\x82\x31\x89\x38", "gb18030"},
++	{"これは漢字です。", "\x82\xb1\x82\xea\x82\xcd\x8a\xbf\x8e\x9a\x82\xc5\x82\xb7\x81B", "SJIS"},
++	{"Hello, 世界!", "Hello, \x90\xa2\x8aE!", "SJIS"},
++	{"ｲｳｴｵｶ", "\xb2\xb3\xb4\xb5\xb6", "SJIS"},
++	{"これは漢字です。", "\xa4\xb3\xa4\xec\xa4\u03f4\xc1\xbb\xfa\xa4\u01e4\xb9\xa1\xa3", "EUC-JP"},
++	{"Hello, 世界!", "Hello, \x1b$B@$3&\x1b(B!", "ISO-2022-JP"},
++	{"네이트 | 즐거움의 시작, 슈파스(Spaβ) NATE", "\xb3\xd7\xc0\xcc\xc6\xae | \xc1\xf1\xb0\xc5\xbf\xf2\xc0\xc7 \xbd\xc3\xc0\xdb, \xbd\xb4\xc6\xc4\xbd\xba(Spa\xa5\xe2) NATE", "EUC-KR"},
++}
++
++func TestDecode(t *testing.T) {
++	for _, tc := range testCases {
++		e, _ := Lookup(tc.otherEncoding)
++		if e == nil {
++			t.Errorf("%s: not found", tc.otherEncoding)
++			continue
++		}
++		s, err := transformString(e.NewDecoder(), tc.other)
++		if err != nil {
++			t.Errorf("%s: decode %q: %v", tc.otherEncoding, tc.other, err)
++			continue
++		}
++		if s != tc.utf8 {
++			t.Errorf("%s: got %q, want %q", tc.otherEncoding, s, tc.utf8)
++		}
++	}
++}
++
++func TestEncode(t *testing.T) {
++	for _, tc := range testCases {
++		e, _ := Lookup(tc.otherEncoding)
++		if e == nil {
++			t.Errorf("%s: not found", tc.otherEncoding)
++			continue
++		}
++		s, err := transformString(e.NewEncoder(), tc.utf8)
++		if err != nil {
++			t.Errorf("%s: encode %q: %s", tc.otherEncoding, tc.utf8, err)
++			continue
++		}
++		if s != tc.other {
++			t.Errorf("%s: got %q, want %q", tc.otherEncoding, s, tc.other)
++		}
++	}
++}
++
++// TestNames verifies that you can pass an encoding's name to Lookup and get
++// the same encoding back (except for "replacement").
++func TestNames(t *testing.T) {
++	for _, e := range encodings {
++		if e.name == "replacement" {
++			continue
++		}
++		_, got := Lookup(e.name)
++		if got != e.name {
++			t.Errorf("got %q, want %q", got, e.name)
++			continue
++		}
++	}
++}
++
++var sniffTestCases = []struct {
++	filename, declared, want string
++}{
++	{"HTTP-charset.html", "text/html; charset=iso-8859-15", "iso-8859-15"},
++	{"UTF-16LE-BOM.html", "", "utf-16le"},
++	{"UTF-16BE-BOM.html", "", "utf-16be"},
++	{"meta-content-attribute.html", "text/html", "iso-8859-15"},
++	{"meta-charset-attribute.html", "text/html", "iso-8859-15"},
++	{"No-encoding-declaration.html", "text/html", "utf-8"},
++	{"HTTP-vs-UTF-8-BOM.html", "text/html; charset=iso-8859-15", "utf-8"},
++	{"HTTP-vs-meta-content.html", "text/html; charset=iso-8859-15", "iso-8859-15"},
++	{"HTTP-vs-meta-charset.html", "text/html; charset=iso-8859-15", "iso-8859-15"},
++	{"UTF-8-BOM-vs-meta-content.html", "text/html", "utf-8"},
++	{"UTF-8-BOM-vs-meta-charset.html", "text/html", "utf-8"},
++}
++
++func TestSniff(t *testing.T) {
++	for _, tc := range sniffTestCases {
++		content, err := ioutil.ReadFile("testdata/" + tc.filename)
++		if err != nil {
++			t.Errorf("%s: error reading file: %v", tc.filename, err)
++			continue
++		}
++
++		_, name, _ := DetermineEncoding(content, tc.declared)
++		if name != tc.want {
++			t.Errorf("%s: got %q, want %q", tc.filename, name, tc.want)
++			continue
++		}
++	}
++}
++
++func TestReader(t *testing.T) {
++	for _, tc := range sniffTestCases {
++		content, err := ioutil.ReadFile("testdata/" + tc.filename)
++		if err != nil {
++			t.Errorf("%s: error reading file: %v", tc.filename, err)
++			continue
++		}
++
++		r, err := NewReader(bytes.NewReader(content), tc.declared)
++		if err != nil {
++			t.Errorf("%s: error creating reader: %v", tc.filename, err)
++			continue
++		}
++
++		got, err := ioutil.ReadAll(r)
++		if err != nil {
++			t.Errorf("%s: error reading from charset.NewReader: %v", tc.filename, err)
++			continue
++		}
++
++		e, _ := Lookup(tc.want)
++		want, err := ioutil.ReadAll(transform.NewReader(bytes.NewReader(content), e.NewDecoder()))
++		if err != nil {
++			t.Errorf("%s: error decoding with hard-coded charset name: %v", tc.filename, err)
++			continue
++		}
++
++		if !bytes.Equal(got, want) {
++			t.Errorf("%s: got %q, want %q", tc.filename, got, want)
++			continue
++		}
++	}
++}
++
++var metaTestCases = []struct {
++	meta, want string
++}{
++	{"", ""},
++	{"text/html", ""},
++	{"text/html; charset utf-8", ""},
++	{"text/html; charset=latin-2", "latin-2"},
++	{"text/html; charset; charset = utf-8", "utf-8"},
++	{`charset="big5"`, "big5"},
++	{"charset='shift_jis'", "shift_jis"},
++}
++
++func TestFromMeta(t *testing.T) {
++	for _, tc := range metaTestCases {
++		got := fromMetaElement(tc.meta)
++		if got != tc.want {
++			t.Errorf("%q: got %q, want %q", tc.meta, got, tc.want)
++		}
++	}
++}
+diff --git a/third_party/code.google.com/p/go.net/html/charset/gen.go b/third_party/code.google.com/p/go.net/html/charset/gen.go
+new file mode 100644
+index 0000000..25a9eb6
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/gen.go
+@@ -0,0 +1,107 @@
++// +build ignore
++
++package main
++
++// Download http://encoding.spec.whatwg.org/encodings.json and use it to
++// generate table.go.
++
++import (
++	"encoding/json"
++	"fmt"
++	"log"
++	"net/http"
++	"strings"
++)
++
++type enc struct {
++	Name   string
++	Labels []string
++}
++
++type group struct {
++	Encodings []enc
++	Heading   string
++}
++
++const specURL = "http://encoding.spec.whatwg.org/encodings.json"
++
++func main() {
++	resp, err := http.Get(specURL)
++	if err != nil {
++		log.Fatalf("error fetching %s: %s", specURL, err)
++	}
++	if resp.StatusCode != 200 {
++		log.Fatalf("error fetching %s: HTTP status %s", specURL, resp.Status)
++	}
++	defer resp.Body.Close()
++
++	var groups []group
++	d := json.NewDecoder(resp.Body)
++	err = d.Decode(&groups)
++	if err != nil {
++		log.Fatalf("error reading encodings.json: %s", err)
++	}
++
++	fmt.Println("// generated by go run gen.go; DO NOT EDIT")
++	fmt.Println()
++	fmt.Println("package charset")
++	fmt.Println()
++
++	fmt.Println("import (")
++	fmt.Println(`"code.google.com/p/go.text/encoding"`)
++	for _, pkg := range []string{"charmap", "japanese", "korean", "simplifiedchinese", "traditionalchinese", "unicode"} {
++		fmt.Printf("\"code.google.com/p/go.text/encoding/%s\"\n", pkg)
++	}
++	fmt.Println(")")
++	fmt.Println()
++
++	fmt.Println("var encodings = map[string]struct{e encoding.Encoding; name string} {")
++	for _, g := range groups {
++		for _, e := range g.Encodings {
++			goName, ok := miscNames[e.Name]
++			if !ok {
++				for k, v := range prefixes {
++					if strings.HasPrefix(e.Name, k) {
++						goName = v + e.Name[len(k):]
++						break
++					}
++				}
++				if goName == "" {
++					log.Fatalf("unrecognized encoding name: %s", e.Name)
++				}
++			}
++
++			for _, label := range e.Labels {
++				fmt.Printf("%q: {%s, %q},\n", label, goName, e.Name)
++			}
++		}
++	}
++	fmt.Println("}")
++}
++
++var prefixes = map[string]string{
++	"iso-8859-": "charmap.ISO8859_",
++	"windows-":  "charmap.Windows",
++}
++
++var miscNames = map[string]string{
++	"utf-8":          "encoding.Nop",
++	"ibm866":         "charmap.CodePage866",
++	"iso-8859-8-i":   "charmap.ISO8859_8",
++	"koi8-r":         "charmap.KOI8R",
++	"koi8-u":         "charmap.KOI8U",
++	"macintosh":      "charmap.Macintosh",
++	"x-mac-cyrillic": "charmap.MacintoshCyrillic",
++	"gbk":            "simplifiedchinese.GBK",
++	"gb18030":        "simplifiedchinese.GB18030",
++	"hz-gb-2312":     "simplifiedchinese.HZGB2312",
++	"big5":           "traditionalchinese.Big5",
++	"euc-jp":         "japanese.EUCJP",
++	"iso-2022-jp":    "japanese.ISO2022JP",
++	"shift_jis":      "japanese.ShiftJIS",
++	"euc-kr":         "korean.EUCKR",
++	"replacement":    "encoding.Replacement",
++	"utf-16be":       "unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM)",
++	"utf-16le":       "unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM)",
++	"x-user-defined": "charmap.XUserDefined",
++}
+diff --git a/third_party/code.google.com/p/go.net/html/charset/table.go b/third_party/code.google.com/p/go.net/html/charset/table.go
+new file mode 100644
+index 0000000..66f8af1
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/table.go
+@@ -0,0 +1,235 @@
++// generated by go run gen.go; DO NOT EDIT
++
++package charset
++
++import (
++	"code.google.com/p/go.text/encoding"
++	"code.google.com/p/go.text/encoding/charmap"
++	"code.google.com/p/go.text/encoding/japanese"
++	"code.google.com/p/go.text/encoding/korean"
++	"code.google.com/p/go.text/encoding/simplifiedchinese"
++	"code.google.com/p/go.text/encoding/traditionalchinese"
++	"code.google.com/p/go.text/encoding/unicode"
++)
++
++var encodings = map[string]struct {
++	e    encoding.Encoding
++	name string
++}{
++	"unicode-1-1-utf-8":   {encoding.Nop, "utf-8"},
++	"utf-8":               {encoding.Nop, "utf-8"},
++	"utf8":                {encoding.Nop, "utf-8"},
++	"866":                 {charmap.CodePage866, "ibm866"},
++	"cp866":               {charmap.CodePage866, "ibm866"},
++	"csibm866":            {charmap.CodePage866, "ibm866"},
++	"ibm866":              {charmap.CodePage866, "ibm866"},
++	"csisolatin2":         {charmap.ISO8859_2, "iso-8859-2"},
++	"iso-8859-2":          {charmap.ISO8859_2, "iso-8859-2"},
++	"iso-ir-101":          {charmap.ISO8859_2, "iso-8859-2"},
++	"iso8859-2":           {charmap.ISO8859_2, "iso-8859-2"},
++	"iso88592":            {charmap.ISO8859_2, "iso-8859-2"},
++	"iso_8859-2":          {charmap.ISO8859_2, "iso-8859-2"},
++	"iso_8859-2:1987":     {charmap.ISO8859_2, "iso-8859-2"},
++	"l2":                  {charmap.ISO8859_2, "iso-8859-2"},
++	"latin2":              {charmap.ISO8859_2, "iso-8859-2"},
++	"csisolatin3":         {charmap.ISO8859_3, "iso-8859-3"},
++	"iso-8859-3":          {charmap.ISO8859_3, "iso-8859-3"},
++	"iso-ir-109":          {charmap.ISO8859_3, "iso-8859-3"},
++	"iso8859-3":           {charmap.ISO8859_3, "iso-8859-3"},
++	"iso88593":            {charmap.ISO8859_3, "iso-8859-3"},
++	"iso_8859-3":          {charmap.ISO8859_3, "iso-8859-3"},
++	"iso_8859-3:1988":     {charmap.ISO8859_3, "iso-8859-3"},
++	"l3":                  {charmap.ISO8859_3, "iso-8859-3"},
++	"latin3":              {charmap.ISO8859_3, "iso-8859-3"},
++	"csisolatin4":         {charmap.ISO8859_4, "iso-8859-4"},
++	"iso-8859-4":          {charmap.ISO8859_4, "iso-8859-4"},
++	"iso-ir-110":          {charmap.ISO8859_4, "iso-8859-4"},
++	"iso8859-4":           {charmap.ISO8859_4, "iso-8859-4"},
++	"iso88594":            {charmap.ISO8859_4, "iso-8859-4"},
++	"iso_8859-4":          {charmap.ISO8859_4, "iso-8859-4"},
++	"iso_8859-4:1988":     {charmap.ISO8859_4, "iso-8859-4"},
++	"l4":                  {charmap.ISO8859_4, "iso-8859-4"},
++	"latin4":              {charmap.ISO8859_4, "iso-8859-4"},
++	"csisolatincyrillic":  {charmap.ISO8859_5, "iso-8859-5"},
++	"cyrillic":            {charmap.ISO8859_5, "iso-8859-5"},
++	"iso-8859-5":          {charmap.ISO8859_5, "iso-8859-5"},
++	"iso-ir-144":          {charmap.ISO8859_5, "iso-8859-5"},
++	"iso8859-5":           {charmap.ISO8859_5, "iso-8859-5"},
++	"iso88595":            {charmap.ISO8859_5, "iso-8859-5"},
++	"iso_8859-5":          {charmap.ISO8859_5, "iso-8859-5"},
++	"iso_8859-5:1988":     {charmap.ISO8859_5, "iso-8859-5"},
++	"arabic":              {charmap.ISO8859_6, "iso-8859-6"},
++	"asmo-708":            {charmap.ISO8859_6, "iso-8859-6"},
++	"csiso88596e":         {charmap.ISO8859_6, "iso-8859-6"},
++	"csiso88596i":         {charmap.ISO8859_6, "iso-8859-6"},
++	"csisolatinarabic":    {charmap.ISO8859_6, "iso-8859-6"},
++	"ecma-114":            {charmap.ISO8859_6, "iso-8859-6"},
++	"iso-8859-6":          {charmap.ISO8859_6, "iso-8859-6"},
++	"iso-8859-6-e":        {charmap.ISO8859_6, "iso-8859-6"},
++	"iso-8859-6-i":        {charmap.ISO8859_6, "iso-8859-6"},
++	"iso-ir-127":          {charmap.ISO8859_6, "iso-8859-6"},
++	"iso8859-6":           {charmap.ISO8859_6, "iso-8859-6"},
++	"iso88596":            {charmap.ISO8859_6, "iso-8859-6"},
++	"iso_8859-6":          {charmap.ISO8859_6, "iso-8859-6"},
++	"iso_8859-6:1987":     {charmap.ISO8859_6, "iso-8859-6"},
++	"csisolatingreek":     {charmap.ISO8859_7, "iso-8859-7"},
++	"ecma-118":            {charmap.ISO8859_7, "iso-8859-7"},
++	"elot_928":            {charmap.ISO8859_7, "iso-8859-7"},
++	"greek":               {charmap.ISO8859_7, "iso-8859-7"},
++	"greek8":              {charmap.ISO8859_7, "iso-8859-7"},
++	"iso-8859-7":          {charmap.ISO8859_7, "iso-8859-7"},
++	"iso-ir-126":          {charmap.ISO8859_7, "iso-8859-7"},
++	"iso8859-7":           {charmap.ISO8859_7, "iso-8859-7"},
++	"iso88597":            {charmap.ISO8859_7, "iso-8859-7"},
++	"iso_8859-7":          {charmap.ISO8859_7, "iso-8859-7"},
++	"iso_8859-7:1987":     {charmap.ISO8859_7, "iso-8859-7"},
++	"sun_eu_greek":        {charmap.ISO8859_7, "iso-8859-7"},
++	"csiso88598e":         {charmap.ISO8859_8, "iso-8859-8"},
++	"csisolatinhebrew":    {charmap.ISO8859_8, "iso-8859-8"},
++	"hebrew":              {charmap.ISO8859_8, "iso-8859-8"},
++	"iso-8859-8":          {charmap.ISO8859_8, "iso-8859-8"},
++	"iso-8859-8-e":        {charmap.ISO8859_8, "iso-8859-8"},
++	"iso-ir-138":          {charmap.ISO8859_8, "iso-8859-8"},
++	"iso8859-8":           {charmap.ISO8859_8, "iso-8859-8"},
++	"iso88598":            {charmap.ISO8859_8, "iso-8859-8"},
++	"iso_8859-8":          {charmap.ISO8859_8, "iso-8859-8"},
++	"iso_8859-8:1988":     {charmap.ISO8859_8, "iso-8859-8"},
++	"visual":              {charmap.ISO8859_8, "iso-8859-8"},
++	"csiso88598i":         {charmap.ISO8859_8, "iso-8859-8-i"},
++	"iso-8859-8-i":        {charmap.ISO8859_8, "iso-8859-8-i"},
++	"logical":             {charmap.ISO8859_8, "iso-8859-8-i"},
++	"csisolatin6":         {charmap.ISO8859_10, "iso-8859-10"},
++	"iso-8859-10":         {charmap.ISO8859_10, "iso-8859-10"},
++	"iso-ir-157":          {charmap.ISO8859_10, "iso-8859-10"},
++	"iso8859-10":          {charmap.ISO8859_10, "iso-8859-10"},
++	"iso885910":           {charmap.ISO8859_10, "iso-8859-10"},
++	"l6":                  {charmap.ISO8859_10, "iso-8859-10"},
++	"latin6":              {charmap.ISO8859_10, "iso-8859-10"},
++	"iso-8859-13":         {charmap.ISO8859_13, "iso-8859-13"},
++	"iso8859-13":          {charmap.ISO8859_13, "iso-8859-13"},
++	"iso885913":           {charmap.ISO8859_13, "iso-8859-13"},
++	"iso-8859-14":         {charmap.ISO8859_14, "iso-8859-14"},
++	"iso8859-14":          {charmap.ISO8859_14, "iso-8859-14"},
++	"iso885914":           {charmap.ISO8859_14, "iso-8859-14"},
++	"csisolatin9":         {charmap.ISO8859_15, "iso-8859-15"},
++	"iso-8859-15":         {charmap.ISO8859_15, "iso-8859-15"},
++	"iso8859-15":          {charmap.ISO8859_15, "iso-8859-15"},
++	"iso885915":           {charmap.ISO8859_15, "iso-8859-15"},
++	"iso_8859-15":         {charmap.ISO8859_15, "iso-8859-15"},
++	"l9":                  {charmap.ISO8859_15, "iso-8859-15"},
++	"iso-8859-16":         {charmap.ISO8859_16, "iso-8859-16"},
++	"cskoi8r":             {charmap.KOI8R, "koi8-r"},
++	"koi":                 {charmap.KOI8R, "koi8-r"},
++	"koi8":                {charmap.KOI8R, "koi8-r"},
++	"koi8-r":              {charmap.KOI8R, "koi8-r"},
++	"koi8_r":              {charmap.KOI8R, "koi8-r"},
++	"koi8-u":              {charmap.KOI8U, "koi8-u"},
++	"csmacintosh":         {charmap.Macintosh, "macintosh"},
++	"mac":                 {charmap.Macintosh, "macintosh"},
++	"macintosh":           {charmap.Macintosh, "macintosh"},
++	"x-mac-roman":         {charmap.Macintosh, "macintosh"},
++	"dos-874":             {charmap.Windows874, "windows-874"},
++	"iso-8859-11":         {charmap.Windows874, "windows-874"},
++	"iso8859-11":          {charmap.Windows874, "windows-874"},
++	"iso885911":           {charmap.Windows874, "windows-874"},
++	"tis-620":             {charmap.Windows874, "windows-874"},
++	"windows-874":         {charmap.Windows874, "windows-874"},
++	"cp1250":              {charmap.Windows1250, "windows-1250"},
++	"windows-1250":        {charmap.Windows1250, "windows-1250"},
++	"x-cp1250":            {charmap.Windows1250, "windows-1250"},
++	"cp1251":              {charmap.Windows1251, "windows-1251"},
++	"windows-1251":        {charmap.Windows1251, "windows-1251"},
++	"x-cp1251":            {charmap.Windows1251, "windows-1251"},
++	"ansi_x3.4-1968":      {charmap.Windows1252, "windows-1252"},
++	"ascii":               {charmap.Windows1252, "windows-1252"},
++	"cp1252":              {charmap.Windows1252, "windows-1252"},
++	"cp819":               {charmap.Windows1252, "windows-1252"},
++	"csisolatin1":         {charmap.Windows1252, "windows-1252"},
++	"ibm819":              {charmap.Windows1252, "windows-1252"},
++	"iso-8859-1":          {charmap.Windows1252, "windows-1252"},
++	"iso-ir-100":          {charmap.Windows1252, "windows-1252"},
++	"iso8859-1":           {charmap.Windows1252, "windows-1252"},
++	"iso88591":            {charmap.Windows1252, "windows-1252"},
++	"iso_8859-1":          {charmap.Windows1252, "windows-1252"},
++	"iso_8859-1:1987":     {charmap.Windows1252, "windows-1252"},
++	"l1":                  {charmap.Windows1252, "windows-1252"},
++	"latin1":              {charmap.Windows1252, "windows-1252"},
++	"us-ascii":            {charmap.Windows1252, "windows-1252"},
++	"windows-1252":        {charmap.Windows1252, "windows-1252"},
++	"x-cp1252":            {charmap.Windows1252, "windows-1252"},
++	"cp1253":              {charmap.Windows1253, "windows-1253"},
++	"windows-1253":        {charmap.Windows1253, "windows-1253"},
++	"x-cp1253":            {charmap.Windows1253, "windows-1253"},
++	"cp1254":              {charmap.Windows1254, "windows-1254"},
++	"csisolatin5":         {charmap.Windows1254, "windows-1254"},
++	"iso-8859-9":          {charmap.Windows1254, "windows-1254"},
++	"iso-ir-148":          {charmap.Windows1254, "windows-1254"},
++	"iso8859-9":           {charmap.Windows1254, "windows-1254"},
++	"iso88599":            {charmap.Windows1254, "windows-1254"},
++	"iso_8859-9":          {charmap.Windows1254, "windows-1254"},
++	"iso_8859-9:1989":     {charmap.Windows1254, "windows-1254"},
++	"l5":                  {charmap.Windows1254, "windows-1254"},
++	"latin5":              {charmap.Windows1254, "windows-1254"},
++	"windows-1254":        {charmap.Windows1254, "windows-1254"},
++	"x-cp1254":            {charmap.Windows1254, "windows-1254"},
++	"cp1255":              {charmap.Windows1255, "windows-1255"},
++	"windows-1255":        {charmap.Windows1255, "windows-1255"},
++	"x-cp1255":            {charmap.Windows1255, "windows-1255"},
++	"cp1256":              {charmap.Windows1256, "windows-1256"},
++	"windows-1256":        {charmap.Windows1256, "windows-1256"},
++	"x-cp1256":            {charmap.Windows1256, "windows-1256"},
++	"cp1257":              {charmap.Windows1257, "windows-1257"},
++	"windows-1257":        {charmap.Windows1257, "windows-1257"},
++	"x-cp1257":            {charmap.Windows1257, "windows-1257"},
++	"cp1258":              {charmap.Windows1258, "windows-1258"},
++	"windows-1258":        {charmap.Windows1258, "windows-1258"},
++	"x-cp1258":            {charmap.Windows1258, "windows-1258"},
++	"x-mac-cyrillic":      {charmap.MacintoshCyrillic, "x-mac-cyrillic"},
++	"x-mac-ukrainian":     {charmap.MacintoshCyrillic, "x-mac-cyrillic"},
++	"chinese":             {simplifiedchinese.GBK, "gbk"},
++	"csgb2312":            {simplifiedchinese.GBK, "gbk"},
++	"csiso58gb231280":     {simplifiedchinese.GBK, "gbk"},
++	"gb2312":              {simplifiedchinese.GBK, "gbk"},
++	"gb_2312":             {simplifiedchinese.GBK, "gbk"},
++	"gb_2312-80":          {simplifiedchinese.GBK, "gbk"},
++	"gbk":                 {simplifiedchinese.GBK, "gbk"},
++	"iso-ir-58":           {simplifiedchinese.GBK, "gbk"},
++	"x-gbk":               {simplifiedchinese.GBK, "gbk"},
++	"gb18030":             {simplifiedchinese.GB18030, "gb18030"},
++	"hz-gb-2312":          {simplifiedchinese.HZGB2312, "hz-gb-2312"},
++	"big5":                {traditionalchinese.Big5, "big5"},
++	"big5-hkscs":          {traditionalchinese.Big5, "big5"},
++	"cn-big5":             {traditionalchinese.Big5, "big5"},
++	"csbig5":              {traditionalchinese.Big5, "big5"},
++	"x-x-big5":            {traditionalchinese.Big5, "big5"},
++	"cseucpkdfmtjapanese": {japanese.EUCJP, "euc-jp"},
++	"euc-jp":              {japanese.EUCJP, "euc-jp"},
++	"x-euc-jp":            {japanese.EUCJP, "euc-jp"},
++	"csiso2022jp":         {japanese.ISO2022JP, "iso-2022-jp"},
++	"iso-2022-jp":         {japanese.ISO2022JP, "iso-2022-jp"},
++	"csshiftjis":          {japanese.ShiftJIS, "shift_jis"},
++	"ms_kanji":            {japanese.ShiftJIS, "shift_jis"},
++	"shift-jis":           {japanese.ShiftJIS, "shift_jis"},
++	"shift_jis":           {japanese.ShiftJIS, "shift_jis"},
++	"sjis":                {japanese.ShiftJIS, "shift_jis"},
++	"windows-31j":         {japanese.ShiftJIS, "shift_jis"},
++	"x-sjis":              {japanese.ShiftJIS, "shift_jis"},
++	"cseuckr":             {korean.EUCKR, "euc-kr"},
++	"csksc56011987":       {korean.EUCKR, "euc-kr"},
++	"euc-kr":              {korean.EUCKR, "euc-kr"},
++	"iso-ir-149":          {korean.EUCKR, "euc-kr"},
++	"korean":              {korean.EUCKR, "euc-kr"},
++	"ks_c_5601-1987":      {korean.EUCKR, "euc-kr"},
++	"ks_c_5601-1989":      {korean.EUCKR, "euc-kr"},
++	"ksc5601":             {korean.EUCKR, "euc-kr"},
++	"ksc_5601":            {korean.EUCKR, "euc-kr"},
++	"windows-949":         {korean.EUCKR, "euc-kr"},
++	"csiso2022kr":         {encoding.Replacement, "replacement"},
++	"iso-2022-kr":         {encoding.Replacement, "replacement"},
++	"iso-2022-cn":         {encoding.Replacement, "replacement"},
++	"iso-2022-cn-ext":     {encoding.Replacement, "replacement"},
++	"utf-16be":            {unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM), "utf-16be"},
++	"utf-16":              {unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM), "utf-16le"},
++	"utf-16le":            {unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM), "utf-16le"},
++	"x-user-defined":      {charmap.XUserDefined, "x-user-defined"},
++}
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-charset.html b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-charset.html
+new file mode 100644
+index 0000000..9915fa0
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-charset.html
+@@ -0,0 +1,48 @@
++<!DOCTYPE html>
++<html  lang="en" >
++<head>
++  <title>HTTP charset</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="The character encoding of a page can be set using the HTTP header charset declaration.">
++<style type='text/css'>
++.test div { width: 50px; }</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-15.css">
++</head>
++<body>
++<p class='title'>HTTP charset</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">The character encoding of a page can be set using the HTTP header charset declaration.</p>
++<div class="notes"><p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00C3;&#x0153;&#x00C3;&#x20AC;&#x00C3;&#x0161;</code>. This matches the sequence of bytes above when they are interpreted as ISO 8859-15. If the class name matches the selector then the test will pass.</p><p>The only character encoding declaration for this HTML file is in the HTTP header, which sets the encoding to ISO 8859-15.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-003">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-001<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#basics" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-001" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-UTF-8-BOM.html b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-UTF-8-BOM.html
+new file mode 100644
+index 0000000..26e5d8b
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-UTF-8-BOM.html
+@@ -0,0 +1,48 @@
++﻿<!DOCTYPE html>
++<html  lang="en" >
++<head>
++  <title>HTTP vs UTF-8 BOM</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="A character encoding set in the HTTP header has lower precedence than the UTF-8 signature.">
++<style type='text/css'>
++.test div { width: 50px; }</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-utf8.css">
++</head>
++<body>
++<p class='title'>HTTP vs UTF-8 BOM</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">A character encoding set in the HTTP header has lower precedence than the UTF-8 signature.</p>
++<div class="notes"><p><p>The HTTP header attempts to set the character encoding to ISO 8859-15. The page starts with a UTF-8 signature.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00FD;&#x00E4;&#x00E8;</code>. This matches the sequence of bytes above when they are interpreted as UTF-8. If the class name matches the selector then the test will pass.</p><p>If the test is unsuccessful, the characters &#x00EF;&#x00BB;&#x00BF; should appear at the top of the page.  These represent the bytes that make up the UTF-8 signature when encountered in the ISO 8859-15 encoding.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-022">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-034<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#precedence" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-034" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-meta-charset.html b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-meta-charset.html
+new file mode 100644
+index 0000000..2f07e95
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-meta-charset.html
+@@ -0,0 +1,49 @@
++<!DOCTYPE html>
++<html  lang="en" >
++<head>
++ <meta charset="iso-8859-1" > <title>HTTP vs meta charset</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="The HTTP header has a higher precedence than an encoding declaration in a meta charset attribute.">
++<style type='text/css'>
++.test div { width: 50px; }.test div { width: 90px; }
++</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-15.css">
++</head>
++<body>
++<p class='title'>HTTP vs meta charset</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">The HTTP header has a higher precedence than an encoding declaration in a meta charset attribute.</p>
++<div class="notes"><p><p>The HTTP header attempts to set the character encoding to ISO 8859-15. The page contains an encoding declaration in a meta charset attribute that attempts to set the character encoding to ISO 8859-1.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00C3;&#x0153;&#x00C3;&#x20AC;&#x00C3;&#x0161;</code>. This matches the sequence of bytes above when they are interpreted as ISO 8859-15. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-037">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-018<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#precedence" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-018" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-meta-content.html b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-meta-content.html
+new file mode 100644
+index 0000000..6853cdd
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/HTTP-vs-meta-content.html
+@@ -0,0 +1,49 @@
++<!DOCTYPE html>
++<html  lang="en" >
++<head>
++ <meta http-equiv="content-type" content="text/html;charset=iso-8859-1" > <title>HTTP vs meta content</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="The HTTP header has a higher precedence than an encoding declaration in a meta content attribute.">
++<style type='text/css'>
++.test div { width: 50px; }.test div { width: 90px; }
++</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-15.css">
++</head>
++<body>
++<p class='title'>HTTP vs meta content</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">The HTTP header has a higher precedence than an encoding declaration in a meta content attribute.</p>
++<div class="notes"><p><p>The HTTP header attempts to set the character encoding to ISO 8859-15. The page contains an encoding declaration in a meta content attribute that attempts to set the character encoding to ISO 8859-1.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00C3;&#x0153;&#x00C3;&#x20AC;&#x00C3;&#x0161;</code>. This matches the sequence of bytes above when they are interpreted as ISO 8859-15. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-018">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-016<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#precedence" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-016" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/No-encoding-declaration.html b/third_party/code.google.com/p/go.net/html/charset/testdata/No-encoding-declaration.html
+new file mode 100644
+index 0000000..612e26c
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/No-encoding-declaration.html
+@@ -0,0 +1,47 @@
++<!DOCTYPE html>
++<html  lang="en" >
++<head>
++  <title>No encoding declaration</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="A page with no encoding information in HTTP, BOM, XML declaration or meta element will be treated as UTF-8.">
++<style type='text/css'>
++.test div { width: 50px; }</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-utf8.css">
++</head>
++<body>
++<p class='title'>No encoding declaration</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">A page with no encoding information in HTTP, BOM, XML declaration or meta element will be treated as UTF-8.</p>
++<div class="notes"><p><p>The test on this page contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00FD;&#x00E4;&#x00E8;</code>. This matches the sequence of bytes above when they are interpreted as UTF-8. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-034">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-015<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#basics" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-015" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/README b/third_party/code.google.com/p/go.net/html/charset/testdata/README
+new file mode 100644
+index 0000000..a8e1fa4
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/README
+@@ -0,0 +1 @@
++These test cases come from http://www.w3.org/International/tests/html5/the-input-byte-stream/results-basics
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-16BE-BOM.html b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-16BE-BOM.html
+new file mode 100644
+index 0000000..3abf7a9
+Binary files /dev/null and b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-16BE-BOM.html differ
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-16LE-BOM.html b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-16LE-BOM.html
+new file mode 100644
+index 0000000..76254c9
+Binary files /dev/null and b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-16LE-BOM.html differ
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-8-BOM-vs-meta-charset.html b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-8-BOM-vs-meta-charset.html
+new file mode 100644
+index 0000000..83de433
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-8-BOM-vs-meta-charset.html
+@@ -0,0 +1,49 @@
++﻿<!DOCTYPE html>
++<html  lang="en" >
++<head>
++ <meta charset="iso-8859-15"> <title>UTF-8 BOM vs meta charset</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="A page with a UTF-8 BOM will be recognized as UTF-8 even if the meta charset attribute declares a different encoding.">
++<style type='text/css'>
++.test div { width: 50px; }.test div { width: 90px; }
++</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-utf8.css">
++</head>
++<body>
++<p class='title'>UTF-8 BOM vs meta charset</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">A page with a UTF-8 BOM will be recognized as UTF-8 even if the meta charset attribute declares a different encoding.</p>
++<div class="notes"><p><p>The page contains an encoding declaration in a meta charset attribute that attempts to set the character encoding to ISO 8859-15, but the file starts with a UTF-8 signature.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00FD;&#x00E4;&#x00E8;</code>. This matches the sequence of bytes above when they are interpreted as UTF-8. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-024">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-038<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#precedence" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-038" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-8-BOM-vs-meta-content.html b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-8-BOM-vs-meta-content.html
+new file mode 100644
+index 0000000..501aac2
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/UTF-8-BOM-vs-meta-content.html
+@@ -0,0 +1,48 @@
++﻿<!DOCTYPE html>
++<html  lang="en" >
++<head>
++ <meta http-equiv="content-type" content="text/html; charset=iso-8859-15"> <title>UTF-8 BOM vs meta content</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="A page with a UTF-8 BOM will be recognized as UTF-8 even if the meta content attribute declares a different encoding.">
++<style type='text/css'>
++.test div { width: 50px; }</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-utf8.css">
++</head>
++<body>
++<p class='title'>UTF-8 BOM vs meta content</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">A page with a UTF-8 BOM will be recognized as UTF-8 even if the meta content attribute declares a different encoding.</p>
++<div class="notes"><p><p>The page contains an encoding declaration in a meta content attribute that attempts to set the character encoding to ISO 8859-15, but the file starts with a UTF-8 signature.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00FD;&#x00E4;&#x00E8;</code>. This matches the sequence of bytes above when they are interpreted as UTF-8. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-038">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-037<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#precedence" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-037" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/meta-charset-attribute.html b/third_party/code.google.com/p/go.net/html/charset/testdata/meta-charset-attribute.html
+new file mode 100644
+index 0000000..2d7d25a
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/meta-charset-attribute.html
+@@ -0,0 +1,48 @@
++<!DOCTYPE html>
++<html  lang="en" >
++<head>
++ <meta charset="iso-8859-15"> <title>meta charset attribute</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="The character encoding of the page can be set by a meta element with charset attribute.">
++<style type='text/css'>
++.test div { width: 50px; }</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-15.css">
++</head>
++<body>
++<p class='title'>meta charset attribute</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">The character encoding of the page can be set by a meta element with charset attribute.</p>
++<div class="notes"><p><p>The only character encoding declaration for this HTML file is in the charset attribute of the meta element, which declares the encoding to be ISO 8859-15.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00C3;&#x0153;&#x00C3;&#x20AC;&#x00C3;&#x0161;</code>. This matches the sequence of bytes above when they are interpreted as ISO 8859-15. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-015">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-009<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#basics" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-009" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/html/charset/testdata/meta-content-attribute.html b/third_party/code.google.com/p/go.net/html/charset/testdata/meta-content-attribute.html
+new file mode 100644
+index 0000000..1c3f228
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/html/charset/testdata/meta-content-attribute.html
+@@ -0,0 +1,48 @@
++<!DOCTYPE html>
++<html  lang="en" >
++<head>
++ <meta http-equiv="content-type" content="text/html; charset=iso-8859-15"> <title>meta content attribute</title>
++<link rel='author' title='Richard Ishida' href='mailto:ishida@w3.org'>
++<link rel='help' href='http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream'>
++<link rel="stylesheet" type="text/css" href="./generatedtests.css">
++<script src="http://w3c-test.org/resources/testharness.js"></script>
++<script src="http://w3c-test.org/resources/testharnessreport.js"></script>
++<meta name='flags' content='http'>
++<meta name="assert" content="The character encoding of the page can be set by a meta element with http-equiv and content attributes.">
++<style type='text/css'>
++.test div { width: 50px; }</style>
++<link rel="stylesheet" type="text/css" href="the-input-byte-stream/support/encodingtests-15.css">
++</head>
++<body>
++<p class='title'>meta content attribute</p>
++
++
++<div id='log'></div>
++
++
++<div class='test'><div id='box' class='ýäè'>&#xA0;</div></div>
++
++
++
++
++
++<div class='description'>
++<p class="assertion" title="Assertion">The character encoding of the page can be set by a meta element with http-equiv and content attributes.</p>
++<div class="notes"><p><p>The only character encoding declaration for this HTML file is in the content attribute of the meta element, which declares the encoding to be ISO 8859-15.</p><p>The test contains a div with a class name that contains the following sequence of bytes: 0xC3 0xBD 0xC3 0xA4 0xC3 0xA8. These represent different sequences of characters in ISO 8859-15, ISO 8859-1 and UTF-8. The external, UTF-8-encoded stylesheet contains a selector <code>.test div.&#x00C3;&#x0153;&#x00C3;&#x20AC;&#x00C3;&#x0161;</code>. This matches the sequence of bytes above when they are interpreted as ISO 8859-15. If the class name matches the selector then the test will pass.</p></p>
++</div>
++</div>
++<div class="nexttest"><div><a href="generate?test=the-input-byte-stream-009">Next test</a></div><div class="doctype">HTML5</div>
++<p class="jump">the-input-byte-stream-007<br /><a href="/International/tests/html5/the-input-byte-stream/results-basics#basics" target="_blank">Result summary &amp; related tests</a><br /><a href="http://w3c-test.org/framework/details/i18n-html5/the-input-byte-stream-007" target="_blank">Detailed results for this test</a><br/>	<a href="http://www.w3.org/TR/html5/syntax.html#the-input-byte-stream" target="_blank">Link to spec</a></p>
++<div class='prereq'>Assumptions: <ul><li>The default encoding for the browser you are testing is not set to ISO 8859-15.</li>
++				<li>The test is read from a server that supports HTTP.</li></ul></div>
++</div>
++<script>
++test(function() {
++assert_equals(document.getElementById('box').offsetWidth, 100);
++}, " ");
++</script>
++
++</body>
++</html>
++
++
+diff --git a/third_party/code.google.com/p/go.net/ipv6/control_rfc2292_unix.go b/third_party/code.google.com/p/go.net/ipv6/control_rfc2292_unix.go
+new file mode 100644
+index 0000000..eef3968
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/control_rfc2292_unix.go
+@@ -0,0 +1,153 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build darwin
++
++package ipv6
++
++import (
++	"net"
++	"os"
++	"syscall"
++	"unsafe"
++)
++
++const pktinfo = FlagDst | FlagInterface
++
++func setControlMessage(fd int, opt *rawOpt, cf ControlFlags, on bool) error {
++	opt.Lock()
++	defer opt.Unlock()
++	if cf&FlagHopLimit != 0 {
++		if err := setIPv6ReceiveHopLimit(fd, on); err != nil {
++			return err
++		}
++		if on {
++			opt.set(FlagHopLimit)
++		} else {
++			opt.clear(FlagHopLimit)
++		}
++	}
++	if cf&pktinfo != 0 {
++		if err := setIPv6ReceivePacketInfo(fd, on); err != nil {
++			return err
++		}
++		if on {
++			opt.set(cf & pktinfo)
++		} else {
++			opt.clear(cf & pktinfo)
++		}
++	}
++	return nil
++}
++
++func newControlMessage(opt *rawOpt) (oob []byte) {
++	opt.Lock()
++	defer opt.Unlock()
++	l, off := 0, 0
++	if opt.isset(FlagHopLimit) {
++		l += syscall.CmsgSpace(4)
++	}
++	if opt.isset(pktinfo) {
++		l += syscall.CmsgSpace(sysSizeofPacketInfo)
++	}
++	if l > 0 {
++		oob = make([]byte, l)
++		if opt.isset(FlagHopLimit) {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockopt2292HopLimit
++			m.SetLen(syscall.CmsgLen(4))
++			off += syscall.CmsgSpace(4)
++		}
++		if opt.isset(pktinfo) {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockopt2292PacketInfo
++			m.SetLen(syscall.CmsgLen(sysSizeofPacketInfo))
++			off += syscall.CmsgSpace(sysSizeofPacketInfo)
++		}
++	}
++	return
++}
++
++func parseControlMessage(b []byte) (*ControlMessage, error) {
++	if len(b) == 0 {
++		return nil, nil
++	}
++	cmsgs, err := syscall.ParseSocketControlMessage(b)
++	if err != nil {
++		return nil, os.NewSyscallError("parse socket control message", err)
++	}
++	cm := &ControlMessage{}
++	for _, m := range cmsgs {
++		if m.Header.Level != ianaProtocolIPv6 {
++			continue
++		}
++		switch m.Header.Type {
++		case sysSockopt2292HopLimit:
++			cm.HopLimit = int(*(*byte)(unsafe.Pointer(&m.Data[:1][0])))
++		case sysSockopt2292PacketInfo:
++			pi := (*sysPacketInfo)(unsafe.Pointer(&m.Data[0]))
++			cm.IfIndex = int(pi.IfIndex)
++			cm.Dst = pi.IP[:]
++		}
++	}
++	return cm, nil
++}
++
++func marshalControlMessage(cm *ControlMessage) (oob []byte) {
++	if cm == nil {
++		return
++	}
++	l, off := 0, 0
++	if cm.HopLimit > 0 {
++		l += syscall.CmsgSpace(4)
++	}
++	pion := false
++	if cm.Src.To4() == nil && cm.Src.To16() != nil || cm.IfIndex != 0 {
++		pion = true
++		l += syscall.CmsgSpace(sysSizeofPacketInfo)
++	}
++	if len(cm.NextHop) == net.IPv6len {
++		l += syscall.CmsgSpace(syscall.SizeofSockaddrInet6)
++	}
++	if l > 0 {
++		oob = make([]byte, l)
++		if cm.HopLimit > 0 {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockopt2292HopLimit
++			m.SetLen(syscall.CmsgLen(4))
++			data := oob[off+syscall.CmsgLen(0):]
++			*(*byte)(unsafe.Pointer(&data[:1][0])) = byte(cm.HopLimit)
++			off += syscall.CmsgSpace(4)
++		}
++		if pion {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockopt2292PacketInfo
++			m.SetLen(syscall.CmsgLen(sysSizeofPacketInfo))
++			pi := (*sysPacketInfo)(unsafe.Pointer(&oob[off+syscall.CmsgLen(0)]))
++			if ip := cm.Src.To16(); ip != nil && ip.To4() == nil {
++				copy(pi.IP[:], ip)
++			}
++			if cm.IfIndex != 0 {
++				pi.IfIndex = uint32(cm.IfIndex)
++			}
++			off += syscall.CmsgSpace(sysSizeofPacketInfo)
++		}
++		if len(cm.NextHop) == net.IPv6len {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockopt2292NextHop
++			m.SetLen(syscall.CmsgLen(syscall.SizeofSockaddrInet6))
++			sa := (*syscall.RawSockaddrInet6)(unsafe.Pointer(&oob[off+syscall.CmsgLen(0)]))
++			sa.Len = syscall.SizeofSockaddrInet6
++			sa.Family = syscall.AF_INET6
++			copy(sa.Addr[:], cm.NextHop)
++			off += syscall.CmsgSpace(syscall.SizeofSockaddrInet6)
++		}
++	}
++	return
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/control_rfc3542_unix.go b/third_party/code.google.com/p/go.net/ipv6/control_rfc3542_unix.go
+new file mode 100644
+index 0000000..882a77b
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/control_rfc3542_unix.go
+@@ -0,0 +1,210 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build freebsd linux netbsd openbsd
++
++package ipv6
++
++import (
++	"net"
++	"os"
++	"syscall"
++	"unsafe"
++)
++
++const pktinfo = FlagDst | FlagInterface
++
++func setControlMessage(fd int, opt *rawOpt, cf ControlFlags, on bool) error {
++	opt.Lock()
++	defer opt.Unlock()
++	if cf&FlagTrafficClass != 0 {
++		if err := setIPv6ReceiveTrafficClass(fd, on); err != nil {
++			return err
++		}
++		if on {
++			opt.set(FlagTrafficClass)
++		} else {
++			opt.clear(FlagTrafficClass)
++		}
++	}
++	if cf&FlagHopLimit != 0 {
++		if err := setIPv6ReceiveHopLimit(fd, on); err != nil {
++			return err
++		}
++		if on {
++			opt.set(FlagHopLimit)
++		} else {
++			opt.clear(FlagHopLimit)
++		}
++	}
++	if cf&pktinfo != 0 {
++		if err := setIPv6ReceivePacketInfo(fd, on); err != nil {
++			return err
++		}
++		if on {
++			opt.set(cf & pktinfo)
++		} else {
++			opt.clear(cf & pktinfo)
++		}
++	}
++	if cf&FlagPathMTU != 0 {
++		if err := setIPv6ReceivePathMTU(fd, on); err != nil {
++			return err
++		}
++		if on {
++			opt.set(FlagPathMTU)
++		} else {
++			opt.clear(FlagPathMTU)
++		}
++	}
++	return nil
++}
++
++func newControlMessage(opt *rawOpt) (oob []byte) {
++	opt.Lock()
++	defer opt.Unlock()
++	l, off := 0, 0
++	if opt.isset(FlagTrafficClass) {
++		l += syscall.CmsgSpace(4)
++	}
++	if opt.isset(FlagHopLimit) {
++		l += syscall.CmsgSpace(4)
++	}
++	if opt.isset(pktinfo) {
++		l += syscall.CmsgSpace(sysSizeofPacketInfo)
++	}
++	if opt.isset(FlagPathMTU) {
++		l += syscall.CmsgSpace(sysSizeofMTUInfo)
++	}
++	if l > 0 {
++		oob = make([]byte, l)
++		if opt.isset(FlagTrafficClass) {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptReceiveTrafficClass
++			m.SetLen(syscall.CmsgLen(4))
++			off += syscall.CmsgSpace(4)
++		}
++		if opt.isset(FlagHopLimit) {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptReceiveHopLimit
++			m.SetLen(syscall.CmsgLen(4))
++			off += syscall.CmsgSpace(4)
++		}
++		if opt.isset(pktinfo) {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptReceivePacketInfo
++			m.SetLen(syscall.CmsgLen(sysSizeofPacketInfo))
++			off += syscall.CmsgSpace(sysSizeofPacketInfo)
++		}
++		if opt.isset(FlagPathMTU) {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptReceivePathMTU
++			m.SetLen(syscall.CmsgLen(sysSizeofMTUInfo))
++			off += syscall.CmsgSpace(sysSizeofMTUInfo)
++		}
++	}
++	return
++}
++
++func parseControlMessage(b []byte) (*ControlMessage, error) {
++	if len(b) == 0 {
++		return nil, nil
++	}
++	cmsgs, err := syscall.ParseSocketControlMessage(b)
++	if err != nil {
++		return nil, os.NewSyscallError("parse socket control message", err)
++	}
++	cm := &ControlMessage{}
++	for _, m := range cmsgs {
++		if m.Header.Level != ianaProtocolIPv6 {
++			continue
++		}
++		switch m.Header.Type {
++		case sysSockoptTrafficClass:
++			cm.TrafficClass = int(*(*byte)(unsafe.Pointer(&m.Data[:1][0])))
++		case sysSockoptHopLimit:
++			cm.HopLimit = int(*(*byte)(unsafe.Pointer(&m.Data[:1][0])))
++		case sysSockoptPacketInfo:
++			pi := (*sysPacketInfo)(unsafe.Pointer(&m.Data[0]))
++			cm.Dst = pi.IP[:]
++			cm.IfIndex = int(pi.IfIndex)
++		case sysSockoptPathMTU:
++			mi := (*sysMTUInfo)(unsafe.Pointer(&m.Data[0]))
++			cm.Dst = mi.Addr.Addr[:]
++			cm.IfIndex = int(mi.Addr.Scope_id)
++			cm.MTU = int(mi.MTU)
++		}
++	}
++	return cm, nil
++}
++
++func marshalControlMessage(cm *ControlMessage) (oob []byte) {
++	if cm == nil {
++		return
++	}
++	l, off := 0, 0
++	if cm.TrafficClass > 0 {
++		l += syscall.CmsgSpace(4)
++	}
++	if cm.HopLimit > 0 {
++		l += syscall.CmsgSpace(4)
++	}
++	pion := false
++	if cm.Src.To4() == nil && cm.Src.To16() != nil || cm.IfIndex != 0 {
++		pion = true
++		l += syscall.CmsgSpace(sysSizeofPacketInfo)
++	}
++	if len(cm.NextHop) == net.IPv6len {
++		l += syscall.CmsgSpace(syscall.SizeofSockaddrInet6)
++	}
++	if l > 0 {
++		oob = make([]byte, l)
++		if cm.TrafficClass > 0 {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptTrafficClass
++			m.SetLen(syscall.CmsgLen(4))
++			data := oob[off+syscall.CmsgLen(0):]
++			*(*byte)(unsafe.Pointer(&data[:1][0])) = byte(cm.TrafficClass)
++			off += syscall.CmsgSpace(4)
++		}
++		if cm.HopLimit > 0 {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptHopLimit
++			m.SetLen(syscall.CmsgLen(4))
++			data := oob[off+syscall.CmsgLen(0):]
++			*(*byte)(unsafe.Pointer(&data[:1][0])) = byte(cm.HopLimit)
++			off += syscall.CmsgSpace(4)
++		}
++		if pion {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptPacketInfo
++			m.SetLen(syscall.CmsgLen(sysSizeofPacketInfo))
++			pi := (*sysPacketInfo)(unsafe.Pointer(&oob[off+syscall.CmsgLen(0)]))
++			if ip := cm.Src.To16(); ip != nil && ip.To4() == nil {
++				copy(pi.IP[:], ip)
++			}
++			if cm.IfIndex != 0 {
++				pi.IfIndex = uint32(cm.IfIndex)
++			}
++			off += syscall.CmsgSpace(sysSizeofPacketInfo)
++		}
++		if len(cm.NextHop) == net.IPv6len {
++			m := (*syscall.Cmsghdr)(unsafe.Pointer(&oob[off]))
++			m.Level = ianaProtocolIPv6
++			m.Type = sysSockoptNextHop
++			m.SetLen(syscall.CmsgLen(syscall.SizeofSockaddrInet6))
++			sa := (*syscall.RawSockaddrInet6)(unsafe.Pointer(&oob[off+syscall.CmsgLen(0)]))
++			setSockaddr(sa, cm.NextHop, cm.IfIndex)
++			off += syscall.CmsgSpace(syscall.SizeofSockaddrInet6)
++		}
++	}
++	return
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sockopt_rfc2292_unix.go b/third_party/code.google.com/p/go.net/ipv6/sockopt_rfc2292_unix.go
+new file mode 100644
+index 0000000..827e943
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sockopt_rfc2292_unix.go
+@@ -0,0 +1,73 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build darwin
++
++package ipv6
++
++import (
++	"os"
++	"unsafe"
++)
++
++func ipv6ReceiveTrafficClass(fd int) (bool, error) {
++	return false, errNotSupported
++}
++
++func setIPv6ReceiveTrafficClass(fd int, v bool) error {
++	return errNotSupported
++}
++
++func ipv6ReceiveHopLimit(fd int) (bool, error) {
++	var v int32
++	l := sysSockoptLen(4)
++	if err := getsockopt(fd, ianaProtocolIPv6, sysSockopt2292HopLimit, uintptr(unsafe.Pointer(&v)), &l); err != nil {
++		return false, os.NewSyscallError("getsockopt", err)
++	}
++	return v == 1, nil
++}
++
++func setIPv6ReceiveHopLimit(fd int, v bool) error {
++	vv := int32(boolint(v))
++	return os.NewSyscallError("setsockopt", setsockopt(fd, ianaProtocolIPv6, sysSockopt2292HopLimit, uintptr(unsafe.Pointer(&vv)), 4))
++}
++
++func ipv6ReceivePacketInfo(fd int) (bool, error) {
++	var v int32
++	l := sysSockoptLen(4)
++	if err := getsockopt(fd, ianaProtocolIPv6, sysSockopt2292PacketInfo, uintptr(unsafe.Pointer(&v)), &l); err != nil {
++		return false, os.NewSyscallError("getsockopt", err)
++	}
++	return v == 1, nil
++}
++
++func setIPv6ReceivePacketInfo(fd int, v bool) error {
++	vv := int32(boolint(v))
++	return os.NewSyscallError("setsockopt", setsockopt(fd, ianaProtocolIPv6, sysSockopt2292PacketInfo, uintptr(unsafe.Pointer(&vv)), 4))
++}
++
++func ipv6PathMTU(fd int) (int, error) {
++	return 0, errNotSupported
++}
++
++func ipv6ReceivePathMTU(fd int) (bool, error) {
++	return false, errNotSupported
++}
++
++func setIPv6ReceivePathMTU(fd int, v bool) error {
++	return errNotSupported
++}
++
++func ipv6ICMPFilter(fd int) (*ICMPFilter, error) {
++	var v ICMPFilter
++	l := sysSockoptLen(sysSizeofICMPFilter)
++	if err := getsockopt(fd, ianaProtocolIPv6ICMP, sysSockoptICMPFilter, uintptr(unsafe.Pointer(&v.sysICMPFilter)), &l); err != nil {
++		return nil, os.NewSyscallError("getsockopt", err)
++	}
++	return &v, nil
++}
++
++func setIPv6ICMPFilter(fd int, f *ICMPFilter) error {
++	return os.NewSyscallError("setsockopt", setsockopt(fd, ianaProtocolIPv6ICMP, sysSockoptICMPFilter, uintptr(unsafe.Pointer(&f.sysICMPFilter)), sysSizeofICMPFilter))
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sys.go b/third_party/code.google.com/p/go.net/ipv6/sys.go
+new file mode 100644
+index 0000000..18b1aca
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sys.go
+@@ -0,0 +1,23 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ipv6
++
++type sysSockoptLen uint32
++
++const (
++	sysSizeofPacketInfo   = 0x14
++	sysSizeofMulticastReq = 0x14
++	sysSizeofICMPFilter   = 0x20
++)
++
++type sysPacketInfo struct {
++	IP      [16]byte
++	IfIndex uint32
++}
++
++type sysMulticastReq struct {
++	IP      [16]byte
++	IfIndex uint32
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sys_bsd.go b/third_party/code.google.com/p/go.net/ipv6/sys_bsd.go
+new file mode 100644
+index 0000000..4a08217
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sys_bsd.go
+@@ -0,0 +1,48 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build freebsd netbsd openbsd
++
++package ipv6
++
++import (
++	"net"
++	"syscall"
++)
++
++// RFC 3493 options
++const (
++	// See /usr/include/netinet6/in6.h.
++	sysSockoptUnicastHopLimit    = 0x4
++	sysSockoptMulticastHopLimit  = 0xa
++	sysSockoptMulticastInterface = 0x9
++	sysSockoptMulticastLoopback  = 0xb
++	sysSockoptJoinGroup          = 0xc
++	sysSockoptLeaveGroup         = 0xd
++)
++
++// RFC 3542 options
++const (
++	// See /usr/include/netinet6/in6.h.
++	sysSockoptReceiveTrafficClass = 0x39
++	sysSockoptTrafficClass        = 0x3d
++	sysSockoptReceiveHopLimit     = 0x25
++	sysSockoptHopLimit            = 0x2f
++	sysSockoptReceivePacketInfo   = 0x24
++	sysSockoptPacketInfo          = 0x2e
++	sysSockoptReceivePathMTU      = 0x2b
++	sysSockoptPathMTU             = 0x2c
++	sysSockoptNextHop             = 0x30
++	sysSockoptChecksum            = 0x1a
++
++	// See /usr/include/netinet6/in6.h.
++	sysSockoptICMPFilter = 0x12
++)
++
++func setSockaddr(sa *syscall.RawSockaddrInet6, ip net.IP, ifindex int) {
++	sa.Len = syscall.SizeofSockaddrInet6
++	sa.Family = syscall.AF_INET6
++	copy(sa.Addr[:], ip)
++	sa.Scope_id = uint32(ifindex)
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sys_darwin.go b/third_party/code.google.com/p/go.net/ipv6/sys_darwin.go
+new file mode 100644
+index 0000000..3d07dff
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sys_darwin.go
+@@ -0,0 +1,54 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ipv6
++
++import (
++	"net"
++	"syscall"
++)
++
++// RFC 2292 options
++const (
++	// See /usr/include/netinet6/in6.h.
++	sysSockopt2292HopLimit   = 0x14
++	sysSockopt2292PacketInfo = 0x13
++	sysSockopt2292NextHop    = 0x15
++)
++
++// RFC 3493 options
++const (
++	// See /usr/include/netinet6/in6.h.
++	sysSockoptUnicastHopLimit    = 0x4
++	sysSockoptMulticastHopLimit  = 0xa
++	sysSockoptMulticastInterface = 0x9
++	sysSockoptMulticastLoopback  = 0xb
++	sysSockoptJoinGroup          = 0xc
++	sysSockoptLeaveGroup         = 0xd
++)
++
++// RFC 3542 options
++const (
++	// See /usr/include/netinet6/in6.h.
++	sysSockoptReceiveTrafficClass = 0x23
++	sysSockoptTrafficClass        = 0x24
++	sysSockoptReceiveHopLimit     = 0x25
++	sysSockoptHopLimit            = 0x2f
++	sysSockoptReceivePacketInfo   = 0x3d
++	sysSockoptPacketInfo          = 0x2e
++	sysSockoptReceivePathMTU      = 0x2b
++	sysSockoptPathMTU             = 0x2c
++	sysSockoptNextHop             = 0x30
++	sysSockoptChecksum            = 0x1a
++
++	// See /usr/include/netinet6/in6.h.
++	sysSockoptICMPFilter = 0x12
++)
++
++func setSockaddr(sa *syscall.RawSockaddrInet6, ip net.IP, ifindex int) {
++	sa.Len = syscall.SizeofSockaddrInet6
++	sa.Family = syscall.AF_INET6
++	copy(sa.Addr[:], ip)
++	sa.Scope_id = uint32(ifindex)
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sys_linux.go b/third_party/code.google.com/p/go.net/ipv6/sys_linux.go
+new file mode 100644
+index 0000000..d90c8cb
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sys_linux.go
+@@ -0,0 +1,45 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ipv6
++
++import (
++	"net"
++	"syscall"
++)
++
++// RFC 3493 options
++const (
++	// See /usr/include/linux/in6.h.
++	sysSockoptUnicastHopLimit    = 0x10
++	sysSockoptMulticastHopLimit  = 0x12
++	sysSockoptMulticastInterface = 0x11
++	sysSockoptMulticastLoopback  = 0x13
++	sysSockoptJoinGroup          = 0x14
++	sysSockoptLeaveGroup         = 0x15
++)
++
++// RFC 3542 options
++const (
++	// See /usr/include/linux/ipv6.h,in6.h.
++	sysSockoptReceiveTrafficClass = 0x42
++	sysSockoptTrafficClass        = 0x43
++	sysSockoptReceiveHopLimit     = 0x33
++	sysSockoptHopLimit            = 0x34
++	sysSockoptReceivePacketInfo   = 0x31
++	sysSockoptPacketInfo          = 0x32
++	sysSockoptReceivePathMTU      = 0x3c
++	sysSockoptPathMTU             = 0x3d
++	sysSockoptNextHop             = 0x9
++	sysSockoptChecksum            = 0x7
++
++	// See /usr/include/linux/icmpv6.h.
++	sysSockoptICMPFilter = 0x1
++)
++
++func setSockaddr(sa *syscall.RawSockaddrInet6, ip net.IP, ifindex int) {
++	sa.Family = syscall.AF_INET6
++	copy(sa.Addr[:], ip)
++	sa.Scope_id = uint32(ifindex)
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sys_unix.go b/third_party/code.google.com/p/go.net/ipv6/sys_unix.go
+new file mode 100644
+index 0000000..40cdfc4
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sys_unix.go
+@@ -0,0 +1,16 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build darwin freebsd linux netbsd openbsd
++
++package ipv6
++
++import "syscall"
++
++const sysSizeofMTUInfo = 0x20
++
++type sysMTUInfo struct {
++	Addr syscall.RawSockaddrInet6
++	MTU  uint32
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/sys_windows.go b/third_party/code.google.com/p/go.net/ipv6/sys_windows.go
+new file mode 100644
+index 0000000..c09672f
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/sys_windows.go
+@@ -0,0 +1,33 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ipv6
++
++import (
++	"net"
++	"syscall"
++)
++
++// RFC 3493 options
++const (
++	// See ws2tcpip.h.
++	sysSockoptUnicastHopLimit    = 0x4
++	sysSockoptMulticastHopLimit  = 0xa
++	sysSockoptMulticastInterface = 0x9
++	sysSockoptMulticastLoopback  = 0xb
++	sysSockoptJoinGroup          = 0xc
++	sysSockoptLeaveGroup         = 0xd
++)
++
++// RFC 3542 options
++const (
++	// See ws2tcpip.h.
++	sysSockoptPacketInfo = 0x13
++)
++
++func setSockaddr(sa *syscall.RawSockaddrInet6, ip net.IP, ifindex int) {
++	sa.Family = syscall.AF_INET6
++	copy(sa.Addr[:], ip)
++	sa.Scope_id = uint32(ifindex)
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/syscall_linux_386.go b/third_party/code.google.com/p/go.net/ipv6/syscall_linux_386.go
+new file mode 100644
+index 0000000..a386636
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/syscall_linux_386.go
+@@ -0,0 +1,42 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// This code is a duplicate of syscall/syscall_linux_386.go with small
++// modifications.
++
++package ipv6
++
++import (
++	"syscall"
++	"unsafe"
++)
++
++// On x86 Linux, all the socket calls go through an extra indirection,
++// I think because the 5-register system call interface can't handle
++// the 6-argument calls like sendto and recvfrom. Instead the
++// arguments to the underlying system call are the number below and a
++// pointer to an array of uintptr. We hide the pointer in the
++// socketcall assembly to avoid allocation on every system call.
++
++const (
++	// See /usr/include/linux/net.h.
++	_SETSOCKOPT = 14
++	_GETSOCKOPT = 15
++)
++
++var socketcall func(call int, a0, a1, a2, a3, a4, a5 uintptr) (int, syscall.Errno)
++
++func getsockopt(fd int, level int, name int, v uintptr, l *sysSockoptLen) error {
++	if _, errno := socketcall(_GETSOCKOPT, uintptr(fd), uintptr(level), uintptr(name), uintptr(v), uintptr(unsafe.Pointer(l)), 0); errno != 0 {
++		return error(errno)
++	}
++	return nil
++}
++
++func setsockopt(fd int, level int, name int, v uintptr, l uintptr) error {
++	if _, errno := socketcall(_SETSOCKOPT, uintptr(fd), uintptr(level), uintptr(name), v, l, 0); errno != 0 {
++		return error(errno)
++	}
++	return nil
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/syscall_linux_386.s b/third_party/code.google.com/p/go.net/ipv6/syscall_linux_386.s
+new file mode 100644
+index 0000000..34c0457
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/syscall_linux_386.s
+@@ -0,0 +1,56 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// This code is a duplicate of syscall/syscall_linux_386.s with small
++// modifications.
++
++#define SYS_SOCKETCALL	102	// from zsysnum_linux_386.go
++
++// func socketcallnosplit7(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, errno int)
++// Kernel interface gets call sub-number and pointer to a0 for Go 1.1.
++TEXT ·socketcallnosplit7(SB),7,$0
++	CALL	runtime·entersyscall(SB)
++	MOVL	$SYS_SOCKETCALL, AX	// syscall entry
++	MOVL	4(SP), BX		// socket call number
++	LEAL	8(SP), CX		// pointer to call arguments
++	MOVL	$0, DX
++	MOVL	$0, SI
++	MOVL	$0, DI
++	CALL	*runtime·_vdso(SB)
++	CMPL	AX, $0xfffff001
++	JLS	ok1
++	MOVL	$-1, 32(SP)		// n
++	NEGL	AX
++	MOVL	AX, 36(SP)		// errno
++	CALL	runtime·exitsyscall(SB)
++	RET
++ok1:
++	MOVL	AX, 32(SP)		// n
++	MOVL	$0, 36(SP)		// errno
++	CALL	runtime·exitsyscall(SB)
++	RET
++
++// func socketcallnosplit4(call int, a0, a1, a2, a3, a4, a5 uintptr) (n int, errno int)
++// Kernel interface gets call sub-number and pointer to a0 for Go 1.2.
++TEXT ·socketcallnosplit4(SB),4,$0-40
++	CALL	runtime·entersyscall(SB)
++	MOVL	$SYS_SOCKETCALL, AX	// syscall entry
++	MOVL	4(SP), BX		// socket call number
++	LEAL	8(SP), CX		// pointer to call arguments
++	MOVL	$0, DX
++	MOVL	$0, SI
++	MOVL	$0, DI
++	CALL	*runtime·_vdso(SB)
++	CMPL	AX, $0xfffff001
++	JLS	ok2
++	MOVL	$-1, 32(SP)		// n
++	NEGL	AX
++	MOVL	AX, 36(SP)		// errno
++	CALL	runtime·exitsyscall(SB)
++	RET
++ok2:
++	MOVL	AX, 32(SP)		// n
++	MOVL	$0, 36(SP)		// errno
++	CALL	runtime·exitsyscall(SB)
++	RET
+diff --git a/third_party/code.google.com/p/go.net/ipv6/syscall_nosplit4_linux_386.go b/third_party/code.google.com/p/go.net/ipv6/syscall_nosplit4_linux_386.go
+new file mode 100644
+index 0000000..6d4ac09
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/syscall_nosplit4_linux_386.go
+@@ -0,0 +1,15 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build go1.2
++
++package ipv6
++
++import "syscall"
++
++func socketcallnosplit4(call int, a0, a1, a2, a3, a4, a5 uintptr) (int, syscall.Errno)
++
++func init() {
++	socketcall = socketcallnosplit4
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/syscall_nosplit7_linux_386.go b/third_party/code.google.com/p/go.net/ipv6/syscall_nosplit7_linux_386.go
+new file mode 100644
+index 0000000..2e4da7b
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/syscall_nosplit7_linux_386.go
+@@ -0,0 +1,15 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build go1.1,!go1.2
++
++package ipv6
++
++import "syscall"
++
++func socketcallnosplit7(call int, a0, a1, a2, a3, a4, a5 uintptr) (int, syscall.Errno)
++
++func init() {
++	socketcall = socketcallnosplit7
++}
+diff --git a/third_party/code.google.com/p/go.net/ipv6/syscall_unix.go b/third_party/code.google.com/p/go.net/ipv6/syscall_unix.go
+new file mode 100644
+index 0000000..d88dab5
+--- /dev/null
++++ b/third_party/code.google.com/p/go.net/ipv6/syscall_unix.go
+@@ -0,0 +1,26 @@
++// Copyright 2013 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build darwin freebsd linux,amd64 linux,arm netbsd openbsd
++
++package ipv6
++
++import (
++	"syscall"
++	"unsafe"
++)
++
++func getsockopt(fd int, level, name int, v uintptr, l *sysSockoptLen) error {
++	if _, _, errno := syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd), uintptr(level), uintptr(name), uintptr(v), uintptr(unsafe.Pointer(l)), 0); errno != 0 {
++		return error(errno)
++	}
++	return nil
++}
++
++func setsockopt(fd int, level int, name int, v uintptr, l uintptr) error {
++	if _, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(level), uintptr(name), uintptr(v), uintptr(l), 0); errno != 0 {
++		return error(errno)
++	}
++	return nil
++}

@@ -1,0 +1,204 @@
+commit ce7536e5640a1be53d5bd0be9954b8622d13969b
+Author: Blake Mizerany <blake.mizerany@gmail.com>
+Date:   Tue Aug 19 18:47:10 2014 -0700
+
+    raft2: wip - to bring in ../raft soon
+
+diff --git a/raft2/node.go b/raft2/node.go
+new file mode 100644
+index 0000000..de32a69
+--- /dev/null
++++ b/raft2/node.go
+@@ -0,0 +1,94 @@
++// Package raft implements raft.
++package raft
++
++import "code.google.com/p/go.net/context"
++
++type stateResp struct {
++	state State
++	ents  []Entry
++	msgs  []Message
++}
++
++type proposal struct {
++	id   int64
++	data []byte
++}
++
++type Node struct {
++	ctx    context.Context
++	propc  chan proposal
++	recvc  chan Message
++	statec chan stateResp
++}
++
++func Start(ctx context.Context, name string, election, heartbeat int) *Node {
++	n := &Node{
++		ctx:    ctx,
++		propc:  make(chan proposal),
++		recvc:  make(chan Message),
++		statec: make(chan stateResp),
++	}
++	r := &raft{
++		name:      name,
++		election:  election,
++		heartbeat: heartbeat,
++	}
++	go n.run(r)
++	return n
++}
++
++func (n *Node) run(r *raft) {
++	propc := n.propc
++
++	for {
++		if r.hasLeader() {
++			propc = n.propc
++		} else {
++			// We cannot accept proposals because we don't know who
++			// to send them to, so we'll apply back-pressure and
++			// block senders.
++			propc = nil
++		}
++
++		select {
++		case p := <-propc:
++			r.propose(p.id, p.data)
++		case m := <-n.recvc:
++			r.step(m)
++		case n.statec <- stateResp{r.State, r.ents, r.msgs}:
++			r.resetState()
++		case <-n.ctx.Done():
++			return
++		}
++	}
++}
++
++// Propose proposes data be appended to the log.
++func (n *Node) Propose(id int64, data []byte) error {
++	select {
++	case n.propc <- proposal{id, data}:
++		return nil
++	case <-n.ctx.Done():
++		return n.ctx.Err()
++	}
++}
++
++// Step advances the state machine using m.
++func (n *Node) Step(m Message) error {
++	select {
++	case n.recvc <- m:
++		return nil
++	case <-n.ctx.Done():
++		return n.ctx.Err()
++	}
++}
++
++// ReadMessages returns the current point-in-time state.
++func (n *Node) ReadState() (State, []Entry, []Message, error) {
++	select {
++	case sr := <-n.statec:
++		return sr.state, sr.ents, sr.msgs, nil
++	case <-n.ctx.Done():
++		return State{}, nil, nil, n.ctx.Err()
++	}
++}
+diff --git a/raft2/node_test.go b/raft2/node_test.go
+new file mode 100644
+index 0000000..0a0cadc
+--- /dev/null
++++ b/raft2/node_test.go
+@@ -0,0 +1,5 @@
++package raft
++
++import "testing"
++
++func TestNode(t *testing.T) {}
+diff --git a/raft2/raft.go b/raft2/raft.go
+new file mode 100644
+index 0000000..358d391
+--- /dev/null
++++ b/raft2/raft.go
+@@ -0,0 +1,34 @@
++package raft
++
++type State struct {
++	CommitIndex int64
++}
++
++type Message struct {
++	State State
++	To    string
++	Data  []byte
++}
++
++type Entry struct {
++	Id    int64
++	Index int64
++	Data  []byte
++}
++
++type raft struct {
++	name string
++
++	State
++
++	election  int
++	heartbeat int
++
++	msgs []Message
++	ents []Entry
++}
++
++func (sm *raft) hasLeader() bool               { return false }
++func (sm *raft) step(m Message)                {}
++func (sm *raft) resetState()                   {}
++func (sm *raft) propose(id int64, data []byte) {}
+diff --git a/raft2/sync.go b/raft2/sync.go
+new file mode 100644
+index 0000000..109a5b4
+--- /dev/null
++++ b/raft2/sync.go
+@@ -0,0 +1,41 @@
++package raft
++
++import (
++	"code.google.com/p/go.net/context"
++	"github.com/coreos/etcd/wait"
++)
++
++type SyncNode struct {
++	n *Node
++	w wait.WaitList
++}
++
++func NewSyncNode(n *Node) *SyncNode { panic("not implemented") }
++
++type waitResp struct {
++	e   Entry
++	err error
++}
++
++func (n *SyncNode) Propose(ctx context.Context, id int64, data []byte) (Entry, error) {
++	ch := n.w.Register(id)
++	n.n.Propose(id, data)
++	select {
++	case x := <-ch:
++		wr := x.(waitResp)
++		return wr.e, wr.err
++	case <-ctx.Done():
++		n.w.Trigger(id, nil) // GC the Wait
++		return Entry{}, ctx.Err()
++	}
++}
++
++func (n *SyncNode) ReadState() (State, []Entry, []Message, error) {
++	st, ents, msgs, err := n.n.ReadState()
++	for _, e := range ents {
++		if e.Index >= st.CommitIndex {
++			n.w.Trigger(e.Id, waitResp{e: e, err: nil})
++		}
++	}
++	return st, ents, msgs, err
++}

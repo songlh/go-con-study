@@ -1,0 +1,292 @@
+commit 8396da3e838514acb1b5c8ff9b909c5fb21e9a18
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Tue Mar 22 11:00:54 2016 -0700
+
+    etcdctlv3: add dial timeout flag
+    
+    Fix https://github.com/coreos/etcd/issues/4836.
+
+diff --git a/e2e/etcd_test.go b/e2e/etcd_test.go
+index 586b73d..bb505cd 100644
+--- a/e2e/etcd_test.go
++++ b/e2e/etcd_test.go
+@@ -183,6 +183,7 @@ type etcdProcessClusterConfig struct {
+ 	isPeerTLS     bool
+ 	isPeerAutoTLS bool
+ 	initialToken  string
++	isV3          bool
+ }
+ 
+ // newEtcdProcessCluster launches a new cluster from etcd processes, returning
+@@ -283,6 +284,9 @@ func (cfg *etcdProcessClusterConfig) etcdProcessConfigs() []*etcdProcessConfig {
+ 			"--initial-cluster-token", cfg.initialToken,
+ 			"--data-dir", dataDirPath,
+ 		}
++		if cfg.isV3 {
++			args = append(args, "--experimental-v3demo")
++		}
+ 
+ 		args = append(args, cfg.tlsArgs()...)
+ 
+diff --git a/e2e/etcdctlv3_test.go b/e2e/etcdctlv3_test.go
+new file mode 100644
+index 0000000..84835e0
+--- /dev/null
++++ b/e2e/etcdctlv3_test.go
+@@ -0,0 +1,154 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package e2e
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/coreos/etcd/pkg/fileutil"
++	"github.com/coreos/etcd/pkg/testutil"
++)
++
++func TestCtlV3SetQuorum(t *testing.T) {
++	testCtlV3Set(t, &configNoTLS, 3*time.Second, true)
++}
++
++func TestCtlV3SetQuorumZeroTimeout(t *testing.T) {
++	testCtlV3Set(t, &configNoTLS, 0, true)
++}
++
++func TestCtlV3SetQuorumTimeout(t *testing.T) {
++	testCtlV3Set(t, &configNoTLS, time.Nanosecond, true)
++}
++
++func TestCtlV3SetPeerTLSQuorum(t *testing.T) {
++	testCtlV3Set(t, &configPeerTLS, 3*time.Second, true)
++}
++
++func testCtlV3Set(t *testing.T, cfg *etcdProcessClusterConfig, dialTimeout time.Duration, quorum bool) {
++	defer testutil.AfterTest(t)
++
++	epc := setupCtlV3Test(t, cfg, quorum)
++	defer func() {
++		if errC := epc.Close(); errC != nil {
++			t.Fatalf("error closing etcd processes (%v)", errC)
++		}
++	}()
++
++	key, value := "foo", "bar"
++
++	donec := make(chan struct{})
++	go func() {
++		if err := ctlV3Put(epc, key, value, dialTimeout); err != nil {
++			if dialTimeout > 0 && dialTimeout <= time.Nanosecond && isGRPCTimedout(err) { // timeout expected
++				donec <- struct{}{}
++				return
++			}
++			t.Fatalf("put error (%v)", err)
++		}
++		if err := ctlV3Get(epc, key, value, dialTimeout, quorum); err != nil {
++			if dialTimeout > 0 && dialTimeout <= time.Nanosecond && isGRPCTimedout(err) { // timeout expected
++				donec <- struct{}{}
++				return
++			}
++			t.Fatalf("get error (%v)", err)
++		}
++		donec <- struct{}{}
++	}()
++
++	select {
++	case <-time.After(2*dialTimeout + time.Second):
++		if dialTimeout > 0 {
++			t.Fatalf("test timed out for %v", dialTimeout)
++		}
++	case <-donec:
++	}
++}
++
++func ctlV3PrefixArgs(clus *etcdProcessCluster, dialTimeout time.Duration) []string {
++	if len(clus.proxies()) > 0 { // TODO: add proxy check as in v2
++		panic("v3 proxy not implemented")
++	}
++
++	endpoints := ""
++	if backends := clus.backends(); len(backends) != 0 {
++		es := []string{}
++		for _, b := range backends {
++			es = append(es, stripSchema(b.cfg.acurl.String()))
++		}
++		endpoints = strings.Join(es, ",")
++	}
++	cmdArgs := []string{"../bin/etcdctlv3", "--endpoints", endpoints, "--dial-timeout", dialTimeout.String()}
++	if clus.cfg.isClientTLS {
++		cmdArgs = append(cmdArgs, "--cacert", caPath, "--cert", certPath, "--key", privateKeyPath)
++	}
++	return cmdArgs
++}
++
++func ctlV3Put(clus *etcdProcessCluster, key, value string, dialTimeout time.Duration) error {
++	cmdArgs := append(ctlV3PrefixArgs(clus, dialTimeout), "put", key, value)
++	return spawnWithExpectedString(cmdArgs, "OK")
++}
++
++func ctlV3Get(clus *etcdProcessCluster, key, value string, dialTimeout time.Duration, quorum bool) error {
++	if !quorum { // TODO: add serialized option
++		panic("serialized option is not implemented")
++	}
++
++	cmdArgs := append(ctlV3PrefixArgs(clus, dialTimeout), "get", key)
++
++	// TODO: match by value. Currently it prints out both key and value in multi-lines.
++	return spawnWithExpectedString(cmdArgs, key)
++}
++
++func mustCtlV3(t *testing.T) {
++	if !fileutil.Exist("../bin/etcdctlv3") {
++		t.Fatalf("could not find etcdctlv3 binary")
++	}
++}
++
++func setupCtlV3Test(t *testing.T, cfg *etcdProcessClusterConfig, quorum bool) *etcdProcessCluster {
++	if !quorum { // TODO: add serialized option
++		panic("serialized option is not implemented")
++	}
++
++	mustCtlV3(t)
++	if !quorum {
++		cfg = configStandalone(*cfg)
++	}
++	copied := *cfg
++	copied.isV3 = true
++	epc, err := newEtcdProcessCluster(&copied)
++	if err != nil {
++		t.Fatalf("could not start etcd process cluster (%v)", err)
++	}
++	return epc
++}
++
++func isGRPCTimedout(err error) bool {
++	return strings.Contains(err.Error(), "grpc: timed out trying to connect")
++}
++
++func stripSchema(s string) string {
++	if strings.HasPrefix(s, "http://") {
++		s = strings.Replace(s, "http://", "", -1)
++	}
++	if strings.HasPrefix(s, "https://") {
++		s = strings.Replace(s, "https://", "", -1)
++	}
++	return s
++}
+diff --git a/etcdctlv3/command/global.go b/etcdctlv3/command/global.go
+index a0ea35a..cbdb79e 100644
+--- a/etcdctlv3/command/global.go
++++ b/etcdctlv3/command/global.go
+@@ -28,7 +28,8 @@ import (
+ // GlobalFlags are flags that defined globally
+ // and are inherited to all sub-commands.
+ type GlobalFlags struct {
+-	Endpoints []string
++	Endpoints   []string
++	DialTimeout time.Duration
+ 
+ 	TLS transport.TLSInfo
+ 
+@@ -44,6 +45,8 @@ func mustClientFromCmd(cmd *cobra.Command) *clientv3.Client {
+ 		ExitWithError(ExitError, err)
+ 	}
+ 
++	dialTimeout := dialTimeoutFromCmd(cmd)
++
+ 	var cert, key, cacert string
+ 	if cert, err = cmd.Flags().GetString("cert"); err != nil {
+ 		ExitWithError(ExitBadArgs, err)
+@@ -69,10 +72,10 @@ func mustClientFromCmd(cmd *cobra.Command) *clientv3.Client {
+ 		ExitWithError(ExitBadFeature, errors.New("unsupported output format"))
+ 	}
+ 
+-	return mustClient(endpoints, cert, key, cacert)
++	return mustClient(endpoints, dialTimeout, cert, key, cacert)
+ }
+ 
+-func mustClient(endpoints []string, cert, key, cacert string) *clientv3.Client {
++func mustClient(endpoints []string, dialTimeout time.Duration, cert, key, cacert string) *clientv3.Client {
+ 	// set tls if any one tls option set
+ 	var cfgtls *transport.TLSInfo
+ 	tls := transport.TLSInfo{}
+@@ -94,7 +97,7 @@ func mustClient(endpoints []string, cert, key, cacert string) *clientv3.Client {
+ 
+ 	cfg := clientv3.Config{
+ 		Endpoints:   endpoints,
+-		DialTimeout: 20 * time.Second,
++		DialTimeout: dialTimeout,
+ 	}
+ 	if cfgtls != nil {
+ 		clientTLS, err := cfgtls.ClientConfig()
+@@ -122,3 +125,11 @@ func argOrStdin(args []string, stdin io.Reader, i int) (string, error) {
+ 	}
+ 	return string(bytes), nil
+ }
++
++func dialTimeoutFromCmd(cmd *cobra.Command) time.Duration {
++	dialTimeout, err := cmd.Flags().GetDuration("dial-timeout")
++	if err != nil {
++		ExitWithError(ExitError, err)
++	}
++	return dialTimeout
++}
+diff --git a/etcdctlv3/command/make_mirror_command.go b/etcdctlv3/command/make_mirror_command.go
+index fa105b5..c2e249d 100644
+--- a/etcdctlv3/command/make_mirror_command.go
++++ b/etcdctlv3/command/make_mirror_command.go
+@@ -57,7 +57,9 @@ func makeMirrorCommandFunc(cmd *cobra.Command, args []string) {
+ 		ExitWithError(ExitBadArgs, errors.New("make-mirror takes one destination arguement."))
+ 	}
+ 
+-	dc := mustClient([]string{args[0]}, mmcert, mmkey, mmcacert)
++	dialTimeout := dialTimeoutFromCmd(cmd)
++
++	dc := mustClient([]string{args[0]}, dialTimeout, mmcert, mmkey, mmcacert)
+ 	c := mustClientFromCmd(cmd)
+ 
+ 	err := makeMirror(context.TODO(), c, dc)
+diff --git a/etcdctlv3/main.go b/etcdctlv3/main.go
+index c0f4014..4322948 100644
+--- a/etcdctlv3/main.go
++++ b/etcdctlv3/main.go
+@@ -17,6 +17,7 @@ package main
+ 
+ import (
+ 	"text/tabwriter"
++	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
+ 	"github.com/coreos/etcd/etcdctlv3/command"
+@@ -25,6 +26,8 @@ import (
+ const (
+ 	cliName        = "etcdctlv3"
+ 	cliDescription = "A simple command line client for etcd3."
++
++	defaultDialTimeout = 2 * time.Second
+ )
+ 
+ var (
+@@ -46,6 +49,8 @@ func init() {
+ 	rootCmd.PersistentFlags().StringVarP(&globalFlags.OutputFormat, "write-out", "w", "simple", "set the output format (simple, json, protobuf)")
+ 	rootCmd.PersistentFlags().BoolVar(&globalFlags.IsHex, "hex", false, "print byte strings as hex encoded strings")
+ 
++	rootCmd.PersistentFlags().DurationVar(&globalFlags.DialTimeout, "dial-timeout", defaultDialTimeout, "dial timeout for client connections")
++
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.TLS.CertFile, "cert", "", "identify secure client using this TLS certificate file")
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.TLS.KeyFile, "key", "", "identify secure client using this TLS key file")
+ 	rootCmd.PersistentFlags().StringVar(&globalFlags.TLS.CAFile, "cacert", "", "verify certificates of TLS-enabled secure servers using this CA bundle")

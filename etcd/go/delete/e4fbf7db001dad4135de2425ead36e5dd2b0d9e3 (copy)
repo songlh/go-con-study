@@ -1,0 +1,307 @@
+commit e4fbf7db001dad4135de2425ead36e5dd2b0d9e3
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Wed Sep 21 04:16:50 2016 -0700
+
+    raftexample: implement Raft snapshot
+
+diff --git a/contrib/raftexample/httpapi.go b/contrib/raftexample/httpapi.go
+index 044066a..10d3a5d 100644
+--- a/contrib/raftexample/httpapi.go
++++ b/contrib/raftexample/httpapi.go
+@@ -18,7 +18,6 @@ import (
+ 	"io/ioutil"
+ 	"log"
+ 	"net/http"
+-	"os"
+ 	"strconv"
+ 
+ 	"github.com/coreos/etcd/raft/raftpb"
+@@ -102,25 +101,22 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // serveHttpKVAPI starts a key-value server with a GET/PUT API and listens.
+-func serveHttpKVAPI(port int, proposeC chan<- string, confChangeC chan<- raftpb.ConfChange,
+-	commitC <-chan *string, errorC <-chan error) {
+-
+-	// exit when raft goes down
+-	go func() {
+-		if err, ok := <-errorC; ok {
+-			log.Fatal(err)
+-		}
+-		os.Exit(0)
+-	}()
+-
++func serveHttpKVAPI(kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
+ 	srv := http.Server{
+ 		Addr: ":" + strconv.Itoa(port),
+ 		Handler: &httpKVAPI{
+-			store:       newKVStore(proposeC, commitC, errorC),
++			store:       kv,
+ 			confChangeC: confChangeC,
+ 		},
+ 	}
+-	if err := srv.ListenAndServe(); err != nil {
++	go func() {
++		if err := srv.ListenAndServe(); err != nil {
++			log.Fatal(err)
++		}
++	}()
++
++	// exit when raft goes down
++	if err, ok := <-errorC; ok {
+ 		log.Fatal(err)
+ 	}
+ }
+diff --git a/contrib/raftexample/kvstore.go b/contrib/raftexample/kvstore.go
+index 1070f6f..5651cf0 100644
+--- a/contrib/raftexample/kvstore.go
++++ b/contrib/raftexample/kvstore.go
+@@ -20,13 +20,16 @@ import (
+ 	"encoding/json"
+ 	"log"
+ 	"sync"
++
++	"github.com/coreos/etcd/snap"
+ )
+ 
+ // a key-value store backed by raft
+ type kvstore struct {
+-	proposeC chan<- string // channel for proposing updates
+-	mu       sync.RWMutex
+-	kvStore  map[string]string // current committed key-value pairs
++	proposeC    chan<- string // channel for proposing updates
++	mu          sync.RWMutex
++	kvStore     map[string]string // current committed key-value pairs
++	snapshotter *snap.Snapshotter
+ }
+ 
+ type kv struct {
+@@ -34,8 +37,8 @@ type kv struct {
+ 	Val string
+ }
+ 
+-func newKVStore(proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
+-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string)}
++func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
++	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+ 	// replay log into key-value map
+ 	s.readCommits(commitC, errorC)
+ 	// read commits from raft into kvStore map until error
+@@ -62,7 +65,18 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
+ 	for data := range commitC {
+ 		if data == nil {
+ 			// done replaying log; new data incoming
+-			return
++			// OR signaled to load snapshot
++			snapshot, err := s.snapshotter.Load()
++			if err == snap.ErrNoSnapshot {
++				return
++			}
++			if err != nil && err != snap.ErrNoSnapshot {
++				log.Panic(err)
++			}
++			log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
++			if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
++				log.Panic(err)
++			}
+ 		}
+ 
+ 		var dataKv kv
+diff --git a/contrib/raftexample/main.go b/contrib/raftexample/main.go
+index 8c3943a..5826924 100644
+--- a/contrib/raftexample/main.go
++++ b/contrib/raftexample/main.go
+@@ -34,8 +34,12 @@ func main() {
+ 	defer close(confChangeC)
+ 
+ 	// raft provides a commit stream for the proposals from the http api
+-	commitC, errorC := newRaftNode(*id, strings.Split(*cluster, ","), *join, proposeC, confChangeC)
++	var kvs *kvstore
++	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
++	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
++
++	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+ 
+ 	// the key-value http handler will propose updates to raft
+-	serveHttpKVAPI(*kvport, proposeC, confChangeC, commitC, errorC)
++	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
+ }
+diff --git a/contrib/raftexample/raft.go b/contrib/raftexample/raft.go
+index 7cb6aa0..b1defe2 100644
+--- a/contrib/raftexample/raft.go
++++ b/contrib/raftexample/raft.go
+@@ -43,12 +43,13 @@ type raftNode struct {
+ 	commitC     chan<- *string           // entries committed to log (k,v)
+ 	errorC      chan<- error             // errors from raft session
+ 
+-	id        int      // client ID for raft session
+-	peers     []string // raft peer URLs
+-	join      bool     // node is joining an existing cluster
+-	waldir    string   // path to WAL directory
+-	snapdir   string   // path to snapshot directory
+-	lastIndex uint64   // index of log at start
++	id          int      // client ID for raft session
++	peers       []string // raft peer URLs
++	join        bool     // node is joining an existing cluster
++	waldir      string   // path to WAL directory
++	snapdir     string   // path to snapshot directory
++	getSnapshot func() ([]byte, error)
++	lastIndex   uint64 // index of log at start
+ 
+ 	confState     raftpb.ConfState
+ 	snapshotIndex uint64
+@@ -58,20 +59,26 @@ type raftNode struct {
+ 	node        raft.Node
+ 	raftStorage *raft.MemoryStorage
+ 	wal         *wal.WAL
+-	snapshotter *snap.Snapshotter
+-	transport   *rafthttp.Transport
+-	stopc       chan struct{} // signals proposal channel closed
+-	httpstopc   chan struct{} // signals http server to shutdown
+-	httpdonec   chan struct{} // signals http server shutdown complete
++
++	snapshotter      *snap.Snapshotter
++	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
++
++	snapCount uint64
++	transport *rafthttp.Transport
++	stopc     chan struct{} // signals proposal channel closed
++	httpstopc chan struct{} // signals http server to shutdown
++	httpdonec chan struct{} // signals http server shutdown complete
+ }
+ 
++var defaultSnapCount uint64 = 10000
++
+ // newRaftNode initiates a raft instance and returns a committed log entry
+ // channel and error channel. Proposals for log updates are sent over the
+ // provided the proposal channel. All log entries are replayed over the
+ // commit channel, followed by a nil message (to indicate the channel is
+ // current), then new log entries. To shutdown, close proposeC and read errorC.
+-func newRaftNode(id int, peers []string, join bool, proposeC <-chan string,
+-	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error) {
++func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
++	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
+ 
+ 	commitC := make(chan *string)
+ 	errorC := make(chan error)
+@@ -86,14 +93,18 @@ func newRaftNode(id int, peers []string, join bool, proposeC <-chan string,
+ 		join:        join,
+ 		waldir:      fmt.Sprintf("raftexample-%d", id),
+ 		snapdir:     fmt.Sprintf("raftexample-%d-snap", id),
++		getSnapshot: getSnapshot,
+ 		raftStorage: raft.NewMemoryStorage(),
++		snapCount:   defaultSnapCount,
+ 		stopc:       make(chan struct{}),
+ 		httpstopc:   make(chan struct{}),
+ 		httpdonec:   make(chan struct{}),
++
++		snapshotterReady: make(chan *snap.Snapshotter, 1),
+ 		// rest of structure populated after WAL replay
+ 	}
+ 	go rc.startRaft()
+-	return commitC, errorC
++	return commitC, errorC, rc.snapshotterReady
+ }
+ 
+ func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
+@@ -229,9 +240,11 @@ func (rc *raftNode) startRaft() {
+ 			log.Fatalf("raftexample: cannot create dir for snapshot (%v)", err)
+ 		}
+ 	}
++	rc.snapshotter = snap.New(rc.snapdir)
++	rc.snapshotterReady <- rc.snapshotter
++
+ 	oldwal := wal.Exist(rc.waldir)
+ 	rc.wal = rc.replayWAL()
+-	rc.snapshotter = snap.New(rc.snapdir)
+ 
+ 	rpeers := make([]raft.Peer, len(rc.peers))
+ 	for i := range rpeers {
+@@ -293,6 +306,56 @@ func (rc *raftNode) stopHTTP() {
+ 	<-rc.httpdonec
+ }
+ 
++func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
++	if raft.IsEmptySnap(snapshotToSave) {
++		return
++	}
++
++	log.Printf("publishing snapshot at index %d", rc.snapshotIndex)
++	defer log.Printf("finished publishing snapshot at index %d", rc.snapshotIndex)
++
++	if snapshotToSave.Metadata.Index <= rc.appliedIndex {
++		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d] + 1", snapshotToSave.Metadata.Index, rc.appliedIndex)
++	}
++	rc.commitC <- nil // trigger kvstore to load snapshot
++
++	rc.confState = snapshotToSave.Metadata.ConfState
++	rc.snapshotIndex = snapshotToSave.Metadata.Index
++	rc.appliedIndex = snapshotToSave.Metadata.Index
++}
++
++var snapshotCatchUpEntriesN uint64 = 10000
++
++func (rc *raftNode) maybeTriggerSnapshot() {
++	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
++		return
++	}
++
++	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
++	data, err := rc.getSnapshot()
++	if err != nil {
++		log.Panic(err)
++	}
++	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex, &rc.confState, data)
++	if err != nil {
++		panic(err)
++	}
++	if err := rc.saveSnap(snap); err != nil {
++		panic(err)
++	}
++
++	compactIndex := uint64(1)
++	if rc.appliedIndex > snapshotCatchUpEntriesN {
++		compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
++	}
++	if err := rc.raftStorage.Compact(compactIndex); err != nil {
++		panic(err)
++	}
++
++	log.Printf("compacted log at index %d", compactIndex)
++	rc.snapshotIndex = rc.appliedIndex
++}
++
+ func (rc *raftNode) serveChannels() {
+ 	snap, err := rc.raftStorage.Snapshot()
+ 	if err != nil {
+@@ -347,15 +410,15 @@ func (rc *raftNode) serveChannels() {
+ 			if !raft.IsEmptySnap(rd.Snapshot) {
+ 				rc.saveSnap(rd.Snapshot)
+ 				rc.raftStorage.ApplySnapshot(rd.Snapshot)
++				rc.publishSnapshot(rd.Snapshot)
+ 			}
+ 			rc.raftStorage.Append(rd.Entries)
+ 			rc.transport.Send(rd.Messages)
+-			// TODO: apply snapshot
+ 			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
+ 				rc.stop()
+ 				return
+ 			}
+-			// TODO: trigger snapshot
++			rc.maybeTriggerSnapshot()
+ 			rc.node.Advance()
+ 
+ 		case err := <-rc.transport.ErrorC:
+diff --git a/contrib/raftexample/raftexample_test.go b/contrib/raftexample/raftexample_test.go
+index 89c8190..1ee0ca5 100644
+--- a/contrib/raftexample/raftexample_test.go
++++ b/contrib/raftexample/raftexample_test.go
+@@ -50,7 +50,7 @@ func newCluster(n int) *cluster {
+ 		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
+ 		clus.proposeC[i] = make(chan string, 1)
+ 		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
+-		clus.commitC[i], clus.errorC[i] = newRaftNode(i+1, clus.peers, false, clus.proposeC[i], clus.confChangeC[i])
++		clus.commitC[i], clus.errorC[i], _ = newRaftNode(i+1, clus.peers, false, nil, clus.proposeC[i], clus.confChangeC[i])
+ 	}
+ 
+ 	return clus

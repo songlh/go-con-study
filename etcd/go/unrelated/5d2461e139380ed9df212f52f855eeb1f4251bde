@@ -1,0 +1,185 @@
+commit 5d2461e139380ed9df212f52f855eeb1f4251bde
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Mon Nov 27 13:39:21 2017 -0800
+
+    clientv3: add Lvl method to logger
+    
+    Signed-off-by: Gyu-Ho Lee <gyuhox@gmail.com>
+
+diff --git a/clientv3/logger.go b/clientv3/logger.go
+index 012abdb..782e313 100644
+--- a/clientv3/logger.go
++++ b/clientv3/logger.go
+@@ -23,10 +23,23 @@ import (
+ 
+ // Logger is the logger used by client library.
+ // It implements grpclog.LoggerV2 interface.
+-type Logger grpclog.LoggerV2
++type Logger interface {
++	grpclog.LoggerV2
++
++	// Lvl returns logger if logger's verbosity level >= "lvl".
++	// Otherwise, logger that discards all logs.
++	Lvl(lvl int) Logger
++
++	// to satisfy capnslog
++
++	Print(args ...interface{})
++	Printf(format string, args ...interface{})
++	Println(args ...interface{})
++}
+ 
+ var (
+-	logger settableLogger
++	loggerMu sync.RWMutex
++	logger   Logger
+ )
+ 
+ type settableLogger struct {
+@@ -36,38 +49,35 @@ type settableLogger struct {
+ 
+ func init() {
+ 	// disable client side logs by default
+-	logger.mu.Lock()
+-	logger.l = grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard)
+-
+-	// logger has to override the grpclog at initialization so that
+-	// any changes to the grpclog go through logger with locking
+-	// instead of through SetLogger
+-	//
+-	// now updates only happen through settableLogger.set
+-	grpclog.SetLoggerV2(&logger)
+-	logger.mu.Unlock()
++	logger = &settableLogger{}
++	SetLogger(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
+ }
+ 
+-// SetLogger sets client-side Logger. By default, logs are disabled.
+-func SetLogger(l Logger) {
+-	logger.set(l)
++// SetLogger sets client-side Logger.
++func SetLogger(l grpclog.LoggerV2) {
++	loggerMu.Lock()
++	logger = NewLogger(l)
++	// override grpclog so that any changes happen with locking
++	grpclog.SetLoggerV2(logger)
++	loggerMu.Unlock()
+ }
+ 
+ // GetLogger returns the current logger.
+ func GetLogger() Logger {
+-	return logger.get()
++	loggerMu.RLock()
++	l := logger
++	loggerMu.RUnlock()
++	return l
+ }
+ 
+-func (s *settableLogger) set(l Logger) {
+-	s.mu.Lock()
+-	logger.l = l
+-	grpclog.SetLoggerV2(&logger)
+-	s.mu.Unlock()
++// NewLogger returns a new Logger with grpclog.LoggerV2.
++func NewLogger(gl grpclog.LoggerV2) Logger {
++	return &settableLogger{l: gl}
+ }
+ 
+-func (s *settableLogger) get() Logger {
++func (s *settableLogger) get() grpclog.LoggerV2 {
+ 	s.mu.RLock()
+-	l := logger.l
++	l := s.l
+ 	s.mu.RUnlock()
+ 	return l
+ }
+@@ -94,3 +104,32 @@ func (s *settableLogger) Print(args ...interface{})                 { s.get().In
+ func (s *settableLogger) Printf(format string, args ...interface{}) { s.get().Infof(format, args...) }
+ func (s *settableLogger) Println(args ...interface{})               { s.get().Infoln(args...) }
+ func (s *settableLogger) V(l int) bool                              { return s.get().V(l) }
++func (s *settableLogger) Lvl(lvl int) Logger {
++	s.mu.RLock()
++	l := s.l
++	s.mu.RUnlock()
++	if l.V(lvl) {
++		return s
++	}
++	return &noLogger{}
++}
++
++type noLogger struct{}
++
++func (*noLogger) Info(args ...interface{})                    {}
++func (*noLogger) Infof(format string, args ...interface{})    {}
++func (*noLogger) Infoln(args ...interface{})                  {}
++func (*noLogger) Warning(args ...interface{})                 {}
++func (*noLogger) Warningf(format string, args ...interface{}) {}
++func (*noLogger) Warningln(args ...interface{})               {}
++func (*noLogger) Error(args ...interface{})                   {}
++func (*noLogger) Errorf(format string, args ...interface{})   {}
++func (*noLogger) Errorln(args ...interface{})                 {}
++func (*noLogger) Fatal(args ...interface{})                   {}
++func (*noLogger) Fatalf(format string, args ...interface{})   {}
++func (*noLogger) Fatalln(args ...interface{})                 {}
++func (*noLogger) Print(args ...interface{})                   {}
++func (*noLogger) Printf(format string, args ...interface{})   {}
++func (*noLogger) Println(args ...interface{})                 {}
++func (*noLogger) V(l int) bool                                { return false }
++func (ng *noLogger) Lvl(lvl int) Logger                       { return ng }
+diff --git a/clientv3/logger_test.go b/clientv3/logger_test.go
+new file mode 100644
+index 0000000..e54d48a
+--- /dev/null
++++ b/clientv3/logger_test.go
+@@ -0,0 +1,51 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package clientv3
++
++import (
++	"bytes"
++	"io/ioutil"
++	"strings"
++	"testing"
++
++	"google.golang.org/grpc/grpclog"
++)
++
++func TestLogger(t *testing.T) {
++	buf := new(bytes.Buffer)
++
++	l := NewLogger(grpclog.NewLoggerV2WithVerbosity(buf, buf, buf, 10))
++	l.Infof("hello world!")
++	if !strings.Contains(buf.String(), "hello world!") {
++		t.Fatalf("expected 'hello world!', got %q", buf.String())
++	}
++	buf.Reset()
++
++	l.Lvl(10).Infof("Level 10")
++	l.Lvl(30).Infof("Level 30")
++	if !strings.Contains(buf.String(), "Level 10") {
++		t.Fatalf("expected 'Level 10', got %q", buf.String())
++	}
++	if strings.Contains(buf.String(), "Level 30") {
++		t.Fatalf("unexpected 'Level 30', got %q", buf.String())
++	}
++	buf.Reset()
++
++	l = NewLogger(grpclog.NewLoggerV2(ioutil.Discard, ioutil.Discard, ioutil.Discard))
++	l.Infof("ignore this")
++	if len(buf.Bytes()) > 0 {
++		t.Fatalf("unexpected logs %q", buf.String())
++	}
++}

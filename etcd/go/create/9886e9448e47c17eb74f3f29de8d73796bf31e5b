@@ -1,0 +1,410 @@
+commit 9886e9448e47c17eb74f3f29de8d73796bf31e5b
+Author: Hitoshi Mitake <mitake.hitoshi@lab.ntt.co.jp>
+Date:   Thu Nov 24 16:34:29 2016 +0900
+
+    auth, etcdserver: let maintenance services require root role
+    
+    This commit lets maintenance services require root privilege. It also
+    moves AuthInfoFromCtx() from etcdserver to auth pkg for cleaning purpose.
+
+diff --git a/auth/store.go b/auth/store.go
+index d6f820d..8037d6d 100644
+--- a/auth/store.go
++++ b/auth/store.go
+@@ -20,6 +20,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 
+@@ -29,6 +30,7 @@ import (
+ 	"github.com/coreos/pkg/capnslog"
+ 	"golang.org/x/crypto/bcrypt"
+ 	"golang.org/x/net/context"
++	"google.golang.org/grpc/metadata"
+ )
+ 
+ var (
+@@ -57,6 +59,7 @@ var (
+ 	ErrPermissionNotGranted = errors.New("auth: permission is not granted to the role")
+ 	ErrAuthNotEnabled       = errors.New("auth: authentication is not enabled")
+ 	ErrAuthOldRevision      = errors.New("auth: revision in header is old")
++	ErrInvalidAuthToken     = errors.New("auth: invalid auth token")
+ 
+ 	// BcryptCost is the algorithm cost / strength for hashing auth passwords
+ 	BcryptCost = bcrypt.DefaultCost
+@@ -153,6 +156,9 @@ type AuthStore interface {
+ 
+ 	// Close does cleanup of AuthStore
+ 	Close() error
++
++	// AuthInfoFromCtx gets AuthInfo from gRPC's context
++	AuthInfoFromCtx(ctx context.Context) (*AuthInfo, error)
+ }
+ 
+ type authStore struct {
+@@ -167,6 +173,8 @@ type authStore struct {
+ 	simpleTokenKeeper *simpleTokenTTLKeeper
+ 
+ 	revision uint64
++
++	indexWaiter func(uint64) <-chan struct{}
+ }
+ 
+ func (as *authStore) AuthEnable() error {
+@@ -871,7 +879,7 @@ func (as *authStore) isAuthEnabled() bool {
+ 	return as.enabled
+ }
+ 
+-func NewAuthStore(be backend.Backend) *authStore {
++func NewAuthStore(be backend.Backend, indexWaiter func(uint64) <-chan struct{}) *authStore {
+ 	tx := be.BatchTx()
+ 	tx.Lock()
+ 
+@@ -883,6 +891,7 @@ func NewAuthStore(be backend.Backend) *authStore {
+ 		be:           be,
+ 		simpleTokens: make(map[string]string),
+ 		revision:     0,
++		indexWaiter:  indexWaiter,
+ 	}
+ 
+ 	as.commitRevision(tx)
+@@ -921,3 +930,46 @@ func getRevision(tx backend.BatchTx) uint64 {
+ func (as *authStore) Revision() uint64 {
+ 	return as.revision
+ }
++
++func (as *authStore) isValidSimpleToken(token string, ctx context.Context) bool {
++	splitted := strings.Split(token, ".")
++	if len(splitted) != 2 {
++		return false
++	}
++	index, err := strconv.Atoi(splitted[1])
++	if err != nil {
++		return false
++	}
++
++	select {
++	case <-as.indexWaiter(uint64(index)):
++		return true
++	case <-ctx.Done():
++	}
++
++	return false
++}
++
++func (as *authStore) AuthInfoFromCtx(ctx context.Context) (*AuthInfo, error) {
++	md, ok := metadata.FromContext(ctx)
++	if !ok {
++		return nil, nil
++	}
++
++	ts, tok := md["token"]
++	if !tok {
++		return nil, nil
++	}
++
++	token := ts[0]
++	if !as.isValidSimpleToken(token, ctx) {
++		return nil, ErrInvalidAuthToken
++	}
++
++	authInfo, uok := as.AuthInfoFromToken(token)
++	if !uok {
++		plog.Warningf("invalid auth token: %s", token)
++		return nil, ErrInvalidAuthToken
++	}
++	return authInfo, nil
++}
+diff --git a/auth/store_test.go b/auth/store_test.go
+index ad3a94e..2e59629 100644
+--- a/auth/store_test.go
++++ b/auth/store_test.go
+@@ -26,6 +26,14 @@ import (
+ 
+ func init() { BcryptCost = bcrypt.MinCost }
+ 
++func dummyIndexWaiter(index uint64) <-chan struct{} {
++	ch := make(chan struct{})
++	go func() {
++		ch <- struct{}{}
++	}()
++	return ch
++}
++
+ func TestUserAdd(t *testing.T) {
+ 	b, tPath := backend.NewDefaultTmpBackend()
+ 	defer func() {
+@@ -33,7 +41,7 @@ func TestUserAdd(t *testing.T) {
+ 		os.Remove(tPath)
+ 	}()
+ 
+-	as := NewAuthStore(b)
++	as := NewAuthStore(b, dummyIndexWaiter)
+ 	ua := &pb.AuthUserAddRequest{Name: "foo"}
+ 	_, err := as.UserAdd(ua) // add a non-existing user
+ 	if err != nil {
+@@ -80,7 +88,7 @@ func TestCheckPassword(t *testing.T) {
+ 		os.Remove(tPath)
+ 	}()
+ 
+-	as := NewAuthStore(b)
++	as := NewAuthStore(b, dummyIndexWaiter)
+ 	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+@@ -125,7 +133,7 @@ func TestUserDelete(t *testing.T) {
+ 		os.Remove(tPath)
+ 	}()
+ 
+-	as := NewAuthStore(b)
++	as := NewAuthStore(b, dummyIndexWaiter)
+ 	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+@@ -162,7 +170,7 @@ func TestUserChangePassword(t *testing.T) {
+ 		os.Remove(tPath)
+ 	}()
+ 
+-	as := NewAuthStore(b)
++	as := NewAuthStore(b, dummyIndexWaiter)
+ 	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+@@ -208,7 +216,7 @@ func TestRoleAdd(t *testing.T) {
+ 		os.Remove(tPath)
+ 	}()
+ 
+-	as := NewAuthStore(b)
++	as := NewAuthStore(b, dummyIndexWaiter)
+ 	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+@@ -229,7 +237,7 @@ func TestUserGrant(t *testing.T) {
+ 		os.Remove(tPath)
+ 	}()
+ 
+-	as := NewAuthStore(b)
++	as := NewAuthStore(b, dummyIndexWaiter)
+ 	defer as.Close()
+ 	err := enableAuthAndCreateRoot(as)
+ 	if err != nil {
+diff --git a/etcdserver/api/v3rpc/maintenance.go b/etcdserver/api/v3rpc/maintenance.go
+index 20af20f..a59e6f9 100644
+--- a/etcdserver/api/v3rpc/maintenance.go
++++ b/etcdserver/api/v3rpc/maintenance.go
+@@ -18,6 +18,7 @@ import (
+ 	"crypto/sha256"
+ 	"io"
+ 
++	"github.com/coreos/etcd/auth"
+ 	"github.com/coreos/etcd/etcdserver"
+ 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+ 	"github.com/coreos/etcd/mvcc"
+@@ -45,6 +46,10 @@ type RaftStatusGetter interface {
+ 	Leader() types.ID
+ }
+ 
++type AuthGetter interface {
++	AuthStore() auth.AuthStore
++}
++
+ type maintenanceServer struct {
+ 	rg  RaftStatusGetter
+ 	kg  KVGetter
+@@ -54,7 +59,8 @@ type maintenanceServer struct {
+ }
+ 
+ func NewMaintenanceServer(s *etcdserver.EtcdServer) pb.MaintenanceServer {
+-	return &maintenanceServer{rg: s, kg: s, bg: s, a: s, hdr: newHeader(s)}
++	srv := &maintenanceServer{rg: s, kg: s, bg: s, a: s, hdr: newHeader(s)}
++	return &authMaintenanceServer{srv, s}
+ }
+ 
+ func (ms *maintenanceServer) Defragment(ctx context.Context, sr *pb.DefragmentRequest) (*pb.DefragmentResponse, error) {
+@@ -139,3 +145,49 @@ func (ms *maintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (
+ 	ms.hdr.fill(resp.Header)
+ 	return resp, nil
+ }
++
++type authMaintenanceServer struct {
++	*maintenanceServer
++	ag AuthGetter
++}
++
++func (ams *authMaintenanceServer) isAuthenticated(ctx context.Context) error {
++	authInfo, err := ams.ag.AuthStore().AuthInfoFromCtx(ctx)
++	if err != nil {
++		return err
++	}
++
++	return ams.ag.AuthStore().IsAdminPermitted(authInfo)
++}
++
++func (ams *authMaintenanceServer) Defragment(ctx context.Context, sr *pb.DefragmentRequest) (*pb.DefragmentResponse, error) {
++	if err := ams.isAuthenticated(ctx); err != nil {
++		return nil, err
++	}
++
++	return ams.maintenanceServer.Defragment(ctx, sr)
++}
++
++func (ams *authMaintenanceServer) Snapshot(sr *pb.SnapshotRequest, srv pb.Maintenance_SnapshotServer) error {
++	if err := ams.isAuthenticated(srv.Context()); err != nil {
++		return err
++	}
++
++	return ams.maintenanceServer.Snapshot(sr, srv)
++}
++
++func (ams *authMaintenanceServer) Hash(ctx context.Context, r *pb.HashRequest) (*pb.HashResponse, error) {
++	if err := ams.isAuthenticated(ctx); err != nil {
++		return nil, err
++	}
++
++	return ams.maintenanceServer.Hash(ctx, r)
++}
++
++func (ams *authMaintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (*pb.StatusResponse, error) {
++	if err := ams.isAuthenticated(ctx); err != nil {
++		return nil, err
++	}
++
++	return ams.maintenanceServer.Status(ctx, ar)
++}
+diff --git a/etcdserver/api/v3rpc/util.go b/etcdserver/api/v3rpc/util.go
+index 26dcc89..5a057ed 100644
+--- a/etcdserver/api/v3rpc/util.go
++++ b/etcdserver/api/v3rpc/util.go
+@@ -93,7 +93,7 @@ func togRPCError(err error) error {
+ 		return rpctypes.ErrGRPCPermissionNotGranted
+ 	case auth.ErrAuthNotEnabled:
+ 		return rpctypes.ErrGRPCAuthNotEnabled
+-	case etcdserver.ErrInvalidAuthToken:
++	case auth.ErrInvalidAuthToken:
+ 		return rpctypes.ErrGRPCInvalidAuthToken
+ 	default:
+ 		return grpc.Errorf(codes.Unknown, err.Error())
+diff --git a/etcdserver/errors.go b/etcdserver/errors.go
+index ce9d0cd..5edc155 100644
+--- a/etcdserver/errors.go
++++ b/etcdserver/errors.go
+@@ -31,7 +31,6 @@ var (
+ 	ErrNoLeader                   = errors.New("etcdserver: no leader")
+ 	ErrRequestTooLarge            = errors.New("etcdserver: request is too large")
+ 	ErrNoSpace                    = errors.New("etcdserver: no space")
+-	ErrInvalidAuthToken           = errors.New("etcdserver: invalid auth token")
+ 	ErrTooManyRequests            = errors.New("etcdserver: too many requests")
+ 	ErrUnhealthy                  = errors.New("etcdserver: unhealthy cluster")
+ )
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 37621c7..cf67702 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -459,7 +459,10 @@ func NewServer(cfg *ServerConfig) (srv *EtcdServer, err error) {
+ 	}
+ 	srv.consistIndex.setConsistentIndex(srv.kv.ConsistentIndex())
+ 
+-	srv.authStore = auth.NewAuthStore(srv.be)
++	srv.authStore = auth.NewAuthStore(srv.be,
++		func(index uint64) <-chan struct{} {
++			return srv.applyWait.Wait(index)
++		})
+ 	if h := cfg.AutoCompactionRetention; h != 0 {
+ 		srv.compactor = compactor.NewPeriodic(h, srv.kv, srv)
+ 		srv.compactor.Run()
+@@ -1019,7 +1022,7 @@ func (s *EtcdServer) checkMembershipOperationPermission(ctx context.Context) err
+ 	// in the state machine layer
+ 	// However, both of membership change and role management requires the root privilege.
+ 	// So careful operation by admins can prevent the problem.
+-	authInfo, err := s.authInfoFromCtx(ctx)
++	authInfo, err := s.AuthStore().AuthInfoFromCtx(ctx)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/etcdserver/v3_server.go b/etcdserver/v3_server.go
+index ac80f38..f78bd56 100644
+--- a/etcdserver/v3_server.go
++++ b/etcdserver/v3_server.go
+@@ -17,8 +17,6 @@ package etcdserver
+ import (
+ 	"bytes"
+ 	"encoding/binary"
+-	"strconv"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/auth"
+@@ -31,7 +29,6 @@ import (
+ 
+ 	"github.com/coreos/go-semver/semver"
+ 	"golang.org/x/net/context"
+-	"google.golang.org/grpc/metadata"
+ )
+ 
+ const (
+@@ -617,52 +614,10 @@ func (s *EtcdServer) RoleDelete(ctx context.Context, r *pb.AuthRoleDeleteRequest
+ 	return result.resp.(*pb.AuthRoleDeleteResponse), nil
+ }
+ 
+-func (s *EtcdServer) isValidSimpleToken(token string) bool {
+-	splitted := strings.Split(token, ".")
+-	if len(splitted) != 2 {
+-		return false
+-	}
+-	index, err := strconv.Atoi(splitted[1])
+-	if err != nil {
+-		return false
+-	}
+-
+-	select {
+-	case <-s.applyWait.Wait(uint64(index)):
+-		return true
+-	case <-s.stop:
+-		return true
+-	}
+-}
+-
+-func (s *EtcdServer) authInfoFromCtx(ctx context.Context) (*auth.AuthInfo, error) {
+-	md, ok := metadata.FromContext(ctx)
+-	if !ok {
+-		return nil, nil
+-	}
+-
+-	ts, tok := md["token"]
+-	if !tok {
+-		return nil, nil
+-	}
+-
+-	token := ts[0]
+-	if !s.isValidSimpleToken(token) {
+-		return nil, ErrInvalidAuthToken
+-	}
+-
+-	authInfo, uok := s.AuthStore().AuthInfoFromToken(token)
+-	if !uok {
+-		plog.Warningf("invalid auth token: %s", token)
+-		return nil, ErrInvalidAuthToken
+-	}
+-	return authInfo, nil
+-}
+-
+ // doSerialize handles the auth logic, with permissions checked by "chk", for a serialized request "get". Returns a non-nil error on authentication failure.
+ func (s *EtcdServer) doSerialize(ctx context.Context, chk func(*auth.AuthInfo) error, get func()) error {
+ 	for {
+-		ai, err := s.authInfoFromCtx(ctx)
++		ai, err := s.AuthStore().AuthInfoFromCtx(ctx)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -697,7 +652,7 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
+ 		ID: s.reqIDGen.Next(),
+ 	}
+ 
+-	authInfo, err := s.authInfoFromCtx(ctx)
++	authInfo, err := s.AuthStore().AuthInfoFromCtx(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}

@@ -1,0 +1,320 @@
+commit cad1215b18a1c70807fad45d16b8dd36cf90f592
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Apr 6 21:01:33 2017 -0700
+
+    *: deny incoming peer certs with wrong IP SAN
+
+diff --git a/embed/etcd.go b/embed/etcd.go
+index ba09aa7..383578f 100644
+--- a/embed/etcd.go
++++ b/embed/etcd.go
+@@ -201,7 +201,6 @@ func startPeerListeners(cfg *Config) (plns []net.Listener, err error) {
+ 	}()
+ 
+ 	for i, u := range cfg.LPUrls {
+-		var tlscfg *tls.Config
+ 		if u.Scheme == "http" {
+ 			if !cfg.PeerTLSInfo.Empty() {
+ 				plog.Warningf("The scheme of peer url %s is HTTP while peer key/cert files are presented. Ignored peer key/cert files.", u.String())
+@@ -210,12 +209,7 @@ func startPeerListeners(cfg *Config) (plns []net.Listener, err error) {
+ 				plog.Warningf("The scheme of peer url %s is HTTP while client cert auth (--peer-client-cert-auth) is enabled. Ignored client cert auth for this url.", u.String())
+ 			}
+ 		}
+-		if !cfg.PeerTLSInfo.Empty() {
+-			if tlscfg, err = cfg.PeerTLSInfo.ServerConfig(); err != nil {
+-				return nil, err
+-			}
+-		}
+-		if plns[i], err = rafthttp.NewListener(u, tlscfg); err != nil {
++		if plns[i], err = rafthttp.NewListener(u, &cfg.PeerTLSInfo); err != nil {
+ 			return nil, err
+ 		}
+ 		plog.Info("listening for peers on ", u.String())
+diff --git a/etcdmain/etcd.go b/etcdmain/etcd.go
+index ba60316..d4edb56 100644
+--- a/etcdmain/etcd.go
++++ b/etcdmain/etcd.go
+@@ -19,7 +19,6 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io/ioutil"
+-	"net"
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
+@@ -305,18 +304,7 @@ func startProxy(cfg *config) error {
+ 	}
+ 	// Start a proxy server goroutine for each listen address
+ 	for _, u := range cfg.LCUrls {
+-		var (
+-			l      net.Listener
+-			tlscfg *tls.Config
+-		)
+-		if !cfg.ClientTLSInfo.Empty() {
+-			tlscfg, err = cfg.ClientTLSInfo.ServerConfig()
+-			if err != nil {
+-				return err
+-			}
+-		}
+-
+-		l, err := transport.NewListener(u.Host, u.Scheme, tlscfg)
++		l, err := transport.NewListener(u.Host, u.Scheme, &cfg.ClientTLSInfo)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -369,6 +357,11 @@ func identifyDataDirOrDie(dir string) dirType {
+ }
+ 
+ func setupLogging(cfg *config) {
++	cfg.ClientTLSInfo.HandshakeFailure = func(conn *tls.Conn, err error) {
++		plog.Infof("rejected connection from %q (%v)", conn.RemoteAddr().String(), err)
++	}
++	cfg.PeerTLSInfo.HandshakeFailure = cfg.ClientTLSInfo.HandshakeFailure
++
+ 	capnslog.SetGlobalLogLevel(capnslog.INFO)
+ 	if cfg.Debug {
+ 		capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+diff --git a/pkg/transport/listener.go b/pkg/transport/listener.go
+index 88c8923..0608517 100644
+--- a/pkg/transport/listener.go
++++ b/pkg/transport/listener.go
+@@ -32,11 +32,11 @@ import (
+ 	"github.com/coreos/etcd/pkg/tlsutil"
+ )
+ 
+-func NewListener(addr, scheme string, tlscfg *tls.Config) (l net.Listener, err error) {
++func NewListener(addr, scheme string, tlsinfo *TLSInfo) (l net.Listener, err error) {
+ 	if l, err = newListener(addr, scheme); err != nil {
+ 		return nil, err
+ 	}
+-	return wrapTLS(addr, scheme, tlscfg, l)
++	return wrapTLS(addr, scheme, tlsinfo, l)
+ }
+ 
+ func newListener(addr string, scheme string) (net.Listener, error) {
+@@ -47,15 +47,11 @@ func newListener(addr string, scheme string) (net.Listener, error) {
+ 	return net.Listen("tcp", addr)
+ }
+ 
+-func wrapTLS(addr, scheme string, tlscfg *tls.Config, l net.Listener) (net.Listener, error) {
++func wrapTLS(addr, scheme string, tlsinfo *TLSInfo, l net.Listener) (net.Listener, error) {
+ 	if scheme != "https" && scheme != "unixs" {
+ 		return l, nil
+ 	}
+-	if tlscfg == nil {
+-		l.Close()
+-		return nil, fmt.Errorf("cannot listen on TLS for %s: KeyFile and CertFile are not presented", scheme+"://"+addr)
+-	}
+-	return tls.NewListener(l, tlscfg), nil
++	return newTLSListener(l, tlsinfo)
+ }
+ 
+ type TLSInfo struct {
+@@ -68,6 +64,10 @@ type TLSInfo struct {
+ 	// ServerName ensures the cert matches the given host in case of discovery / virtual hosting
+ 	ServerName string
+ 
++	// HandshakeFailure is optinally called when a connection fails to handshake. The
++	// connection will be closed immediately afterwards.
++	HandshakeFailure func(*tls.Conn, error)
++
+ 	selfCert bool
+ 
+ 	// parseFunc exists to simplify testing. Typically, parseFunc
+diff --git a/pkg/transport/listener_tls.go b/pkg/transport/listener_tls.go
+new file mode 100644
+index 0000000..39228bb
+--- /dev/null
++++ b/pkg/transport/listener_tls.go
+@@ -0,0 +1,138 @@
++// Copyright 2017 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package transport
++
++import (
++	"crypto/tls"
++	"fmt"
++	"net"
++	"sync"
++)
++
++// tlsListener overrides a TLS listener so it will reject client
++// certificates with insufficient SAN credentials.
++type tlsListener struct {
++	net.Listener
++	connc            chan net.Conn
++	donec            chan struct{}
++	err              error
++	handshakeFailure func(*tls.Conn, error)
++}
++
++func newTLSListener(l net.Listener, tlsinfo *TLSInfo) (net.Listener, error) {
++	if tlsinfo == nil || tlsinfo.Empty() {
++		l.Close()
++		return nil, fmt.Errorf("cannot listen on TLS for %s: KeyFile and CertFile are not presented", l.Addr().String())
++	}
++	tlscfg, err := tlsinfo.ServerConfig()
++	if err != nil {
++		return nil, err
++	}
++	tlsl := &tlsListener{
++		Listener:         tls.NewListener(l, tlscfg),
++		connc:            make(chan net.Conn),
++		donec:            make(chan struct{}),
++		handshakeFailure: tlsinfo.HandshakeFailure,
++	}
++	go tlsl.acceptLoop()
++	return tlsl, nil
++}
++
++func (l *tlsListener) Accept() (net.Conn, error) {
++	select {
++	case conn := <-l.connc:
++		return conn, nil
++	case <-l.donec:
++		return nil, l.err
++	}
++}
++
++// acceptLoop launches each TLS handshake in a separate goroutine
++// to prevent a hanging TLS connection from blocking other connections.
++func (l *tlsListener) acceptLoop() {
++	var wg sync.WaitGroup
++	var pendingMu sync.Mutex
++
++	pending := make(map[net.Conn]struct{})
++	stopc := make(chan struct{})
++	defer func() {
++		close(stopc)
++		pendingMu.Lock()
++		for c := range pending {
++			c.Close()
++		}
++		pendingMu.Unlock()
++		wg.Wait()
++		close(l.donec)
++	}()
++
++	for {
++		conn, err := l.Listener.Accept()
++		if err != nil {
++			l.err = err
++			return
++		}
++
++		pendingMu.Lock()
++		pending[conn] = struct{}{}
++		pendingMu.Unlock()
++
++		wg.Add(1)
++		go func() {
++			defer func() {
++				if conn != nil {
++					conn.Close()
++				}
++				wg.Done()
++			}()
++
++			tlsConn := conn.(*tls.Conn)
++			herr := tlsConn.Handshake()
++			pendingMu.Lock()
++			delete(pending, conn)
++			pendingMu.Unlock()
++			if herr != nil {
++				if l.handshakeFailure != nil {
++					l.handshakeFailure(tlsConn, herr)
++				}
++				return
++			}
++
++			st := tlsConn.ConnectionState()
++			if len(st.PeerCertificates) > 0 {
++				cert := st.PeerCertificates[0]
++				if len(cert.IPAddresses) > 0 || len(cert.DNSNames) > 0 {
++					addr := tlsConn.RemoteAddr().String()
++					h, _, herr := net.SplitHostPort(addr)
++					if herr != nil || cert.VerifyHostname(h) != nil {
++						return
++					}
++				}
++			}
++
++			select {
++			case l.connc <- tlsConn:
++				conn = nil
++			case <-stopc:
++			}
++		}()
++	}
++}
++
++func (l *tlsListener) Close() error {
++	err := l.Listener.Close()
++	<-l.donec
++	return err
++}
+diff --git a/pkg/transport/timeout_listener.go b/pkg/transport/timeout_listener.go
+index 0f4df5f..b35e049 100644
+--- a/pkg/transport/timeout_listener.go
++++ b/pkg/transport/timeout_listener.go
+@@ -15,7 +15,6 @@
+ package transport
+ 
+ import (
+-	"crypto/tls"
+ 	"net"
+ 	"time"
+ )
+@@ -23,7 +22,7 @@ import (
+ // NewTimeoutListener returns a listener that listens on the given address.
+ // If read/write on the accepted connection blocks longer than its time limit,
+ // it will return timeout error.
+-func NewTimeoutListener(addr string, scheme string, tlscfg *tls.Config, rdtimeoutd, wtimeoutd time.Duration) (net.Listener, error) {
++func NewTimeoutListener(addr string, scheme string, tlsinfo *TLSInfo, rdtimeoutd, wtimeoutd time.Duration) (net.Listener, error) {
+ 	ln, err := newListener(addr, scheme)
+ 	if err != nil {
+ 		return nil, err
+@@ -33,7 +32,7 @@ func NewTimeoutListener(addr string, scheme string, tlscfg *tls.Config, rdtimeou
+ 		rdtimeoutd: rdtimeoutd,
+ 		wtimeoutd:  wtimeoutd,
+ 	}
+-	if ln, err = wrapTLS(addr, scheme, tlscfg, ln); err != nil {
++	if ln, err = wrapTLS(addr, scheme, tlsinfo, ln); err != nil {
+ 		return nil, err
+ 	}
+ 	return ln, nil
+diff --git a/rafthttp/util.go b/rafthttp/util.go
+index 83c1a27..12e548c 100644
+--- a/rafthttp/util.go
++++ b/rafthttp/util.go
+@@ -15,7 +15,6 @@
+ package rafthttp
+ 
+ import (
+-	"crypto/tls"
+ 	"fmt"
+ 	"io"
+ 	"net"
+@@ -37,8 +36,8 @@ var (
+ 
+ // NewListener returns a listener for raft message transfer between peers.
+ // It uses timeout listener to identify broken streams promptly.
+-func NewListener(u url.URL, tlscfg *tls.Config) (net.Listener, error) {
+-	return transport.NewTimeoutListener(u.Host, u.Scheme, tlscfg, ConnReadTimeout, ConnWriteTimeout)
++func NewListener(u url.URL, tlsinfo *transport.TLSInfo) (net.Listener, error) {
++	return transport.NewTimeoutListener(u.Host, u.Scheme, tlsinfo, ConnReadTimeout, ConnWriteTimeout)
+ }
+ 
+ // NewRoundTripper returns a roundTripper used to send requests

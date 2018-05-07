@@ -1,0 +1,71 @@
+commit 56e3ab094386e80384ce8d1b71a69bf87bf5c2ea
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Tue Feb 16 11:03:12 2016 -0800
+
+    etcd-agent: tidy cleanup before SIGKILL
+    
+    https://github.com/golang/go/blob/master/src/os/exec_posix.go#L18 shows that
+    cmd.Process.Kill calls syscall.SIGKILL to the command. But
+    http://tldp.org/LDP/Bash-Beginners-Guide/html/sect_12_01.html explains
+    'If you send a SIGKILL to a process, you remove any chance for the process to
+    do a tidy cleanup and shutdown, which might have unfortunate consequences.'
+    This sends SIGTERM, SIGINT syscalls to the PID so that the process could
+    have more time to clean up the resources.
+    
+    Related to https://github.com/coreos/etcd/issues/4517.
+
+diff --git a/tools/functional-tester/etcd-agent/agent.go b/tools/functional-tester/etcd-agent/agent.go
+index b0b7010..a1e724d 100644
+--- a/tools/functional-tester/etcd-agent/agent.go
++++ b/tools/functional-tester/etcd-agent/agent.go
+@@ -21,6 +21,7 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/pkg/netutil"
+@@ -80,18 +81,37 @@ func (a *Agent) stop() error {
+ 	if a.state != stateStarted {
+ 		return nil
+ 	}
+-	err := a.cmd.Process.Kill()
++
++	err := sigtermAndWait(a.cmd)
+ 	if err != nil {
+ 		return err
+ 	}
+-	_, err = a.cmd.Process.Wait()
++
++	a.state = stateStopped
++	return nil
++}
++
++func sigtermAndWait(cmd *exec.Cmd) error {
++	err := cmd.Process.Signal(syscall.SIGTERM)
+ 	if err != nil {
+ 		return err
+-
+ 	}
+ 
+-	a.state = stateStopped
+-	return nil
++	errc := make(chan error)
++	go func() {
++		_, err := cmd.Process.Wait()
++		errc <- err
++		close(errc)
++	}()
++
++	select {
++	case <-time.After(5 * time.Second):
++		cmd.Process.Kill()
++	case err := <-errc:
++		return err
++	}
++	err = <-errc
++	return err
+ }
+ 
+ // restart restarts the stopped etcd process.

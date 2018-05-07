@@ -1,0 +1,152 @@
+commit d73390a67470f4b99f7f1d340b275231d0cd7414
+Author: Doug MacEachern <dougm@vmware.com>
+Date:   Mon Apr 14 17:03:09 2014 -0700
+
+    fix(server): avoid race conditions in Run/Stop
+    
+    - don't close ready channel until PeerServer is listening.
+      avoids possible panic in Stop() if PeerServer is nil.
+    
+    - avoid data race in Run() (err variable was shared between 2 goroutines)
+    
+    - avoid data race in PeerServer Start/Stop (PeerServer.closeChan)
+
+diff --git a/etcd/etcd.go b/etcd/etcd.go
+index c4c5db7..bf964eb 100644
+--- a/etcd/etcd.go
++++ b/etcd/etcd.go
+@@ -182,8 +182,6 @@ func (e *Etcd) Run() {
+ 	log.Infof("etcd server [name %s, listen on %s, advertised url %s]", e.Server.Name, e.Config.BindAddr, e.Server.URL())
+ 	e.listener = server.NewListener(e.Config.EtcdTLSInfo().Scheme(), e.Config.BindAddr, etcdTLSConfig)
+ 
+-	close(e.readyC) // etcd server is ready to accept connections, notify waiters.
+-
+ 	// An error string equivalent to net.errClosing for using with
+ 	// http.Serve() during server shutdown. Need to re-declare
+ 	// here because it is not exported by "net" package.
+@@ -200,8 +198,10 @@ func (e *Etcd) Run() {
+ 		log.Infof("peer server [name %s, listen on %s, advertised url %s]", e.PeerServer.Config.Name, e.Config.Peer.BindAddr, e.PeerServer.Config.URL)
+ 		e.peerListener = server.NewListener(psConfig.Scheme, e.Config.Peer.BindAddr, peerTLSConfig)
+ 
++		close(e.readyC) // etcd server is ready to accept connections, notify waiters.
++
+ 		sHTTP := &ehttp.CORSHandler{e.PeerServer.HTTPHandler(), corsInfo}
+-		if err = http.Serve(e.peerListener, sHTTP); err != nil {
++		if err := http.Serve(e.peerListener, sHTTP); err != nil {
+ 			if !strings.Contains(err.Error(), errClosing) {
+ 				log.Fatal(err)
+ 			}
+@@ -210,7 +210,7 @@ func (e *Etcd) Run() {
+ 	}()
+ 
+ 	sHTTP := &ehttp.CORSHandler{e.Server.HTTPHandler(), corsInfo}
+-	if err = http.Serve(e.listener, sHTTP); err != nil {
++	if err := http.Serve(e.listener, sHTTP); err != nil {
+ 		if !strings.Contains(err.Error(), errClosing) {
+ 			log.Fatal(err)
+ 		}
+diff --git a/etcd/etcd_test.go b/etcd/etcd_test.go
+new file mode 100644
+index 0000000..8599136
+--- /dev/null
++++ b/etcd/etcd_test.go
+@@ -0,0 +1,45 @@
++/*
++Copyright 2013 CoreOS Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package etcd
++
++import (
++	"io/ioutil"
++	"os"
++	"testing"
++
++	"github.com/coreos/etcd/config"
++)
++
++func TestRunStop(t *testing.T) {
++	path, _ := ioutil.TempDir("", "etcd-")
++	defer os.RemoveAll(path)
++
++	config := config.New()
++	config.Name = "ETCDTEST"
++	config.DataDir = path
++	config.Addr = "localhost:0"
++	config.Peer.Addr = "localhost:0"
++
++	if err := config.Sanitize(); err != nil {
++		t.Fatal(err)
++	}
++
++	etcd := New(config)
++	go etcd.Run()
++	<-etcd.ReadyNotify()
++	etcd.Stop()
++}
+diff --git a/server/peer_server.go b/server/peer_server.go
+index 7d8b6b0..0f91d38 100644
+--- a/server/peer_server.go
++++ b/server/peer_server.go
+@@ -10,6 +10,7 @@ import (
+ 	"net/url"
+ 	"sort"
+ 	"strconv"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/coreos/etcd/third_party/github.com/goraft/raft"
+@@ -72,6 +73,7 @@ type PeerServer struct {
+ 	proxyClientURL string
+ 
+ 	metrics *metrics.Bucket
++	sync.Mutex
+ }
+ 
+ // TODO: find a good policy to do snapshot
+@@ -257,6 +259,9 @@ func (s *PeerServer) findCluster(discoverURL string, peers []string) {
+ 
+ // Start the raft server
+ func (s *PeerServer) Start(snapshot bool, discoverURL string, peers []string) error {
++	s.Lock()
++	defer s.Unlock()
++
+ 	// LoadSnapshot
+ 	if snapshot {
+ 		err := s.raftServer.LoadSnapshot()
+@@ -295,6 +300,9 @@ func (s *PeerServer) Start(snapshot bool, discoverURL string, peers []string) er
+ }
+ 
+ func (s *PeerServer) Stop() {
++	s.Lock()
++	defer s.Unlock()
++
+ 	if s.closeChan != nil {
+ 		close(s.closeChan)
+ 		s.closeChan = nil
+diff --git a/test.sh b/test.sh
+index 1397e11..6ca1cac 100755
+--- a/test.sh
++++ b/test.sh
+@@ -2,6 +2,9 @@
+ 
+ . ./build
+ 
++go test -i ./etcd
++go test -v ./etcd -race
++
+ go test -i ./http
+ go test -v ./http -race
+ 

@@ -1,0 +1,3382 @@
+commit b21731c022acf715f4b2445dc051e7e46b60f98b
+Author: Dr. Stefan Schimanski <stefan.schimanski@gmail.com>
+Date:   Mon Dec 5 16:56:04 2016 +0100
+
+    vendor: update ugorji/go
+
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/0doc.go b/cmd/vendor/github.com/ugorji/go/codec/0doc.go
+index caa7e0a..209f9eb 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/0doc.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/0doc.go
+@@ -64,10 +64,11 @@ Rich Feature Set includes:
+   - Never silently skip data when decoding.
+     User decides whether to return an error or silently skip data when keys or indexes
+     in the data stream do not map to fields in the struct.
++  - Detect and error when encoding a cyclic reference (instead of stack overflow shutdown)
+   - Encode/Decode from/to chan types (for iterative streaming support)
+   - Drop-in replacement for encoding/json. `json:` key in struct tag supported.
+   - Provides a RPC Server and Client Codec for net/rpc communication protocol.
+-  - Handle unique idiosynchracies of codecs e.g. 
++  - Handle unique idiosyncrasies of codecs e.g. 
+     - For messagepack, configure how ambiguities in handling raw bytes are resolved 
+     - For messagepack, provide rpc server/client codec to support 
+       msgpack-rpc protocol defined at:
+@@ -171,6 +172,8 @@ package codec
+ 
+ // TODO:
+ //
++//   - optimization for codecgen:
++//     if len of entity is <= 3 words, then support a value receiver for encode.
+ //   - (En|De)coder should store an error when it occurs.
+ //     Until reset, subsequent calls return that error that was stored.
+ //     This means that free panics must go away.
+@@ -178,16 +181,19 @@ package codec
+ //   - Decoding using a chan is good, but incurs concurrency costs.
+ //     This is because there's no fast way to use a channel without it
+ //     having to switch goroutines constantly.
+-//     Callback pattern is still the best. Maybe cnsider supporting something like:
++//     Callback pattern is still the best. Maybe consider supporting something like:
+ //        type X struct {
+ //             Name string
+ //             Ys []Y
+ //             Ys chan <- Y
+-//             Ys func(interface{}) -> call this interface for each entry in there.
++//             Ys func(Y) -> call this function for each entry
+ //        }
+ //    - Consider adding a isZeroer interface { isZero() bool }
+ //      It is used within isEmpty, for omitEmpty support.
+ //    - Consider making Handle used AS-IS within the encoding/decoding session.
+ //      This means that we don't cache Handle information within the (En|De)coder,
+ //      except we really need it at Reset(...)
+-//    - Handle recursive types during encoding/decoding?
++//    - Consider adding math/big support
++//    - Consider reducing the size of the generated functions:
++//      Maybe use one loop, and put the conditionals in the loop.
++//      for ... { if cLen > 0 { if j == cLen { break } } else if dd.CheckBreak() { break } }
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/binc.go b/cmd/vendor/github.com/ugorji/go/codec/binc.go
+index c884d14..33120dc 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/binc.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/binc.go
+@@ -348,6 +348,13 @@ func (d *bincDecDriver) readNextBd() {
+ 	d.bdRead = true
+ }
+ 
++func (d *bincDecDriver) uncacheRead() {
++	if d.bdRead {
++		d.r.unreadn1()
++		d.bdRead = false
++	}
++}
++
+ func (d *bincDecDriver) ContainerType() (vt valueType) {
+ 	if d.vd == bincVdSpecial && d.vs == bincSpNil {
+ 		return valueTypeNil
+@@ -705,7 +712,7 @@ func (d *bincDecDriver) decStringAndBytes(bs []byte, withString, zerocopy bool)
+ }
+ 
+ func (d *bincDecDriver) DecodeString() (s string) {
+-	// DecodeBytes does not accomodate symbols, whose impl stores string version in map.
++	// DecodeBytes does not accommodate symbols, whose impl stores string version in map.
+ 	// Use decStringAndBytes directly.
+ 	// return string(d.DecodeBytes(d.b[:], true, true))
+ 	_, s = d.decStringAndBytes(d.b[:], true, true)
+@@ -908,10 +915,14 @@ func (h *BincHandle) newDecDriver(d *Decoder) decDriver {
+ 
+ func (e *bincEncDriver) reset() {
+ 	e.w = e.e.w
++	e.s = 0
++	e.m = nil
+ }
+ 
+ func (d *bincDecDriver) reset() {
+ 	d.r = d.d.r
++	d.s = nil
++	d.bd, d.bdRead, d.vd, d.vs = 0, false, 0, 0
+ }
+ 
+ var _ decDriver = (*bincDecDriver)(nil)
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/cbor.go b/cmd/vendor/github.com/ugorji/go/codec/cbor.go
+index 0e5d32b..4fa349a 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/cbor.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/cbor.go
+@@ -188,6 +188,13 @@ func (d *cborDecDriver) readNextBd() {
+ 	d.bdRead = true
+ }
+ 
++func (d *cborDecDriver) uncacheRead() {
++	if d.bdRead {
++		d.r.unreadn1()
++		d.bdRead = false
++	}
++}
++
+ func (d *cborDecDriver) ContainerType() (vt valueType) {
+ 	if d.bd == cborBdNil {
+ 		return valueTypeNil
+@@ -508,7 +515,7 @@ func (d *cborDecDriver) DecodeNaked() {
+ 			n.v = valueTypeExt
+ 			n.u = d.decUint()
+ 			n.l = nil
+-			d.bdRead = false
++			// d.bdRead = false
+ 			// d.d.decode(&re.Value) // handled by decode itself.
+ 			// decodeFurther = true
+ 		default:
+@@ -578,6 +585,7 @@ func (e *cborEncDriver) reset() {
+ 
+ func (d *cborDecDriver) reset() {
+ 	d.r = d.d.r
++	d.bd, d.bdRead = 0, false
+ }
+ 
+ var _ decDriver = (*cborDecDriver)(nil)
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/decode.go b/cmd/vendor/github.com/ugorji/go/codec/decode.go
+index b3b99f0..52c1dfe 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/decode.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/decode.go
+@@ -91,10 +91,12 @@ type decDriver interface {
+ 	uncacheRead()
+ }
+ 
+-type decNoSeparator struct{}
++type decNoSeparator struct {
++}
++
++func (_ decNoSeparator) ReadEnd() {}
+ 
+-func (_ decNoSeparator) ReadEnd()     {}
+-func (_ decNoSeparator) uncacheRead() {}
++// func (_ decNoSeparator) uncacheRead() {}
+ 
+ type DecodeOptions struct {
+ 	// MapType specifies type to use during schema-less decoding of a map in the stream.
+@@ -161,6 +163,15 @@ type DecodeOptions struct {
+ 	// Note: Handles will be smart when using the intern functionality.
+ 	// So everything will not be interned.
+ 	InternString bool
++
++	// PreferArrayOverSlice controls whether to decode to an array or a slice.
++	//
++	// This only impacts decoding into a nil interface{}.
++	// Consequently, it has no effect on codecgen.
++	//
++	// *Note*: This only applies if using go1.5 and above,
++	// as it requires reflect.ArrayOf support which was absent before go1.5.
++	PreferArrayOverSlice bool
+ }
+ 
+ // ------------------------------------
+@@ -433,6 +444,10 @@ func (f *decFnInfo) rawExt(rv reflect.Value) {
+ 	f.d.d.DecodeExt(rv.Addr().Interface(), 0, nil)
+ }
+ 
++func (f *decFnInfo) raw(rv reflect.Value) {
++	rv.SetBytes(f.d.raw())
++}
++
+ func (f *decFnInfo) ext(rv reflect.Value) {
+ 	f.d.d.DecodeExt(rv.Addr().Interface(), f.xfTag, f.xfFn)
+ }
+@@ -583,14 +598,16 @@ func (f *decFnInfo) kInterfaceNaked() (rvn reflect.Value) {
+ 		if d.mtid == 0 || d.mtid == mapIntfIntfTypId {
+ 			l := len(n.ms)
+ 			n.ms = append(n.ms, nil)
+-			d.decode(&n.ms[l])
+-			rvn = reflect.ValueOf(&n.ms[l]).Elem()
++			var v2 interface{} = &n.ms[l]
++			d.decode(v2)
++			rvn = reflect.ValueOf(v2).Elem()
+ 			n.ms = n.ms[:l]
+ 		} else if d.mtid == mapStrIntfTypId { // for json performance
+ 			l := len(n.ns)
+ 			n.ns = append(n.ns, nil)
+-			d.decode(&n.ns[l])
+-			rvn = reflect.ValueOf(&n.ns[l]).Elem()
++			var v2 interface{} = &n.ns[l]
++			d.decode(v2)
++			rvn = reflect.ValueOf(v2).Elem()
+ 			n.ns = n.ns[:l]
+ 		} else {
+ 			rvn = reflect.New(d.h.MapType).Elem()
+@@ -601,9 +618,13 @@ func (f *decFnInfo) kInterfaceNaked() (rvn reflect.Value) {
+ 		if d.stid == 0 || d.stid == intfSliceTypId {
+ 			l := len(n.ss)
+ 			n.ss = append(n.ss, nil)
+-			d.decode(&n.ss[l])
+-			rvn = reflect.ValueOf(&n.ss[l]).Elem()
++			var v2 interface{} = &n.ss[l]
++			d.decode(v2)
+ 			n.ss = n.ss[:l]
++			rvn = reflect.ValueOf(v2).Elem()
++			if reflectArrayOfSupported && d.stid == 0 && d.h.PreferArrayOverSlice {
++				rvn = reflectArrayOf(rvn)
++			}
+ 		} else {
+ 			rvn = reflect.New(d.h.SliceType).Elem()
+ 			d.decodeValue(rvn, nil)
+@@ -615,9 +636,9 @@ func (f *decFnInfo) kInterfaceNaked() (rvn reflect.Value) {
+ 			l := len(n.is)
+ 			n.is = append(n.is, nil)
+ 			v2 := &n.is[l]
+-			n.is = n.is[:l]
+ 			d.decode(v2)
+ 			v = *v2
++			n.is = n.is[:l]
+ 		}
+ 		bfn := d.h.getExtForTag(tag)
+ 		if bfn == nil {
+@@ -1166,7 +1187,7 @@ type decRtidFn struct {
+ // primitives are being decoded.
+ //
+ // maps and arrays are not handled by this mechanism.
+-// However, RawExt is, and we accomodate for extensions that decode
++// However, RawExt is, and we accommodate for extensions that decode
+ // RawExt from DecodeNaked, but need to decode the value subsequently.
+ // kInterfaceNaked and swallow, which call DecodeNaked, handle this caveat.
+ //
+@@ -1453,8 +1474,8 @@ func (d *Decoder) swallow() {
+ 			l := len(n.is)
+ 			n.is = append(n.is, nil)
+ 			v2 := &n.is[l]
+-			n.is = n.is[:l]
+ 			d.decode(v2)
++			n.is = n.is[:l]
+ 		}
+ 	}
+ }
+@@ -1504,6 +1525,8 @@ func (d *Decoder) decode(iv interface{}) {
+ 			*v = 0
+ 		case *[]uint8:
+ 			*v = nil
++		case *Raw:
++			*v = nil
+ 		case reflect.Value:
+ 			if v.Kind() != reflect.Ptr || v.IsNil() {
+ 				d.errNotValidPtrValue(v)
+@@ -1543,7 +1566,6 @@ func (d *Decoder) decode(iv interface{}) {
+ 		d.decodeValueNotNil(v.Elem(), nil)
+ 
+ 	case *string:
+-
+ 		*v = d.d.DecodeString()
+ 	case *bool:
+ 		*v = d.d.DecodeBool()
+@@ -1574,6 +1596,9 @@ func (d *Decoder) decode(iv interface{}) {
+ 	case *[]uint8:
+ 		*v = d.d.DecodeBytes(*v, false, false)
+ 
++	case *Raw:
++		*v = d.raw()
++
+ 	case *interface{}:
+ 		d.decodeValueNotNil(reflect.ValueOf(iv).Elem(), nil)
+ 
+@@ -1695,6 +1720,8 @@ func (d *Decoder) getDecFn(rt reflect.Type, checkFastpath, checkCodecSelfer bool
+ 		fn.f = (*decFnInfo).selferUnmarshal
+ 	} else if rtid == rawExtTypId {
+ 		fn.f = (*decFnInfo).rawExt
++	} else if rtid == rawTypId {
++		fn.f = (*decFnInfo).raw
+ 	} else if d.d.IsBuiltinType(rtid) {
+ 		fn.f = (*decFnInfo).builtin
+ 	} else if xfFn := d.h.getExt(rtid); xfFn != nil {
+@@ -1793,12 +1820,13 @@ func (d *Decoder) getDecFn(rt reflect.Type, checkFastpath, checkCodecSelfer bool
+ }
+ 
+ func (d *Decoder) structFieldNotFound(index int, rvkencname string) {
++	// NOTE: rvkencname may be a stringView, so don't pass it to another function.
+ 	if d.h.ErrorIfNoField {
+ 		if index >= 0 {
+ 			d.errorf("no matching struct field found when decoding stream array at index %v", index)
+ 			return
+ 		} else if rvkencname != "" {
+-			d.errorf("no matching struct field found when decoding stream map with key %s", rvkencname)
++			d.errorf("no matching struct field found when decoding stream map with key " + rvkencname)
+ 			return
+ 		}
+ 	}
+@@ -1862,6 +1890,7 @@ func (d *Decoder) intern(s string) {
+ 	}
+ }
+ 
++// nextValueBytes returns the next value in the stream as a set of bytes.
+ func (d *Decoder) nextValueBytes() []byte {
+ 	d.d.uncacheRead()
+ 	d.r.track()
+@@ -1869,6 +1898,15 @@ func (d *Decoder) nextValueBytes() []byte {
+ 	return d.r.stopTrack()
+ }
+ 
++func (d *Decoder) raw() []byte {
++	// ensure that this is not a view into the bytes
++	// i.e. make new copy always.
++	bs := d.nextValueBytes()
++	bs2 := make([]byte, len(bs))
++	copy(bs2, bs)
++	return bs2
++}
++
+ // --------------------------------------------------
+ 
+ // decSliceHelper assists when decoding into a slice, from a map or an array in the stream.
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/decode_go.go b/cmd/vendor/github.com/ugorji/go/codec/decode_go.go
+new file mode 100644
+index 0000000..ba289ce
+--- /dev/null
++++ b/cmd/vendor/github.com/ugorji/go/codec/decode_go.go
+@@ -0,0 +1,16 @@
++// Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
++// Use of this source code is governed by a MIT license found in the LICENSE file.
++
++// +build go1.5
++
++package codec
++
++import "reflect"
++
++const reflectArrayOfSupported = true
++
++func reflectArrayOf(rvn reflect.Value) (rvn2 reflect.Value) {
++	rvn2 = reflect.New(reflect.ArrayOf(rvn.Len(), intfTyp)).Elem()
++	reflect.Copy(rvn2, rvn)
++	return
++}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/decode_go14.go b/cmd/vendor/github.com/ugorji/go/codec/decode_go14.go
+new file mode 100644
+index 0000000..50063bc
+--- /dev/null
++++ b/cmd/vendor/github.com/ugorji/go/codec/decode_go14.go
+@@ -0,0 +1,14 @@
++// Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
++// Use of this source code is governed by a MIT license found in the LICENSE file.
++
++// +build !go1.5
++
++package codec
++
++import "reflect"
++
++const reflectArrayOfSupported = false
++
++func reflectArrayOf(rvn reflect.Value) (rvn2 reflect.Value) {
++	panic("reflect.ArrayOf unsupported")
++}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/encode.go b/cmd/vendor/github.com/ugorji/go/codec/encode.go
+index 99af6fa..c2cef81 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/encode.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/encode.go
+@@ -110,6 +110,28 @@ type EncodeOptions struct {
+ 	//
+ 	Canonical bool
+ 
++	// CheckCircularRef controls whether we check for circular references
++	// and error fast during an encode.
++	//
++	// If enabled, an error is received if a pointer to a struct
++	// references itself either directly or through one of its fields (iteratively).
++	//
++	// This is opt-in, as there may be a performance hit to checking circular references.
++	CheckCircularRef bool
++
++	// RecursiveEmptyCheck controls whether we descend into interfaces, structs and pointers
++	// when checking if a value is empty.
++	//
++	// Note that this may make OmitEmpty more expensive, as it incurs a lot more reflect calls.
++	RecursiveEmptyCheck bool
++
++	// Raw controls whether we encode Raw values.
++	// This is a "dangerous" option and must be explicitly set.
++	// If set, we blindly encode Raw values as-is, without checking
++	// if they are a correct representation of a value in that format.
++	// If unset, we error out.
++	Raw bool
++
+ 	// AsSymbols defines what should be encoded as symbols.
+ 	//
+ 	// Encoding as symbols can reduce the encoded size significantly.
+@@ -132,13 +154,16 @@ type simpleIoEncWriterWriter struct {
+ 	w  io.Writer
+ 	bw io.ByteWriter
+ 	sw ioEncStringWriter
++	bs [1]byte
+ }
+ 
+ func (o *simpleIoEncWriterWriter) WriteByte(c byte) (err error) {
+ 	if o.bw != nil {
+ 		return o.bw.WriteByte(c)
+ 	}
+-	_, err = o.w.Write([]byte{c})
++	// _, err = o.w.Write([]byte{c})
++	o.bs[0] = c
++	_, err = o.w.Write(o.bs[:])
+ 	return
+ }
+ 
+@@ -210,45 +235,57 @@ type bytesEncWriter struct {
+ }
+ 
+ func (z *bytesEncWriter) writeb(s []byte) {
+-	if len(s) > 0 {
+-		c := z.grow(len(s))
+-		copy(z.b[c:], s)
++	if len(s) == 0 {
++		return
+ 	}
++	oc, a := z.growNoAlloc(len(s))
++	if a {
++		z.growAlloc(len(s), oc)
++	}
++	copy(z.b[oc:], s)
+ }
+ 
+ func (z *bytesEncWriter) writestr(s string) {
+-	if len(s) > 0 {
+-		c := z.grow(len(s))
+-		copy(z.b[c:], s)
++	if len(s) == 0 {
++		return
+ 	}
++	oc, a := z.growNoAlloc(len(s))
++	if a {
++		z.growAlloc(len(s), oc)
++	}
++	copy(z.b[oc:], s)
+ }
+ 
+ func (z *bytesEncWriter) writen1(b1 byte) {
+-	c := z.grow(1)
+-	z.b[c] = b1
++	oc, a := z.growNoAlloc(1)
++	if a {
++		z.growAlloc(1, oc)
++	}
++	z.b[oc] = b1
+ }
+ 
+ func (z *bytesEncWriter) writen2(b1 byte, b2 byte) {
+-	c := z.grow(2)
+-	z.b[c] = b1
+-	z.b[c+1] = b2
++	oc, a := z.growNoAlloc(2)
++	if a {
++		z.growAlloc(2, oc)
++	}
++	z.b[oc+1] = b2
++	z.b[oc] = b1
+ }
+ 
+ func (z *bytesEncWriter) atEndOfEncode() {
+ 	*(z.out) = z.b[:z.c]
+ }
+ 
+-func (z *bytesEncWriter) grow(n int) (oldcursor int) {
++// have a growNoalloc(n int), which can be inlined.
++// if allocation is needed, then call growAlloc(n int)
++
++func (z *bytesEncWriter) growNoAlloc(n int) (oldcursor int, allocNeeded bool) {
+ 	oldcursor = z.c
+-	z.c = oldcursor + n
++	z.c = z.c + n
+ 	if z.c > len(z.b) {
+ 		if z.c > cap(z.b) {
+-			// appendslice logic (if cap < 1024, *2, else *1.25): more expensive. many copy calls.
+-			// bytes.Buffer model (2*cap + n): much better
+-			// bs := make([]byte, 2*cap(z.b)+n)
+-			bs := make([]byte, growCap(cap(z.b), 1, n))
+-			copy(bs, z.b[:oldcursor])
+-			z.b = bs
++			allocNeeded = true
+ 		} else {
+ 			z.b = z.b[:cap(z.b)]
+ 		}
+@@ -256,6 +293,15 @@ func (z *bytesEncWriter) grow(n int) (oldcursor int) {
+ 	return
+ }
+ 
++func (z *bytesEncWriter) growAlloc(n int, oldcursor int) {
++	// appendslice logic (if cap < 1024, *2, else *1.25): more expensive. many copy calls.
++	// bytes.Buffer model (2*cap + n): much better
++	// bs := make([]byte, 2*cap(z.b)+n)
++	bs := make([]byte, growCap(cap(z.b), 1, n))
++	copy(bs, z.b[:oldcursor])
++	z.b = bs
++}
++
+ // ---------------------------------------------
+ 
+ type encFnInfo struct {
+@@ -270,6 +316,10 @@ func (f *encFnInfo) builtin(rv reflect.Value) {
+ 	f.e.e.EncodeBuiltin(f.ti.rtid, rv.Interface())
+ }
+ 
++func (f *encFnInfo) raw(rv reflect.Value) {
++	f.e.raw(rv.Interface().(Raw))
++}
++
+ func (f *encFnInfo) rawExt(rv reflect.Value) {
+ 	// rev := rv.Interface().(RawExt)
+ 	// f.e.e.EncodeRawExt(&rev, f.e)
+@@ -296,7 +346,7 @@ func (f *encFnInfo) getValueForMarshalInterface(rv reflect.Value, indir int8) (v
+ 		v = rv.Interface()
+ 	} else if indir == -1 {
+ 		// If a non-pointer was passed to Encode(), then that value is not addressable.
+-		// Take addr if addresable, else copy value to an addressable value.
++		// Take addr if addressable, else copy value to an addressable value.
+ 		if rv.CanAddr() {
+ 			v = rv.Addr().Interface()
+ 		} else {
+@@ -464,7 +514,7 @@ func (f *encFnInfo) kSlice(rv reflect.Value) {
+ 		for j := 0; j < l; j++ {
+ 			if cr != nil {
+ 				if ti.mbs {
+-					if l%2 == 0 {
++					if j%2 == 0 {
+ 						cr.sendContainerState(containerMapKey)
+ 					} else {
+ 						cr.sendContainerState(containerMapValue)
+@@ -503,7 +553,7 @@ func (f *encFnInfo) kStruct(rv reflect.Value) {
+ 	newlen := len(fti.sfi)
+ 
+ 	// Use sync.Pool to reduce allocating slices unnecessarily.
+-	// The cost of the occasional locking is less than the cost of new allocation.
++	// The cost of sync.Pool is less than the cost of new allocation.
+ 	pool, poolv, fkvs := encStructPoolGet(newlen)
+ 
+ 	// if toMap, use the sorted array. If toArray, use unsorted array (to match sequence in struct)
+@@ -512,25 +562,20 @@ func (f *encFnInfo) kStruct(rv reflect.Value) {
+ 	}
+ 	newlen = 0
+ 	var kv stringRv
++	recur := e.h.RecursiveEmptyCheck
+ 	for _, si := range tisfi {
+ 		kv.r = si.field(rv, false)
+-		// if si.i != -1 {
+-		// 	rvals[newlen] = rv.Field(int(si.i))
+-		// } else {
+-		// 	rvals[newlen] = rv.FieldByIndex(si.is)
+-		// }
+ 		if toMap {
+-			if si.omitEmpty && isEmptyValue(kv.r) {
++			if si.omitEmpty && isEmptyValue(kv.r, recur, recur) {
+ 				continue
+ 			}
+ 			kv.v = si.encName
+ 		} else {
+ 			// use the zero value.
+ 			// if a reference or struct, set to nil (so you do not output too much)
+-			if si.omitEmpty && isEmptyValue(kv.r) {
++			if si.omitEmpty && isEmptyValue(kv.r, recur, recur) {
+ 				switch kv.r.Kind() {
+-				case reflect.Struct, reflect.Interface, reflect.Ptr, reflect.Array,
+-					reflect.Map, reflect.Slice:
++				case reflect.Struct, reflect.Interface, reflect.Ptr, reflect.Array, reflect.Map, reflect.Slice:
+ 					kv.r = reflect.Value{} //encode as nil
+ 				}
+ 			}
+@@ -541,7 +586,7 @@ func (f *encFnInfo) kStruct(rv reflect.Value) {
+ 
+ 	// debugf(">>>> kStruct: newlen: %v", newlen)
+ 	// sep := !e.be
+-	ee := e.e //don't dereference everytime
++	ee := e.e //don't dereference every time
+ 
+ 	if toMap {
+ 		ee.EncodeMapStart(newlen)
+@@ -596,13 +641,15 @@ func (f *encFnInfo) kStruct(rv reflect.Value) {
+ // 	f.e.encodeValue(rv.Elem())
+ // }
+ 
+-func (f *encFnInfo) kInterface(rv reflect.Value) {
+-	if rv.IsNil() {
+-		f.e.e.EncodeNil()
+-		return
+-	}
+-	f.e.encodeValue(rv.Elem(), nil)
+-}
++// func (f *encFnInfo) kInterface(rv reflect.Value) {
++// 	println("kInterface called")
++// 	debug.PrintStack()
++// 	if rv.IsNil() {
++// 		f.e.e.EncodeNil()
++// 		return
++// 	}
++// 	f.e.encodeValue(rv.Elem(), nil)
++// }
+ 
+ func (f *encFnInfo) kMap(rv reflect.Value) {
+ 	ee := f.e.e
+@@ -877,6 +924,7 @@ type Encoder struct {
+ 	// as the handler MAY need to do some coordination.
+ 	w  encWriter
+ 	s  []encRtidFn
++	ci set
+ 	be bool // is binary encoding
+ 	js bool // is json handle
+ 
+@@ -925,7 +973,7 @@ func newEncoder(h Handle) *Encoder {
+ 
+ // Reset the Encoder with a new output stream.
+ //
+-// This accomodates using the state of the Encoder,
++// This accommodates using the state of the Encoder,
+ // where it has "cached" information about sub-engines.
+ func (e *Encoder) Reset(w io.Writer) {
+ 	ww, ok := w.(ioEncWriterWriter)
+@@ -1032,20 +1080,6 @@ func (e *Encoder) MustEncode(v interface{}) {
+ 	e.w.atEndOfEncode()
+ }
+ 
+-// comment out these (Must)Write methods. They were only put there to support cbor.
+-// However, users already have access to the streams, and can write directly.
+-//
+-// // Write allows users write to the Encoder stream directly.
+-// func (e *Encoder) Write(bs []byte) (err error) {
+-// 	defer panicToErr(&err)
+-// 	e.w.writeb(bs)
+-// 	return
+-// }
+-// // MustWrite is like write, but panics if unable to Write.
+-// func (e *Encoder) MustWrite(bs []byte) {
+-// 	e.w.writeb(bs)
+-// }
+-
+ func (e *Encoder) encode(iv interface{}) {
+ 	// if ics, ok := iv.(Selfer); ok {
+ 	// 	ics.CodecEncodeSelf(e)
+@@ -1057,7 +1091,8 @@ func (e *Encoder) encode(iv interface{}) {
+ 		e.e.EncodeNil()
+ 	case Selfer:
+ 		v.CodecEncodeSelf(e)
+-
++	case Raw:
++		e.raw(v)
+ 	case reflect.Value:
+ 		e.encodeValue(v, nil)
+ 
+@@ -1133,20 +1168,23 @@ func (e *Encoder) encode(iv interface{}) {
+ 	}
+ }
+ 
+-func (e *Encoder) encodeI(iv interface{}, checkFastpath, checkCodecSelfer bool) {
+-	if rv, proceed := e.preEncodeValue(reflect.ValueOf(iv)); proceed {
+-		rt := rv.Type()
+-		rtid := reflect.ValueOf(rt).Pointer()
+-		fn := e.getEncFn(rtid, rt, checkFastpath, checkCodecSelfer)
+-		fn.f(&fn.i, rv)
+-	}
+-}
+-
+-func (e *Encoder) preEncodeValue(rv reflect.Value) (rv2 reflect.Value, proceed bool) {
++func (e *Encoder) preEncodeValue(rv reflect.Value) (rv2 reflect.Value, sptr uintptr, proceed bool) {
+ 	// use a goto statement instead of a recursive function for ptr/interface.
+ TOP:
+ 	switch rv.Kind() {
+-	case reflect.Ptr, reflect.Interface:
++	case reflect.Ptr:
++		if rv.IsNil() {
++			e.e.EncodeNil()
++			return
++		}
++		rv = rv.Elem()
++		if e.h.CheckCircularRef && rv.Kind() == reflect.Struct {
++			// TODO: Movable pointers will be an issue here. Future problem.
++			sptr = rv.UnsafeAddr()
++			break TOP
++		}
++		goto TOP
++	case reflect.Interface:
+ 		if rv.IsNil() {
+ 			e.e.EncodeNil()
+ 			return
+@@ -1163,18 +1201,40 @@ TOP:
+ 		return
+ 	}
+ 
+-	return rv, true
++	proceed = true
++	rv2 = rv
++	return
++}
++
++func (e *Encoder) doEncodeValue(rv reflect.Value, fn *encFn, sptr uintptr,
++	checkFastpath, checkCodecSelfer bool) {
++	if sptr != 0 {
++		if (&e.ci).add(sptr) {
++			e.errorf("circular reference found: # %d", sptr)
++		}
++	}
++	if fn == nil {
++		rt := rv.Type()
++		rtid := reflect.ValueOf(rt).Pointer()
++		// fn = e.getEncFn(rtid, rt, true, true)
++		fn = e.getEncFn(rtid, rt, checkFastpath, checkCodecSelfer)
++	}
++	fn.f(&fn.i, rv)
++	if sptr != 0 {
++		(&e.ci).remove(sptr)
++	}
++}
++
++func (e *Encoder) encodeI(iv interface{}, checkFastpath, checkCodecSelfer bool) {
++	if rv, sptr, proceed := e.preEncodeValue(reflect.ValueOf(iv)); proceed {
++		e.doEncodeValue(rv, nil, sptr, checkFastpath, checkCodecSelfer)
++	}
+ }
+ 
+ func (e *Encoder) encodeValue(rv reflect.Value, fn *encFn) {
+ 	// if a valid fn is passed, it MUST BE for the dereferenced type of rv
+-	if rv, proceed := e.preEncodeValue(rv); proceed {
+-		if fn == nil {
+-			rt := rv.Type()
+-			rtid := reflect.ValueOf(rt).Pointer()
+-			fn = e.getEncFn(rtid, rt, true, true)
+-		}
+-		fn.f(&fn.i, rv)
++	if rv, sptr, proceed := e.preEncodeValue(rv); proceed {
++		e.doEncodeValue(rv, fn, sptr, true, true)
+ 	}
+ }
+ 
+@@ -1217,6 +1277,8 @@ func (e *Encoder) getEncFn(rtid uintptr, rt reflect.Type, checkFastpath, checkCo
+ 
+ 	if checkCodecSelfer && ti.cs {
+ 		fn.f = (*encFnInfo).selferMarshal
++	} else if rtid == rawTypId {
++		fn.f = (*encFnInfo).raw
+ 	} else if rtid == rawExtTypId {
+ 		fn.f = (*encFnInfo).rawExt
+ 	} else if e.e.IsBuiltinType(rtid) {
+@@ -1234,7 +1296,7 @@ func (e *Encoder) getEncFn(rtid uintptr, rt reflect.Type, checkFastpath, checkCo
+ 	} else {
+ 		rk := rt.Kind()
+ 		if fastpathEnabled && checkFastpath && (rk == reflect.Map || rk == reflect.Slice) {
+-			if rt.PkgPath() == "" {
++			if rt.PkgPath() == "" { // un-named slice or map
+ 				if idx := fastpathAV.index(rtid); idx != -1 {
+ 					fn.f = fastpathAV[idx].encfn
+ 				}
+@@ -1284,10 +1346,11 @@ func (e *Encoder) getEncFn(rtid uintptr, rt reflect.Type, checkFastpath, checkCo
+ 				fn.f = (*encFnInfo).kSlice
+ 			case reflect.Struct:
+ 				fn.f = (*encFnInfo).kStruct
++				// reflect.Ptr and reflect.Interface are handled already by preEncodeValue
+ 				// case reflect.Ptr:
+ 				// 	fn.f = (*encFnInfo).kPtr
+-			case reflect.Interface:
+-				fn.f = (*encFnInfo).kInterface
++				// case reflect.Interface:
++				// 	fn.f = (*encFnInfo).kInterface
+ 			case reflect.Map:
+ 				fn.f = (*encFnInfo).kMap
+ 			default:
+@@ -1320,6 +1383,18 @@ func (e *Encoder) asis(v []byte) {
+ 	}
+ }
+ 
++func (e *Encoder) raw(vv Raw) {
++	v := []byte(vv)
++	if !e.h.Raw {
++		e.errorf("Raw values cannot be encoded: %v", v)
++	}
++	if e.as == nil {
++		e.w.writeb(v)
++	} else {
++		e.as.EncodeAsis(v)
++	}
++}
++
+ func (e *Encoder) errorf(format string, params ...interface{}) {
+ 	err := fmt.Errorf(format, params...)
+ 	panic(err)
+@@ -1353,25 +1428,6 @@ func encStructPoolGet(newlen int) (p *sync.Pool, v interface{}, s []stringRv) {
+ 	// 	panic(errors.New("encStructPoolLen must be equal to 4")) // defensive, in case it is changed
+ 	// }
+ 	// idxpool := newlen / 8
+-
+-	// if pool == nil {
+-	// 	fkvs = make([]stringRv, newlen)
+-	// } else {
+-	// 	poolv = pool.Get()
+-	// 	switch vv := poolv.(type) {
+-	// 	case *[8]stringRv:
+-	// 		fkvs = vv[:newlen]
+-	// 	case *[16]stringRv:
+-	// 		fkvs = vv[:newlen]
+-	// 	case *[32]stringRv:
+-	// 		fkvs = vv[:newlen]
+-	// 	case *[64]stringRv:
+-	// 		fkvs = vv[:newlen]
+-	// 	case *[128]stringRv:
+-	// 		fkvs = vv[:newlen]
+-	// 	}
+-	// }
+-
+ 	if newlen <= 8 {
+ 		p = &encStructPool[0]
+ 		v = p.Get()
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/fast-path.generated.go b/cmd/vendor/github.com/ugorji/go/codec/fast-path.generated.go
+index d968a50..f2e5d2d 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/fast-path.generated.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/fast-path.generated.go
+@@ -23,7 +23,7 @@ package codec
+ // Currently support
+ //    - slice of all builtin types,
+ //    - map of all builtin types to string or interface value
+-//    - symetrical maps of all builtin types (e.g. str-str, uint8-uint8)
++//    - symmetrical maps of all builtin types (e.g. str-str, uint8-uint8)
+ // This should provide adequate "typical" implementations.
+ //
+ // Note that fast track decode functions must handle values for which an address cannot be obtained.
+@@ -38,6 +38,8 @@ import (
+ 	"sort"
+ )
+ 
++const fastpathEnabled = true
++
+ const fastpathCheckNilFalse = false // for reflect
+ const fastpathCheckNilTrue = true   // for type switch
+ 
+@@ -81,9 +83,6 @@ var fastpathAV fastpathA
+ 
+ // due to possible initialization loop error, make fastpath in an init()
+ func init() {
+-	if !fastpathEnabled {
+-		return
+-	}
+ 	i := 0
+ 	fn := func(v interface{}, fe func(*encFnInfo, reflect.Value), fd func(*decFnInfo, reflect.Value)) (f fastpathE) {
+ 		xrt := reflect.TypeOf(v)
+@@ -373,9 +372,6 @@ func init() {
+ 
+ // -- -- fast path type switch
+ func fastpathEncodeTypeSwitch(iv interface{}, e *Encoder) bool {
+-	if !fastpathEnabled {
+-		return false
+-	}
+ 	switch v := iv.(type) {
+ 
+ 	case []interface{}:
+@@ -1741,9 +1737,6 @@ func fastpathEncodeTypeSwitch(iv interface{}, e *Encoder) bool {
+ }
+ 
+ func fastpathEncodeTypeSwitchSlice(iv interface{}, e *Encoder) bool {
+-	if !fastpathEnabled {
+-		return false
+-	}
+ 	switch v := iv.(type) {
+ 
+ 	case []interface{}:
+@@ -1829,9 +1822,6 @@ func fastpathEncodeTypeSwitchSlice(iv interface{}, e *Encoder) bool {
+ }
+ 
+ func fastpathEncodeTypeSwitchMap(iv interface{}, e *Encoder) bool {
+-	if !fastpathEnabled {
+-		return false
+-	}
+ 	switch v := iv.(type) {
+ 
+ 	case map[interface{}]interface{}:
+@@ -3124,7 +3114,11 @@ func fastpathEncodeTypeSwitchMap(iv interface{}, e *Encoder) bool {
+ // -- -- fast path functions
+ 
+ func (f *encFnInfo) fastpathEncSliceIntfR(rv reflect.Value) {
+-	fastpathTV.EncSliceIntfV(rv.Interface().([]interface{}), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceIntfV(rv.Interface().([]interface{}), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceIntfV(rv.Interface().([]interface{}), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceIntfV(v []interface{}, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3145,8 +3139,39 @@ func (_ fastpathT) EncSliceIntfV(v []interface{}, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceIntfV(v []interface{}, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		e.encode(v2)
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceStringR(rv reflect.Value) {
+-	fastpathTV.EncSliceStringV(rv.Interface().([]string), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceStringV(rv.Interface().([]string), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceStringV(rv.Interface().([]string), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceStringV(v []string, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3167,8 +3192,39 @@ func (_ fastpathT) EncSliceStringV(v []string, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceStringV(v []string, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeString(c_UTF8, v2)
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceFloat32R(rv reflect.Value) {
+-	fastpathTV.EncSliceFloat32V(rv.Interface().([]float32), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceFloat32V(rv.Interface().([]float32), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceFloat32V(rv.Interface().([]float32), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceFloat32V(v []float32, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3189,8 +3245,39 @@ func (_ fastpathT) EncSliceFloat32V(v []float32, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceFloat32V(v []float32, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeFloat32(v2)
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceFloat64R(rv reflect.Value) {
+-	fastpathTV.EncSliceFloat64V(rv.Interface().([]float64), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceFloat64V(rv.Interface().([]float64), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceFloat64V(rv.Interface().([]float64), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceFloat64V(v []float64, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3211,8 +3298,39 @@ func (_ fastpathT) EncSliceFloat64V(v []float64, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceFloat64V(v []float64, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeFloat64(v2)
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceUintR(rv reflect.Value) {
+-	fastpathTV.EncSliceUintV(rv.Interface().([]uint), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceUintV(rv.Interface().([]uint), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceUintV(rv.Interface().([]uint), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceUintV(v []uint, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3233,8 +3351,39 @@ func (_ fastpathT) EncSliceUintV(v []uint, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceUintV(v []uint, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeUint(uint64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceUint16R(rv reflect.Value) {
+-	fastpathTV.EncSliceUint16V(rv.Interface().([]uint16), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceUint16V(rv.Interface().([]uint16), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceUint16V(rv.Interface().([]uint16), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceUint16V(v []uint16, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3255,8 +3404,39 @@ func (_ fastpathT) EncSliceUint16V(v []uint16, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceUint16V(v []uint16, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeUint(uint64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceUint32R(rv reflect.Value) {
+-	fastpathTV.EncSliceUint32V(rv.Interface().([]uint32), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceUint32V(rv.Interface().([]uint32), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceUint32V(rv.Interface().([]uint32), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceUint32V(v []uint32, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3277,8 +3457,39 @@ func (_ fastpathT) EncSliceUint32V(v []uint32, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceUint32V(v []uint32, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeUint(uint64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceUint64R(rv reflect.Value) {
+-	fastpathTV.EncSliceUint64V(rv.Interface().([]uint64), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceUint64V(rv.Interface().([]uint64), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceUint64V(rv.Interface().([]uint64), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceUint64V(v []uint64, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3299,8 +3510,39 @@ func (_ fastpathT) EncSliceUint64V(v []uint64, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceUint64V(v []uint64, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeUint(uint64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceUintptrR(rv reflect.Value) {
+-	fastpathTV.EncSliceUintptrV(rv.Interface().([]uintptr), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceUintptrV(rv.Interface().([]uintptr), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceUintptrV(rv.Interface().([]uintptr), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceUintptrV(v []uintptr, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3321,8 +3563,39 @@ func (_ fastpathT) EncSliceUintptrV(v []uintptr, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceUintptrV(v []uintptr, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		e.encode(v2)
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceIntR(rv reflect.Value) {
+-	fastpathTV.EncSliceIntV(rv.Interface().([]int), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceIntV(rv.Interface().([]int), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceIntV(rv.Interface().([]int), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceIntV(v []int, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3343,8 +3616,39 @@ func (_ fastpathT) EncSliceIntV(v []int, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceIntV(v []int, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeInt(int64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceInt8R(rv reflect.Value) {
+-	fastpathTV.EncSliceInt8V(rv.Interface().([]int8), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceInt8V(rv.Interface().([]int8), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceInt8V(rv.Interface().([]int8), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceInt8V(v []int8, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3365,8 +3669,39 @@ func (_ fastpathT) EncSliceInt8V(v []int8, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceInt8V(v []int8, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeInt(int64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceInt16R(rv reflect.Value) {
+-	fastpathTV.EncSliceInt16V(rv.Interface().([]int16), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceInt16V(rv.Interface().([]int16), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceInt16V(rv.Interface().([]int16), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceInt16V(v []int16, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3387,8 +3722,39 @@ func (_ fastpathT) EncSliceInt16V(v []int16, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceInt16V(v []int16, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeInt(int64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceInt32R(rv reflect.Value) {
+-	fastpathTV.EncSliceInt32V(rv.Interface().([]int32), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceInt32V(rv.Interface().([]int32), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceInt32V(rv.Interface().([]int32), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceInt32V(v []int32, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3409,8 +3775,39 @@ func (_ fastpathT) EncSliceInt32V(v []int32, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceInt32V(v []int32, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeInt(int64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceInt64R(rv reflect.Value) {
+-	fastpathTV.EncSliceInt64V(rv.Interface().([]int64), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceInt64V(rv.Interface().([]int64), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceInt64V(rv.Interface().([]int64), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceInt64V(v []int64, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3431,8 +3828,39 @@ func (_ fastpathT) EncSliceInt64V(v []int64, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceInt64V(v []int64, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeInt(int64(v2))
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncSliceBoolR(rv reflect.Value) {
+-	fastpathTV.EncSliceBoolV(rv.Interface().([]bool), fastpathCheckNilFalse, f.e)
++	if f.ti.mbs {
++		fastpathTV.EncAsMapSliceBoolV(rv.Interface().([]bool), fastpathCheckNilFalse, f.e)
++	} else {
++		fastpathTV.EncSliceBoolV(rv.Interface().([]bool), fastpathCheckNilFalse, f.e)
++	}
+ }
+ func (_ fastpathT) EncSliceBoolV(v []bool, checkNil bool, e *Encoder) {
+ 	ee := e.e
+@@ -3453,6 +3881,33 @@ func (_ fastpathT) EncSliceBoolV(v []bool, checkNil bool, e *Encoder) {
+ 	}
+ }
+ 
++func (_ fastpathT) EncAsMapSliceBoolV(v []bool, checkNil bool, e *Encoder) {
++	ee := e.e
++	cr := e.cr
++	if checkNil && v == nil {
++		ee.EncodeNil()
++		return
++	}
++	if len(v)%2 == 1 {
++		e.errorf("mapBySlice requires even slice length, but got %v", len(v))
++		return
++	}
++	ee.EncodeMapStart(len(v) / 2)
++	for j, v2 := range v {
++		if cr != nil {
++			if j%2 == 0 {
++				cr.sendContainerState(containerMapKey)
++			} else {
++				cr.sendContainerState(containerMapValue)
++			}
++		}
++		ee.EncodeBool(v2)
++	}
++	if cr != nil {
++		cr.sendContainerState(containerMapEnd)
++	}
++}
++
+ func (f *encFnInfo) fastpathEncMapIntfIntfR(rv reflect.Value) {
+ 	fastpathTV.EncMapIntfIntfV(rv.Interface().(map[interface{}]interface{}), fastpathCheckNilFalse, f.e)
+ }
+@@ -15489,9 +15944,6 @@ func (_ fastpathT) EncMapBoolBoolV(v map[bool]bool, checkNil bool, e *Encoder) {
+ 
+ // -- -- fast path type switch
+ func fastpathDecodeTypeSwitch(iv interface{}, d *Decoder) bool {
+-	if !fastpathEnabled {
+-		return false
+-	}
+ 	switch v := iv.(type) {
+ 
+ 	case []interface{}:
+@@ -17712,7 +18164,7 @@ func (_ fastpathT) DecSliceIntfV(v []interface{}, checkNil bool, canChange bool,
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -17771,7 +18223,7 @@ func (_ fastpathT) DecSliceIntfV(v []interface{}, checkNil bool, canChange bool,
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]interface{}, 1, 4)
+@@ -17846,7 +18298,7 @@ func (_ fastpathT) DecSliceStringV(v []string, checkNil bool, canChange bool, d
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -17905,7 +18357,7 @@ func (_ fastpathT) DecSliceStringV(v []string, checkNil bool, canChange bool, d
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]string, 1, 4)
+@@ -17979,7 +18431,7 @@ func (_ fastpathT) DecSliceFloat32V(v []float32, checkNil bool, canChange bool,
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18038,7 +18490,7 @@ func (_ fastpathT) DecSliceFloat32V(v []float32, checkNil bool, canChange bool,
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]float32, 1, 4)
+@@ -18112,7 +18564,7 @@ func (_ fastpathT) DecSliceFloat64V(v []float64, checkNil bool, canChange bool,
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18171,7 +18623,7 @@ func (_ fastpathT) DecSliceFloat64V(v []float64, checkNil bool, canChange bool,
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]float64, 1, 4)
+@@ -18245,7 +18697,7 @@ func (_ fastpathT) DecSliceUintV(v []uint, checkNil bool, canChange bool, d *Dec
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18304,7 +18756,7 @@ func (_ fastpathT) DecSliceUintV(v []uint, checkNil bool, canChange bool, d *Dec
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]uint, 1, 4)
+@@ -18378,7 +18830,7 @@ func (_ fastpathT) DecSliceUint16V(v []uint16, checkNil bool, canChange bool, d
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18437,7 +18889,7 @@ func (_ fastpathT) DecSliceUint16V(v []uint16, checkNil bool, canChange bool, d
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]uint16, 1, 4)
+@@ -18511,7 +18963,7 @@ func (_ fastpathT) DecSliceUint32V(v []uint32, checkNil bool, canChange bool, d
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18570,7 +19022,7 @@ func (_ fastpathT) DecSliceUint32V(v []uint32, checkNil bool, canChange bool, d
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]uint32, 1, 4)
+@@ -18644,7 +19096,7 @@ func (_ fastpathT) DecSliceUint64V(v []uint64, checkNil bool, canChange bool, d
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18703,7 +19155,7 @@ func (_ fastpathT) DecSliceUint64V(v []uint64, checkNil bool, canChange bool, d
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]uint64, 1, 4)
+@@ -18777,7 +19229,7 @@ func (_ fastpathT) DecSliceUintptrV(v []uintptr, checkNil bool, canChange bool,
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18836,7 +19288,7 @@ func (_ fastpathT) DecSliceUintptrV(v []uintptr, checkNil bool, canChange bool,
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]uintptr, 1, 4)
+@@ -18910,7 +19362,7 @@ func (_ fastpathT) DecSliceIntV(v []int, checkNil bool, canChange bool, d *Decod
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -18969,7 +19421,7 @@ func (_ fastpathT) DecSliceIntV(v []int, checkNil bool, canChange bool, d *Decod
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]int, 1, 4)
+@@ -19043,7 +19495,7 @@ func (_ fastpathT) DecSliceInt8V(v []int8, checkNil bool, canChange bool, d *Dec
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -19102,7 +19554,7 @@ func (_ fastpathT) DecSliceInt8V(v []int8, checkNil bool, canChange bool, d *Dec
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]int8, 1, 4)
+@@ -19176,7 +19628,7 @@ func (_ fastpathT) DecSliceInt16V(v []int16, checkNil bool, canChange bool, d *D
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -19235,7 +19687,7 @@ func (_ fastpathT) DecSliceInt16V(v []int16, checkNil bool, canChange bool, d *D
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]int16, 1, 4)
+@@ -19309,7 +19761,7 @@ func (_ fastpathT) DecSliceInt32V(v []int32, checkNil bool, canChange bool, d *D
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -19368,7 +19820,7 @@ func (_ fastpathT) DecSliceInt32V(v []int32, checkNil bool, canChange bool, d *D
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]int32, 1, 4)
+@@ -19442,7 +19894,7 @@ func (_ fastpathT) DecSliceInt64V(v []int64, checkNil bool, canChange bool, d *D
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -19501,7 +19953,7 @@ func (_ fastpathT) DecSliceInt64V(v []int64, checkNil bool, canChange bool, d *D
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]int64, 1, 4)
+@@ -19575,7 +20027,7 @@ func (_ fastpathT) DecSliceBoolV(v []bool, checkNil bool, canChange bool, d *Dec
+ 			changed = true
+ 		}
+ 		slh.End()
+-		return
++		return v, changed
+ 	}
+ 
+ 	if containerLenS > 0 {
+@@ -19634,7 +20086,7 @@ func (_ fastpathT) DecSliceBoolV(v []bool, checkNil bool, canChange bool, d *Dec
+ 				changed = true
+ 			}
+ 			slh.End()
+-			return
++			return v, changed
+ 		}
+ 		if cap(v) == 0 {
+ 			v = make([]bool, 1, 4)
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/fast-path.not.go b/cmd/vendor/github.com/ugorji/go/codec/fast-path.not.go
+index d6f5f0c..63e5911 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/fast-path.not.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/fast-path.not.go
+@@ -4,6 +4,8 @@ package codec
+ 
+ import "reflect"
+ 
++const fastpathEnabled = false
++
+ // The generated fast-path code is very large, and adds a few seconds to the build time.
+ // This causes test execution, execution of small tools which use codec, etc
+ // to take a long time.
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/gen-helper.generated.go b/cmd/vendor/github.com/ugorji/go/codec/gen-helper.generated.go
+index 22bce77..96a6b61 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/gen-helper.generated.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/gen-helper.generated.go
+@@ -1,4 +1,4 @@
+-// //+build ignore
++// // +build ignore
+ 
+ // Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
+ // Use of this source code is governed by a MIT license found in the LICENSE file.
+@@ -17,7 +17,7 @@ import (
+ 
+ // This file is used to generate helper code for codecgen.
+ // The values here i.e. genHelper(En|De)coder are not to be used directly by
+-// library users. They WILL change continously and without notice.
++// library users. They WILL change continuously and without notice.
+ //
+ // To help enforce this, we create an unexported type with exported members.
+ // The only way to get the type is via the one exported type that we control (somewhat).
+@@ -84,6 +84,11 @@ func (f genHelperEncoder) EncBinaryMarshal(iv encoding.BinaryMarshaler) {
+ }
+ 
+ // FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
++func (f genHelperEncoder) EncRaw(iv Raw) {
++	f.e.raw(iv)
++}
++
++// FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
+ func (f genHelperEncoder) TimeRtidIfBinc() uintptr {
+ 	if _, ok := f.e.hh.(*BincHandle); ok {
+ 		return timeTypId
+@@ -192,6 +197,11 @@ func (f genHelperDecoder) DecBinaryUnmarshal(bm encoding.BinaryUnmarshaler) {
+ }
+ 
+ // FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
++func (f genHelperDecoder) DecRaw() []byte {
++	return f.d.raw()
++}
++
++// FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
+ func (f genHelperDecoder) TimeRtidIfBinc() uintptr {
+ 	if _, ok := f.d.hh.(*BincHandle); ok {
+ 		return timeTypId
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/gen.generated.go b/cmd/vendor/github.com/ugorji/go/codec/gen.generated.go
+index fb6f4b8..2ace97b 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/gen.generated.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/gen.generated.go
+@@ -68,8 +68,9 @@ z.DecSendContainerState(codecSelfer_containerMapEnd{{ .Sfx }})
+ 
+ const genDecListTmpl = `
+ {{var "v"}} := {{if not isArray}}*{{end}}{{ .Varname }}
+-{{var "h"}}, {{var "l"}} := z.DecSliceHelperStart() {{/* // helper, containerLenS */}}
++{{var "h"}}, {{var "l"}} := z.DecSliceHelperStart() {{/* // helper, containerLenS */}}{{if not isArray}}
+ var {{var "c"}} bool {{/* // changed */}}
++_ = {{var "c"}}{{end}}
+ if {{var "l"}} == 0 {
+ 	{{if isSlice }}if {{var "v"}} == nil {
+ 		{{var "v"}} = []{{ .Typ }}{}
+@@ -95,6 +96,8 @@ if {{var "l"}} == 0 {
+ 	}
+ 	{{ else }}	var {{var "rr"}}, {{var "rl"}} int {{/* // num2read, length of slice/array/chan */}}
+ 	var {{var "rt"}} bool {{/* truncated */}}
++	_, _ = {{var "rl"}}, {{var "rt"}}
++	{{var "rr"}} = {{var "l"}} // len({{var "v"}})
+ 	if {{var "l"}} > cap({{var "v"}}) {
+ 		{{if isArray }}z.DecArrayCannotExpand(len({{var "v"}}), {{var "l"}})
+ 		{{ else }}{{if not .Immutable }}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/gen.go b/cmd/vendor/github.com/ugorji/go/codec/gen.go
+index a075e7c..1a27675 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/gen.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/gen.go
+@@ -12,7 +12,6 @@ import (
+ 	"io"
+ 	"io/ioutil"
+ 	"math/rand"
+-	"os"
+ 	"reflect"
+ 	"regexp"
+ 	"sort"
+@@ -21,11 +20,14 @@ import (
+ 	"sync"
+ 	"text/template"
+ 	"time"
++	"unicode"
++	"unicode/utf8"
+ )
+ 
+ // ---------------------------------------------------
+ // codecgen supports the full cycle of reflection-based codec:
+ //    - RawExt
++//    - Raw
+ //    - Builtins
+ //    - Extensions
+ //    - (Binary|Text|JSON)(Unm|M)arshal
+@@ -76,7 +78,7 @@ import (
+ // codecgen will panic if the file was generated with an old version of the library in use.
+ //
+ // Note:
+-//   It was a concious decision to have gen.go always explicitly call EncodeNil or TryDecodeAsNil.
++//   It was a conscious decision to have gen.go always explicitly call EncodeNil or TryDecodeAsNil.
+ //   This way, there isn't a function call overhead just to see that we should not enter a block of code.
+ 
+ // GenVersion is the current version of codecgen.
+@@ -124,6 +126,7 @@ var (
+ 	genExpectArrayOrMapErr = errors.New("unexpected type. Expecting array/map/slice")
+ 	genBase64enc           = base64.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789__")
+ 	genQNameRegex          = regexp.MustCompile(`[A-Za-z_.]+`)
++	genCheckVendor         bool
+ )
+ 
+ // genRunner holds some state used during a Gen run.
+@@ -162,6 +165,16 @@ type genRunner struct {
+ //
+ // Library users: *DO NOT USE IT DIRECTLY. IT WILL CHANGE CONTINOUSLY WITHOUT NOTICE.*
+ func Gen(w io.Writer, buildTags, pkgName, uid string, useUnsafe bool, ti *TypeInfos, typ ...reflect.Type) {
++	// trim out all types which already implement Selfer
++	typ2 := make([]reflect.Type, 0, len(typ))
++	for _, t := range typ {
++		if reflect.PtrTo(t).Implements(selferTyp) || t.Implements(selferTyp) {
++			continue
++		}
++		typ2 = append(typ2, t)
++	}
++	typ = typ2
++
+ 	if len(typ) == 0 {
+ 		return
+ 	}
+@@ -199,7 +212,7 @@ func Gen(w io.Writer, buildTags, pkgName, uid string, useUnsafe bool, ti *TypeIn
+ 		x.genRefPkgs(t)
+ 	}
+ 	if buildTags != "" {
+-		x.line("//+build " + buildTags)
++		x.line("// +build " + buildTags)
+ 		x.line("")
+ 	}
+ 	x.line(`
+@@ -266,6 +279,7 @@ func Gen(w io.Writer, buildTags, pkgName, uid string, useUnsafe bool, ti *TypeIn
+ 	x.line("type " + x.hn + " struct{}")
+ 	x.line("")
+ 
++	x.varsfxreset()
+ 	x.line("func init() {")
+ 	x.linef("if %sGenVersion != %v {", x.cpfx, GenVersion)
+ 	x.line("_, file, _, _ := runtime.Caller(0)")
+@@ -309,6 +323,7 @@ func Gen(w io.Writer, buildTags, pkgName, uid string, useUnsafe bool, ti *TypeIn
+ 	for _, t := range x.ts {
+ 		rtid := reflect.ValueOf(t).Pointer()
+ 		// generate enc functions for all these slice/map types.
++		x.varsfxreset()
+ 		x.linef("func (x %s) enc%s(v %s%s, e *%sEncoder) {", x.hn, x.genMethodNameT(t), x.arr2str(t, "*"), x.genTypeName(t), x.cpfx)
+ 		x.genRequiredMethodVars(true)
+ 		switch t.Kind() {
+@@ -323,6 +338,7 @@ func Gen(w io.Writer, buildTags, pkgName, uid string, useUnsafe bool, ti *TypeIn
+ 		x.line("")
+ 
+ 		// generate dec functions for all these slice/map types.
++		x.varsfxreset()
+ 		x.linef("func (x %s) dec%s(v *%s, d *%sDecoder) {", x.hn, x.genMethodNameT(t), x.genTypeName(t), x.cpfx)
+ 		x.genRequiredMethodVars(false)
+ 		switch t.Kind() {
+@@ -377,7 +393,7 @@ func (x *genRunner) genRefPkgs(t reflect.Type) {
+ 				x.imn[tpkg] = tpkg
+ 			} else {
+ 				x.imc++
+-				x.imn[tpkg] = "pkg" + strconv.FormatUint(x.imc, 10) + "_" + tpkg[idx+1:]
++				x.imn[tpkg] = "pkg" + strconv.FormatUint(x.imc, 10) + "_" + genGoIdentifier(tpkg[idx+1:], false)
+ 			}
+ 		}
+ 	}
+@@ -408,6 +424,10 @@ func (x *genRunner) varsfx() string {
+ 	return strconv.FormatUint(x.c, 10)
+ }
+ 
++func (x *genRunner) varsfxreset() {
++	x.c = 0
++}
++
+ func (x *genRunner) out(s string) {
+ 	if _, err := io.WriteString(x.w, s); err != nil {
+ 		panic(err)
+@@ -494,6 +514,7 @@ func (x *genRunner) selfer(encode bool) {
+ 	// always make decode use a pointer receiver,
+ 	// and structs always use a ptr receiver (encode|decode)
+ 	isptr := !encode || t.Kind() == reflect.Struct
++	x.varsfxreset()
+ 	fnSigPfx := "func (x "
+ 	if isptr {
+ 		fnSigPfx += "*"
+@@ -566,9 +587,28 @@ func (x *genRunner) xtraSM(varname string, encode bool, t reflect.Type) {
+ 	} else {
+ 		x.linef("h.dec%s((*%s)(%s), d)", x.genMethodNameT(t), x.genTypeName(t), varname)
+ 	}
+-	if _, ok := x.tm[t]; !ok {
+-		x.tm[t] = struct{}{}
+-		x.ts = append(x.ts, t)
++	x.registerXtraT(t)
++}
++
++func (x *genRunner) registerXtraT(t reflect.Type) {
++	// recursively register the types
++	if _, ok := x.tm[t]; ok {
++		return
++	}
++	var tkey reflect.Type
++	switch t.Kind() {
++	case reflect.Chan, reflect.Slice, reflect.Array:
++	case reflect.Map:
++		tkey = t.Key()
++	default:
++		return
++	}
++	x.tm[t] = struct{}{}
++	x.ts = append(x.ts, t)
++	// check if this refers to any xtra types eg. a slice of array: add the array
++	x.registerXtraT(t.Elem())
++	if tkey != nil {
++		x.registerXtraT(tkey)
+ 	}
+ }
+ 
+@@ -608,22 +648,33 @@ func (x *genRunner) encVar(varname string, t reflect.Type) {
+ 
+ }
+ 
+-// enc will encode a variable (varname) of type T,
+-// except t is of kind reflect.Struct or reflect.Array, wherein varname is of type *T (to prevent copying)
++// enc will encode a variable (varname) of type t,
++// except t is of kind reflect.Struct or reflect.Array, wherein varname is of type ptrTo(T) (to prevent copying)
+ func (x *genRunner) enc(varname string, t reflect.Type) {
+-	// varName here must be to a pointer to a struct/array, or to a value directly.
+ 	rtid := reflect.ValueOf(t).Pointer()
+ 	// We call CodecEncodeSelf if one of the following are honored:
+ 	//   - the type already implements Selfer, call that
+ 	//   - the type has a Selfer implementation just created, use that
+ 	//   - the type is in the list of the ones we will generate for, but it is not currently being generated
+ 
++	mi := x.varsfx()
+ 	tptr := reflect.PtrTo(t)
+ 	tk := t.Kind()
+ 	if x.checkForSelfer(t, varname) {
+-		if t.Implements(selferTyp) || (tptr.Implements(selferTyp) && (tk == reflect.Array || tk == reflect.Struct)) {
+-			x.line(varname + ".CodecEncodeSelf(e)")
+-			return
++		if tk == reflect.Array || tk == reflect.Struct { // varname is of type *T
++			if tptr.Implements(selferTyp) || t.Implements(selferTyp) {
++				x.line(varname + ".CodecEncodeSelf(e)")
++				return
++			}
++		} else { // varname is of type T
++			if t.Implements(selferTyp) {
++				x.line(varname + ".CodecEncodeSelf(e)")
++				return
++			} else if tptr.Implements(selferTyp) {
++				x.linef("%ssf%s := &%s", genTempVarPfx, mi, varname)
++				x.linef("%ssf%s.CodecEncodeSelf(e)", genTempVarPfx, mi)
++				return
++			}
+ 		}
+ 
+ 		if _, ok := x.te[rtid]; ok {
+@@ -651,14 +702,17 @@ func (x *genRunner) enc(varname string, t reflect.Type) {
+ 	}
+ 
+ 	// check if
+-	//   - type is RawExt
++	//   - type is RawExt, Raw
+ 	//   - the type implements (Text|JSON|Binary)(Unm|M)arshal
+-	mi := x.varsfx()
+ 	x.linef("%sm%s := z.EncBinary()", genTempVarPfx, mi)
+ 	x.linef("_ = %sm%s", genTempVarPfx, mi)
+ 	x.line("if false {")           //start if block
+ 	defer func() { x.line("}") }() //end if block
+ 
++	if t == rawTyp {
++		x.linef("} else { z.EncRaw(%v)", varname)
++		return
++	}
+ 	if t == rawExtTyp {
+ 		x.linef("} else { r.EncodeRawExt(%v, e)", varname)
+ 		return
+@@ -676,15 +730,31 @@ func (x *genRunner) enc(varname string, t reflect.Type) {
+ 		// first check if extensions are configued, before doing the interface conversion
+ 		x.linef("} else if z.HasExtensions() && z.EncExt(%s) {", varname)
+ 	}
+-	if t.Implements(binaryMarshalerTyp) || tptr.Implements(binaryMarshalerTyp) {
+-		x.linef("} else if %sm%s { z.EncBinaryMarshal(%v) ", genTempVarPfx, mi, varname)
+-	}
+-	if t.Implements(jsonMarshalerTyp) || tptr.Implements(jsonMarshalerTyp) {
+-		x.linef("} else if !%sm%s && z.IsJSONHandle() { z.EncJSONMarshal(%v) ", genTempVarPfx, mi, varname)
+-	} else if t.Implements(textMarshalerTyp) || tptr.Implements(textMarshalerTyp) {
+-		x.linef("} else if !%sm%s { z.EncTextMarshal(%v) ", genTempVarPfx, mi, varname)
++	if tk == reflect.Array || tk == reflect.Struct { // varname is of type *T
++		if t.Implements(binaryMarshalerTyp) || tptr.Implements(binaryMarshalerTyp) {
++			x.linef("} else if %sm%s { z.EncBinaryMarshal(%v) ", genTempVarPfx, mi, varname)
++		}
++		if t.Implements(jsonMarshalerTyp) || tptr.Implements(jsonMarshalerTyp) {
++			x.linef("} else if !%sm%s && z.IsJSONHandle() { z.EncJSONMarshal(%v) ", genTempVarPfx, mi, varname)
++		} else if t.Implements(textMarshalerTyp) || tptr.Implements(textMarshalerTyp) {
++			x.linef("} else if !%sm%s { z.EncTextMarshal(%v) ", genTempVarPfx, mi, varname)
++		}
++	} else { // varname is of type T
++		if t.Implements(binaryMarshalerTyp) {
++			x.linef("} else if %sm%s { z.EncBinaryMarshal(%v) ", genTempVarPfx, mi, varname)
++		} else if tptr.Implements(binaryMarshalerTyp) {
++			x.linef("} else if %sm%s { z.EncBinaryMarshal(&%v) ", genTempVarPfx, mi, varname)
++		}
++		if t.Implements(jsonMarshalerTyp) {
++			x.linef("} else if !%sm%s && z.IsJSONHandle() { z.EncJSONMarshal(%v) ", genTempVarPfx, mi, varname)
++		} else if tptr.Implements(jsonMarshalerTyp) {
++			x.linef("} else if !%sm%s && z.IsJSONHandle() { z.EncJSONMarshal(&%v) ", genTempVarPfx, mi, varname)
++		} else if t.Implements(textMarshalerTyp) {
++			x.linef("} else if !%sm%s { z.EncTextMarshal(%v) ", genTempVarPfx, mi, varname)
++		} else if tptr.Implements(textMarshalerTyp) {
++			x.linef("} else if !%sm%s { z.EncTextMarshal(&%v) ", genTempVarPfx, mi, varname)
++		}
+ 	}
+-
+ 	x.line("} else {")
+ 
+ 	switch t.Kind() {
+@@ -922,6 +992,14 @@ func (x *genRunner) encStruct(varname string, rtid uintptr, t reflect.Type) {
+ }
+ 
+ func (x *genRunner) encListFallback(varname string, t reflect.Type) {
++	if t.AssignableTo(uint8SliceTyp) {
++		x.linef("r.EncodeStringBytes(codecSelferC_RAW%s, []byte(%s))", x.xs, varname)
++		return
++	}
++	if t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8 {
++		x.linef("r.EncodeStringBytes(codecSelferC_RAW%s, ([%v]byte(%s))[:])", x.xs, t.Len(), varname)
++		return
++	}
+ 	i := x.varsfx()
+ 	g := genTempVarPfx
+ 	x.line("r.EncodeArrayStart(len(" + varname + "))")
+@@ -1020,6 +1098,8 @@ func (x *genRunner) decVar(varname string, t reflect.Type, canBeNil bool) {
+ 	}
+ }
+ 
++// dec will decode a variable (varname) of type ptrTo(t).
++// t is always a basetype (i.e. not of kind reflect.Ptr).
+ func (x *genRunner) dec(varname string, t reflect.Type) {
+ 	// assumptions:
+ 	//   - the varname is to a pointer already. No need to take address of it
+@@ -1056,7 +1136,7 @@ func (x *genRunner) dec(varname string, t reflect.Type) {
+ 	}
+ 
+ 	// check if
+-	//   - type is RawExt
++	//   - type is Raw, RawExt
+ 	//   - the type implements (Text|JSON|Binary)(Unm|M)arshal
+ 	mi := x.varsfx()
+ 	x.linef("%sm%s := z.DecBinary()", genTempVarPfx, mi)
+@@ -1064,6 +1144,10 @@ func (x *genRunner) dec(varname string, t reflect.Type) {
+ 	x.line("if false {")           //start if block
+ 	defer func() { x.line("}") }() //end if block
+ 
++	if t == rawTyp {
++		x.linef("} else { *%v = z.DecRaw()", varname)
++		return
++	}
+ 	if t == rawExtTyp {
+ 		x.linef("} else { r.DecodeExt(%v, 0, nil)", varname)
+ 		return
+@@ -1189,59 +1273,49 @@ func (x *genRunner) dec(varname string, t reflect.Type) {
+ }
+ 
+ func (x *genRunner) decTryAssignPrimitive(varname string, t reflect.Type) (tryAsPtr bool) {
+-	// We have to use the actual type name when doing a direct assignment.
+-	// We don't have the luxury of casting the pointer to the underlying type.
+-	//
+-	// Consequently, in the situation of a
+-	//     type Message int32
+-	//     var x Message
+-	//     var i int32 = 32
+-	//     x = i // this will bomb
+-	//     x = Message(i) // this will work
+-	//     *((*int32)(&x)) = i // this will work
+-	//
+-	// Consequently, we replace:
+-	//      case reflect.Uint32: x.line(varname + " = uint32(r.DecodeUint(32))")
+-	// with:
+-	//      case reflect.Uint32: x.line(varname + " = " + genTypeNamePrim(t, x.tc) + "(r.DecodeUint(32))")
++	// This should only be used for exact primitives (ie un-named types).
++	// Named types may be implementations of Selfer, Unmarshaler, etc.
++	// They should be handled by dec(...)
+ 
+-	xfn := func(t reflect.Type) string {
+-		return x.genTypeNamePrim(t)
++	if t.Name() != "" {
++		tryAsPtr = true
++		return
+ 	}
++
+ 	switch t.Kind() {
+ 	case reflect.Int:
+-		x.linef("%s = %s(r.DecodeInt(codecSelferBitsize%s))", varname, xfn(t), x.xs)
++		x.linef("%s = r.DecodeInt(codecSelferBitsize%s)", varname, x.xs)
+ 	case reflect.Int8:
+-		x.linef("%s = %s(r.DecodeInt(8))", varname, xfn(t))
++		x.linef("%s = r.DecodeInt(8)", varname)
+ 	case reflect.Int16:
+-		x.linef("%s = %s(r.DecodeInt(16))", varname, xfn(t))
++		x.linef("%s = r.DecodeInt(16)", varname)
+ 	case reflect.Int32:
+-		x.linef("%s = %s(r.DecodeInt(32))", varname, xfn(t))
++		x.linef("%s = r.DecodeInt(32)", varname)
+ 	case reflect.Int64:
+-		x.linef("%s = %s(r.DecodeInt(64))", varname, xfn(t))
++		x.linef("%s = r.DecodeInt(64)", varname)
+ 
+ 	case reflect.Uint:
+-		x.linef("%s = %s(r.DecodeUint(codecSelferBitsize%s))", varname, xfn(t), x.xs)
++		x.linef("%s = r.DecodeUint(codecSelferBitsize%s)", varname, x.xs)
+ 	case reflect.Uint8:
+-		x.linef("%s = %s(r.DecodeUint(8))", varname, xfn(t))
++		x.linef("%s = r.DecodeUint(8)", varname)
+ 	case reflect.Uint16:
+-		x.linef("%s = %s(r.DecodeUint(16))", varname, xfn(t))
++		x.linef("%s = r.DecodeUint(16)", varname)
+ 	case reflect.Uint32:
+-		x.linef("%s = %s(r.DecodeUint(32))", varname, xfn(t))
++		x.linef("%s = r.DecodeUint(32)", varname)
+ 	case reflect.Uint64:
+-		x.linef("%s = %s(r.DecodeUint(64))", varname, xfn(t))
++		x.linef("%s = r.DecodeUint(64)", varname)
+ 	case reflect.Uintptr:
+-		x.linef("%s = %s(r.DecodeUint(codecSelferBitsize%s))", varname, xfn(t), x.xs)
++		x.linef("%s = r.DecodeUint(codecSelferBitsize%s)", varname, x.xs)
+ 
+ 	case reflect.Float32:
+-		x.linef("%s = %s(r.DecodeFloat(true))", varname, xfn(t))
++		x.linef("%s = r.DecodeFloat(true)", varname)
+ 	case reflect.Float64:
+-		x.linef("%s = %s(r.DecodeFloat(false))", varname, xfn(t))
++		x.linef("%s = r.DecodeFloat(false)", varname)
+ 
+ 	case reflect.Bool:
+-		x.linef("%s = %s(r.DecodeBool())", varname, xfn(t))
++		x.linef("%s = r.DecodeBool()", varname)
+ 	case reflect.String:
+-		x.linef("%s = %s(r.DecodeString())", varname, xfn(t))
++		x.linef("%s = r.DecodeString()", varname)
+ 	default:
+ 		tryAsPtr = true
+ 	}
+@@ -1249,6 +1323,14 @@ func (x *genRunner) decTryAssignPrimitive(varname string, t reflect.Type) (tryAs
+ }
+ 
+ func (x *genRunner) decListFallback(varname string, rtid uintptr, t reflect.Type) {
++	if t.AssignableTo(uint8SliceTyp) {
++		x.line("*" + varname + " = r.DecodeBytes(*((*[]byte)(" + varname + ")), false, false)")
++		return
++	}
++	if t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8 {
++		x.linef("r.DecodeBytes( ((*[%s]byte)(%s))[:], false, true)", t.Len(), varname)
++		return
++	}
+ 	type tstruc struct {
+ 		TempVar   string
+ 		Rand      string
+@@ -1364,7 +1446,7 @@ func (x *genRunner) decStructMapSwitch(kName string, varname string, rtid uintpt
+ 		if si.i != -1 {
+ 			t2 = t.Field(int(si.i))
+ 		} else {
+-			//we must accomodate anonymous fields, where the embedded field is a nil pointer in the value.
++			//we must accommodate anonymous fields, where the embedded field is a nil pointer in the value.
+ 			// t2 = t.FieldByIndex(si.is)
+ 			t2typ := t
+ 			varname3 := varname
+@@ -1452,7 +1534,7 @@ func (x *genRunner) decStructArray(varname, lenvarname, breakString string, rtid
+ 		if si.i != -1 {
+ 			t2 = t.Field(int(si.i))
+ 		} else {
+-			//we must accomodate anonymous fields, where the embedded field is a nil pointer in the value.
++			//we must accommodate anonymous fields, where the embedded field is a nil pointer in the value.
+ 			// t2 = t.FieldByIndex(si.is)
+ 			t2typ := t
+ 			varname3 := varname
+@@ -1569,8 +1651,6 @@ func (x *genV) MethodNamePfx(prefix string, prim bool) string {
+ 
+ }
+ 
+-var genCheckVendor = os.Getenv("GO15VENDOREXPERIMENT") == "1"
+-
+ // genImportPath returns import path of a non-predeclared named typed, or an empty string otherwise.
+ //
+ // This handles the misbehaviour that occurs when 1.5-style vendoring is enabled,
+@@ -1592,6 +1672,26 @@ func genImportPath(t reflect.Type) (s string) {
+ 	return
+ }
+ 
++// A go identifier is (letter|_)[letter|number|_]*
++func genGoIdentifier(s string, checkFirstChar bool) string {
++	b := make([]byte, 0, len(s))
++	t := make([]byte, 4)
++	var n int
++	for i, r := range s {
++		if checkFirstChar && i == 0 && !unicode.IsLetter(r) {
++			b = append(b, '_')
++		}
++		// r must be unicode_letter, unicode_digit or _
++		if unicode.IsLetter(r) || unicode.IsDigit(r) {
++			n = utf8.EncodeRune(t, r)
++			b = append(b, t[:n]...)
++		} else {
++			b = append(b, '_')
++		}
++	}
++	return string(b)
++}
++
+ func genNonPtr(t reflect.Type) reflect.Type {
+ 	for t.Kind() == reflect.Ptr {
+ 		t = t.Elem()
+@@ -1601,7 +1701,7 @@ func genNonPtr(t reflect.Type) reflect.Type {
+ 
+ func genTitleCaseName(s string) string {
+ 	switch s {
+-	case "interface{}":
++	case "interface{}", "interface {}":
+ 		return "Intf"
+ 	default:
+ 		return strings.ToUpper(s[0:1]) + s[1:]
+@@ -1704,7 +1804,7 @@ func (x genInternal) FastpathLen() (l int) {
+ 
+ func genInternalZeroValue(s string) string {
+ 	switch s {
+-	case "interface{}":
++	case "interface{}", "interface {}":
+ 		return "nil"
+ 	case "bool":
+ 		return "false"
+@@ -1856,7 +1956,7 @@ func genInternalInit() {
+ 	}
+ 	var gt genInternal
+ 
+-	// For each slice or map type, there must be a (symetrical) Encode and Decode fast-path function
++	// For each slice or map type, there must be a (symmetrical) Encode and Decode fast-path function
+ 	for _, s := range types {
+ 		gt.Values = append(gt.Values, genV{Primitive: s, Size: mapvaltypes2[s]})
+ 		if s != "uint8" { // do not generate fast path for slice of bytes. Treat specially already.
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/gen_15.go b/cmd/vendor/github.com/ugorji/go/codec/gen_15.go
+new file mode 100644
+index 0000000..ab76c31
+--- /dev/null
++++ b/cmd/vendor/github.com/ugorji/go/codec/gen_15.go
+@@ -0,0 +1,12 @@
++// Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
++// Use of this source code is governed by a MIT license found in the LICENSE file.
++
++// +build go1.5,!go1.6
++
++package codec
++
++import "os"
++
++func init() {
++	genCheckVendor = os.Getenv("GO15VENDOREXPERIMENT") == "1"
++}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/gen_16.go b/cmd/vendor/github.com/ugorji/go/codec/gen_16.go
+new file mode 100644
+index 0000000..87c04e2
+--- /dev/null
++++ b/cmd/vendor/github.com/ugorji/go/codec/gen_16.go
+@@ -0,0 +1,12 @@
++// Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
++// Use of this source code is governed by a MIT license found in the LICENSE file.
++
++// +build go1.6
++
++package codec
++
++import "os"
++
++func init() {
++	genCheckVendor = os.Getenv("GO15VENDOREXPERIMENT") != "0"
++}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/gen_17.go b/cmd/vendor/github.com/ugorji/go/codec/gen_17.go
+new file mode 100644
+index 0000000..3881a43
+--- /dev/null
++++ b/cmd/vendor/github.com/ugorji/go/codec/gen_17.go
+@@ -0,0 +1,10 @@
++// Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
++// Use of this source code is governed by a MIT license found in the LICENSE file.
++
++// +build go1.7
++
++package codec
++
++func init() {
++	genCheckVendor = true
++}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/helper.go b/cmd/vendor/github.com/ugorji/go/codec/helper.go
+index 560014a..8b94fc1 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/helper.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/helper.go
+@@ -38,10 +38,6 @@ package codec
+ // a length prefix, or if it used explicit breaks. If length-prefixed, we assume that
+ // it has to be binary, and we do not even try to read separators.
+ //
+-// The only codec that may suffer (slightly) is cbor, and only when decoding indefinite-length.
+-// It may suffer because we treat it like a text-based codec, and read separators.
+-// However, this read is a no-op and the cost is insignificant.
+-//
+ // Philosophy
+ // ------------
+ // On decode, this codec will update containers appropriately:
+@@ -137,17 +133,6 @@ const (
+ 	// Note that this will always cause rpc tests to fail, since they need io.EOF sent via panic.
+ 	recoverPanicToErr = true
+ 
+-	// Fast path functions try to create a fast path encode or decode implementation
+-	// for common maps and slices, by by-passing reflection altogether.
+-	fastpathEnabled = true
+-
+-	// if checkStructForEmptyValue, check structs fields to see if an empty value.
+-	// This could be an expensive call, so possibly disable it.
+-	checkStructForEmptyValue = false
+-
+-	// if derefForIsEmptyValue, deref pointers and interfaces when checking isEmptyValue
+-	derefForIsEmptyValue = false
+-
+ 	// if resetSliceElemToZeroValue, then on decoding a slice, reset the element to a zero value first.
+ 	// Only concern is that, if the slice already contained some garbage, we will decode into that garbage.
+ 	// The chances of this are slim, so leave this "optimization".
+@@ -155,8 +140,10 @@ const (
+ 	resetSliceElemToZeroValue bool = false
+ )
+ 
+-var oneByteArr = [1]byte{0}
+-var zeroByteSlice = oneByteArr[:0:0]
++var (
++	oneByteArr    = [1]byte{0}
++	zeroByteSlice = oneByteArr[:0:0]
++)
+ 
+ type charEncoding uint8
+ 
+@@ -215,6 +202,41 @@ const (
+ 	containerArrayEnd
+ )
+ 
++// sfiIdx used for tracking where a (field/enc)Name is seen in a []*structFieldInfo
++type sfiIdx struct {
++	name  string
++	index int
++}
++
++// do not recurse if a containing type refers to an embedded type
++// which refers back to its containing type (via a pointer).
++// The second time this back-reference happens, break out,
++// so as not to cause an infinite loop.
++const rgetMaxRecursion = 2
++
++// Anecdotally, we believe most types have <= 12 fields.
++// Java's PMD rules set TooManyFields threshold to 15.
++const rgetPoolTArrayLen = 12
++
++type rgetT struct {
++	fNames   []string
++	encNames []string
++	etypes   []uintptr
++	sfis     []*structFieldInfo
++}
++
++type rgetPoolT struct {
++	fNames   [rgetPoolTArrayLen]string
++	encNames [rgetPoolTArrayLen]string
++	etypes   [rgetPoolTArrayLen]uintptr
++	sfis     [rgetPoolTArrayLen]*structFieldInfo
++	sfiidx   [rgetPoolTArrayLen]sfiIdx
++}
++
++var rgetPool = sync.Pool{
++	New: func() interface{} { return new(rgetPoolT) },
++}
++
+ type containerStateRecv interface {
+ 	sendContainerState(containerState)
+ }
+@@ -240,6 +262,7 @@ var (
+ 	stringTyp     = reflect.TypeOf("")
+ 	timeTyp       = reflect.TypeOf(time.Time{})
+ 	rawExtTyp     = reflect.TypeOf(RawExt{})
++	rawTyp        = reflect.TypeOf(Raw{})
+ 	uint8SliceTyp = reflect.TypeOf([]uint8(nil))
+ 
+ 	mapBySliceTyp = reflect.TypeOf((*MapBySlice)(nil)).Elem()
+@@ -257,6 +280,7 @@ var (
+ 
+ 	uint8SliceTypId = reflect.ValueOf(uint8SliceTyp).Pointer()
+ 	rawExtTypId     = reflect.ValueOf(rawExtTyp).Pointer()
++	rawTypId        = reflect.ValueOf(rawTyp).Pointer()
+ 	intfTypId       = reflect.ValueOf(intfTyp).Pointer()
+ 	timeTypId       = reflect.ValueOf(timeTyp).Pointer()
+ 	stringTypId     = reflect.ValueOf(stringTyp).Pointer()
+@@ -337,6 +361,11 @@ type Handle interface {
+ 	isBinary() bool
+ }
+ 
++// Raw represents raw formatted bytes.
++// We "blindly" store it during encode and store the raw bytes during decode.
++// Note: it is dangerous during encode, so we may gate the behaviour behind an Encode flag which must be explicitly set.
++type Raw []byte
++
+ // RawExt represents raw unprocessed extension data.
+ // Some codecs will decode extension data as a *RawExt if there is no registered extension for the tag.
+ //
+@@ -347,7 +376,7 @@ type RawExt struct {
+ 	// Data is used by codecs (e.g. binc, msgpack, simple) which do custom serialization of the types
+ 	Data []byte
+ 	// Value represents the extension, if Data is nil.
+-	// Value is used by codecs (e.g. cbor) which use the format to do custom serialization of the types.
++	// Value is used by codecs (e.g. cbor, json) which use the format to do custom serialization of the types.
+ 	Value interface{}
+ }
+ 
+@@ -525,7 +554,7 @@ func (o *extHandle) AddExt(
+ func (o *extHandle) SetExt(rt reflect.Type, tag uint64, ext Ext) (err error) {
+ 	// o is a pointer, because we may need to initialize it
+ 	if rt.PkgPath() == "" || rt.Kind() == reflect.Interface {
+-		err = fmt.Errorf("codec.Handle.AddExt: Takes named type, especially not a pointer or interface: %T",
++		err = fmt.Errorf("codec.Handle.AddExt: Takes named type, not a pointer or interface: %T",
+ 			reflect.Zero(rt).Interface())
+ 		return
+ 	}
+@@ -568,7 +597,8 @@ func (o extHandle) getExtForTag(tag uint64) *extTypeTagFn {
+ }
+ 
+ type structFieldInfo struct {
+-	encName string // encode name
++	encName   string // encode name
++	fieldName string // field name
+ 
+ 	// only one of 'i' or 'is' can be set. If 'i' is -1, then 'is' has been set.
+ 
+@@ -714,6 +744,7 @@ type typeInfo struct {
+ }
+ 
+ func (ti *typeInfo) indexForEncName(name string) int {
++	// NOTE: name may be a stringView, so don't pass it to another function.
+ 	//tisfi := ti.sfi
+ 	const binarySearchThreshold = 16
+ 	if sfilen := len(ti.sfi); sfilen < binarySearchThreshold {
+@@ -828,19 +859,19 @@ func (x *TypeInfos) get(rtid uintptr, rt reflect.Type) (pti *typeInfo) {
+ 	}
+ 
+ 	if rt.Kind() == reflect.Struct {
+-		var siInfo *structFieldInfo
++		var omitEmpty bool
+ 		if f, ok := rt.FieldByName(structInfoFieldName); ok {
+-			siInfo = parseStructFieldInfo(structInfoFieldName, x.structTag(f.Tag))
++			siInfo := parseStructFieldInfo(structInfoFieldName, x.structTag(f.Tag))
+ 			ti.toArray = siInfo.toArray
++			omitEmpty = siInfo.omitEmpty
+ 		}
+-		sfip := make([]*structFieldInfo, 0, rt.NumField())
+-		x.rget(rt, nil, make(map[string]bool, 16), &sfip, siInfo)
+-
+-		ti.sfip = make([]*structFieldInfo, len(sfip))
+-		ti.sfi = make([]*structFieldInfo, len(sfip))
+-		copy(ti.sfip, sfip)
+-		sort.Sort(sfiSortedByEncName(sfip))
+-		copy(ti.sfi, sfip)
++		pi := rgetPool.Get()
++		pv := pi.(*rgetPoolT)
++		pv.etypes[0] = ti.baseId
++		vv := rgetT{pv.fNames[:0], pv.encNames[:0], pv.etypes[:1], pv.sfis[:0]}
++		x.rget(rt, rtid, omitEmpty, nil, &vv)
++		ti.sfip, ti.sfi = rgetResolveSFI(vv.sfis, pv.sfiidx[:0])
++		rgetPool.Put(pi)
+ 	}
+ 	// sfi = sfip
+ 
+@@ -853,17 +884,30 @@ func (x *TypeInfos) get(rtid uintptr, rt reflect.Type) (pti *typeInfo) {
+ 	return
+ }
+ 
+-func (x *TypeInfos) rget(rt reflect.Type, indexstack []int, fnameToHastag map[string]bool,
+-	sfi *[]*structFieldInfo, siInfo *structFieldInfo,
++func (x *TypeInfos) rget(rt reflect.Type, rtid uintptr, omitEmpty bool,
++	indexstack []int, pv *rgetT,
+ ) {
+-	for j := 0; j < rt.NumField(); j++ {
++	// Read up fields and store how to access the value.
++	//
++	// It uses go's rules for message selectors,
++	// which say that the field with the shallowest depth is selected.
++	//
++	// Note: we consciously use slices, not a map, to simulate a set.
++	//       Typically, types have < 16 fields,
++	//       and iteration using equals is faster than maps there
++
++LOOP:
++	for j, jlen := 0, rt.NumField(); j < jlen; j++ {
+ 		f := rt.Field(j)
+ 		fkind := f.Type.Kind()
+ 		// skip if a func type, or is unexported, or structTag value == "-"
+-		if fkind == reflect.Func {
+-			continue
++		switch fkind {
++		case reflect.Func, reflect.Complex64, reflect.Complex128, reflect.UnsafePointer:
++			continue LOOP
+ 		}
+-		// if r1, _ := utf8.DecodeRuneInString(f.Name); r1 == utf8.RuneError || !unicode.IsUpper(r1) {
++
++		// if r1, _ := utf8.DecodeRuneInString(f.Name);
++		// r1 == utf8.RuneError || !unicode.IsUpper(r1) {
+ 		if f.PkgPath != "" && !f.Anonymous { // unexported, not embedded
+ 			continue
+ 		}
+@@ -872,7 +916,8 @@ func (x *TypeInfos) rget(rt reflect.Type, indexstack []int, fnameToHastag map[st
+ 			continue
+ 		}
+ 		var si *structFieldInfo
+-		// if anonymous and no struct tag (or it's blank), and a struct (or pointer to struct), inline it.
++		// if anonymous and no struct tag (or it's blank),
++		// and a struct (or pointer to struct), inline it.
+ 		if f.Anonymous && fkind != reflect.Interface {
+ 			doInline := stag == ""
+ 			if !doInline {
+@@ -886,11 +931,31 @@ func (x *TypeInfos) rget(rt reflect.Type, indexstack []int, fnameToHastag map[st
+ 					ft = ft.Elem()
+ 				}
+ 				if ft.Kind() == reflect.Struct {
+-					indexstack2 := make([]int, len(indexstack)+1, len(indexstack)+4)
+-					copy(indexstack2, indexstack)
+-					indexstack2[len(indexstack)] = j
+-					// indexstack2 := append(append(make([]int, 0, len(indexstack)+4), indexstack...), j)
+-					x.rget(ft, indexstack2, fnameToHastag, sfi, siInfo)
++					// if etypes contains this, don't call rget again (as fields are already seen here)
++					ftid := reflect.ValueOf(ft).Pointer()
++					// We cannot recurse forever, but we need to track other field depths.
++					// So - we break if we see a type twice (not the first time).
++					// This should be sufficient to handle an embedded type that refers to its
++					// owning type, which then refers to its embedded type.
++					processIt := true
++					numk := 0
++					for _, k := range pv.etypes {
++						if k == ftid {
++							numk++
++							if numk == rgetMaxRecursion {
++								processIt = false
++								break
++							}
++						}
++					}
++					if processIt {
++						pv.etypes = append(pv.etypes, ftid)
++						indexstack2 := make([]int, len(indexstack)+1)
++						copy(indexstack2, indexstack)
++						indexstack2[len(indexstack)] = j
++						// indexstack2 := append(append(make([]int, 0, len(indexstack)+4), indexstack...), j)
++						x.rget(ft, ftid, omitEmpty, indexstack2, pv)
++					}
+ 					continue
+ 				}
+ 			}
+@@ -901,36 +966,86 @@ func (x *TypeInfos) rget(rt reflect.Type, indexstack []int, fnameToHastag map[st
+ 			continue
+ 		}
+ 
+-		// do not let fields with same name in embedded structs override field at higher level.
+-		// this must be done after anonymous check, to allow anonymous field
+-		// still include their child fields
+-		if _, ok := fnameToHastag[f.Name]; ok {
+-			continue
+-		}
+ 		if f.Name == "" {
+ 			panic(noFieldNameToStructFieldInfoErr)
+ 		}
++
++		pv.fNames = append(pv.fNames, f.Name)
++
+ 		if si == nil {
+ 			si = parseStructFieldInfo(f.Name, stag)
+ 		} else if si.encName == "" {
+ 			si.encName = f.Name
+ 		}
++		si.fieldName = f.Name
++
++		pv.encNames = append(pv.encNames, si.encName)
++
+ 		// si.ikind = int(f.Type.Kind())
+ 		if len(indexstack) == 0 {
+ 			si.i = int16(j)
+ 		} else {
+ 			si.i = -1
+-			si.is = append(append(make([]int, 0, len(indexstack)+4), indexstack...), j)
++			si.is = make([]int, len(indexstack)+1)
++			copy(si.is, indexstack)
++			si.is[len(indexstack)] = j
++			// si.is = append(append(make([]int, 0, len(indexstack)+4), indexstack...), j)
+ 		}
+ 
+-		if siInfo != nil {
+-			if siInfo.omitEmpty {
+-				si.omitEmpty = true
++		if omitEmpty {
++			si.omitEmpty = true
++		}
++		pv.sfis = append(pv.sfis, si)
++	}
++}
++
++// resolves the struct field info got from a call to rget.
++// Returns a trimmed, unsorted and sorted []*structFieldInfo.
++func rgetResolveSFI(x []*structFieldInfo, pv []sfiIdx) (y, z []*structFieldInfo) {
++	var n int
++	for i, v := range x {
++		xn := v.encName //TODO: fieldName or encName? use encName for now.
++		var found bool
++		for j, k := range pv {
++			if k.name == xn {
++				// one of them must be reset to nil, and the index updated appropriately to the other one
++				if len(v.is) == len(x[k.index].is) {
++				} else if len(v.is) < len(x[k.index].is) {
++					pv[j].index = i
++					if x[k.index] != nil {
++						x[k.index] = nil
++						n++
++					}
++				} else {
++					if x[i] != nil {
++						x[i] = nil
++						n++
++					}
++				}
++				found = true
++				break
+ 			}
+ 		}
+-		*sfi = append(*sfi, si)
+-		fnameToHastag[f.Name] = stag != ""
++		if !found {
++			pv = append(pv, sfiIdx{xn, i})
++		}
+ 	}
++
++	// remove all the nils
++	y = make([]*structFieldInfo, len(x)-n)
++	n = 0
++	for _, v := range x {
++		if v == nil {
++			continue
++		}
++		y[n] = v
++		n++
++	}
++
++	z = make([]*structFieldInfo, len(y))
++	copy(z, y)
++	sort.Sort(sfiSortedByEncName(z))
++	return
+ }
+ 
+ func panicToErr(err *error) {
+@@ -1127,3 +1242,73 @@ type bytesISlice []bytesI
+ func (p bytesISlice) Len() int           { return len(p) }
+ func (p bytesISlice) Less(i, j int) bool { return bytes.Compare(p[i].v, p[j].v) == -1 }
+ func (p bytesISlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
++
++// -----------------
++
++type set []uintptr
++
++func (s *set) add(v uintptr) (exists bool) {
++	// e.ci is always nil, or len >= 1
++	// defer func() { fmt.Printf("$$$$$$$$$$$ cirRef Add: %v, exists: %v\n", v, exists) }()
++	x := *s
++	if x == nil {
++		x = make([]uintptr, 1, 8)
++		x[0] = v
++		*s = x
++		return
++	}
++	// typically, length will be 1. make this perform.
++	if len(x) == 1 {
++		if j := x[0]; j == 0 {
++			x[0] = v
++		} else if j == v {
++			exists = true
++		} else {
++			x = append(x, v)
++			*s = x
++		}
++		return
++	}
++	// check if it exists
++	for _, j := range x {
++		if j == v {
++			exists = true
++			return
++		}
++	}
++	// try to replace a "deleted" slot
++	for i, j := range x {
++		if j == 0 {
++			x[i] = v
++			return
++		}
++	}
++	// if unable to replace deleted slot, just append it.
++	x = append(x, v)
++	*s = x
++	return
++}
++
++func (s *set) remove(v uintptr) (exists bool) {
++	// defer func() { fmt.Printf("$$$$$$$$$$$ cirRef Rm: %v, exists: %v\n", v, exists) }()
++	x := *s
++	if len(x) == 0 {
++		return
++	}
++	if len(x) == 1 {
++		if x[0] == v {
++			x[0] = 0
++		}
++		return
++	}
++	for i, j := range x {
++		if j == v {
++			exists = true
++			x[i] = 0 // set it to 0, as way to delete it.
++			// copy(x[i:], x[i+1:])
++			// x = x[:len(x)-1]
++			return
++		}
++	}
++	return
++}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/helper_internal.go b/cmd/vendor/github.com/ugorji/go/codec/helper_internal.go
+index dea981f..5d0727f 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/helper_internal.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/helper_internal.go
+@@ -70,8 +70,8 @@ func hIsEmptyValue(v reflect.Value, deref, checkStruct bool) bool {
+ 	return false
+ }
+ 
+-func isEmptyValue(v reflect.Value) bool {
+-	return hIsEmptyValue(v, derefForIsEmptyValue, checkStructForEmptyValue)
++func isEmptyValue(v reflect.Value, deref, checkStruct bool) bool {
++	return hIsEmptyValue(v, deref, checkStruct)
+ }
+ 
+ func pruneSignExt(v []byte, pos bool) (n int) {
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/helper_not_unsafe.go b/cmd/vendor/github.com/ugorji/go/codec/helper_not_unsafe.go
+index 7c2ffc0..8b06a00 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/helper_not_unsafe.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/helper_not_unsafe.go
+@@ -1,4 +1,4 @@
+-//+build !unsafe
++// +build !unsafe
+ 
+ // Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
+ // Use of this source code is governed by a MIT license found in the LICENSE file.
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/helper_unsafe.go b/cmd/vendor/github.com/ugorji/go/codec/helper_unsafe.go
+index 373b2b1..0f596c7 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/helper_unsafe.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/helper_unsafe.go
+@@ -1,4 +1,4 @@
+-//+build unsafe
++// +build unsafe
+ 
+ // Copyright (c) 2012-2015 Ugorji Nwoke. All rights reserved.
+ // Use of this source code is governed by a MIT license found in the LICENSE file.
+@@ -16,7 +16,7 @@ type unsafeString struct {
+ 	Len  int
+ }
+ 
+-type unsafeBytes struct {
++type unsafeSlice struct {
+ 	Data uintptr
+ 	Len  int
+ 	Cap  int
+@@ -29,8 +29,10 @@ func stringView(v []byte) string {
+ 	if len(v) == 0 {
+ 		return ""
+ 	}
+-	x := unsafeString{uintptr(unsafe.Pointer(&v[0])), len(v)}
+-	return *(*string)(unsafe.Pointer(&x))
++
++	bx := (*unsafeSlice)(unsafe.Pointer(&v))
++	sx := unsafeString{bx.Data, bx.Len}
++	return *(*string)(unsafe.Pointer(&sx))
+ }
+ 
+ // bytesView returns a view of the string as a []byte.
+@@ -40,6 +42,8 @@ func bytesView(v string) []byte {
+ 	if len(v) == 0 {
+ 		return zeroByteSlice
+ 	}
+-	x := unsafeBytes{uintptr(unsafe.Pointer(&v)), len(v), len(v)}
+-	return *(*[]byte)(unsafe.Pointer(&x))
++
++	sx := (*unsafeString)(unsafe.Pointer(&v))
++	bx := unsafeSlice{sx.Data, sx.Len, sx.Len}
++	return *(*[]byte)(unsafe.Pointer(&bx))
+ }
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/json.go b/cmd/vendor/github.com/ugorji/go/codec/json.go
+index a18a5f7..5bb3896 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/json.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/json.go
+@@ -43,18 +43,23 @@ import (
+ 
+ //--------------------------------
+ 
+-var jsonLiterals = [...]byte{'t', 'r', 'u', 'e', 'f', 'a', 'l', 's', 'e', 'n', 'u', 'l', 'l'}
++var (
++	jsonLiterals = [...]byte{'t', 'r', 'u', 'e', 'f', 'a', 'l', 's', 'e', 'n', 'u', 'l', 'l'}
+ 
+-var jsonFloat64Pow10 = [...]float64{
+-	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+-	1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+-	1e20, 1e21, 1e22,
+-}
++	jsonFloat64Pow10 = [...]float64{
++		1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
++		1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
++		1e20, 1e21, 1e22,
++	}
+ 
+-var jsonUint64Pow10 = [...]uint64{
+-	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+-	1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+-}
++	jsonUint64Pow10 = [...]uint64{
++		1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
++		1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
++	}
++
++	// jsonTabs and jsonSpaces are used as caches for indents
++	jsonTabs, jsonSpaces string
++)
+ 
+ const (
+ 	// jsonUnreadAfterDecNum controls whether we unread after decoding a number.
+@@ -85,8 +90,23 @@ const (
+ 	jsonNumUintMaxVal = 1<<uint64(64) - 1
+ 
+ 	// jsonNumDigitsUint64Largest = 19
++
++	jsonSpacesOrTabsLen = 128
+ )
+ 
++func init() {
++	var bs [jsonSpacesOrTabsLen]byte
++	for i := 0; i < jsonSpacesOrTabsLen; i++ {
++		bs[i] = ' '
++	}
++	jsonSpaces = string(bs[:])
++
++	for i := 0; i < jsonSpacesOrTabsLen; i++ {
++		bs[i] = '\t'
++	}
++	jsonTabs = string(bs[:])
++}
++
+ type jsonEncDriver struct {
+ 	e  *Encoder
+ 	w  encWriter
+@@ -94,30 +114,76 @@ type jsonEncDriver struct {
+ 	b  [64]byte // scratch
+ 	bs []byte   // scratch
+ 	se setExtWrapper
++	ds string // indent string
++	dl uint16 // indent level
++	dt bool   // indent using tabs
++	d  bool   // indent
+ 	c  containerState
+ 	noBuiltInTypes
+ }
+ 
++// indent is done as below:
++//   - newline and indent are added before each mapKey or arrayElem
++//   - newline and indent are added before each ending,
++//     except there was no entry (so we can have {} or [])
++
+ func (e *jsonEncDriver) sendContainerState(c containerState) {
+ 	// determine whether to output separators
+ 	if c == containerMapKey {
+ 		if e.c != containerMapStart {
+ 			e.w.writen1(',')
+ 		}
++		if e.d {
++			e.writeIndent()
++		}
+ 	} else if c == containerMapValue {
+-		e.w.writen1(':')
++		if e.d {
++			e.w.writen2(':', ' ')
++		} else {
++			e.w.writen1(':')
++		}
+ 	} else if c == containerMapEnd {
++		if e.d {
++			e.dl--
++			if e.c != containerMapStart {
++				e.writeIndent()
++			}
++		}
+ 		e.w.writen1('}')
+ 	} else if c == containerArrayElem {
+ 		if e.c != containerArrayStart {
+ 			e.w.writen1(',')
+ 		}
++		if e.d {
++			e.writeIndent()
++		}
+ 	} else if c == containerArrayEnd {
++		if e.d {
++			e.dl--
++			if e.c != containerArrayStart {
++				e.writeIndent()
++			}
++		}
+ 		e.w.writen1(']')
+ 	}
+ 	e.c = c
+ }
+ 
++func (e *jsonEncDriver) writeIndent() {
++	e.w.writen1('\n')
++	if x := len(e.ds) * int(e.dl); x <= jsonSpacesOrTabsLen {
++		if e.dt {
++			e.w.writestr(jsonTabs[:x])
++		} else {
++			e.w.writestr(jsonSpaces[:x])
++		}
++	} else {
++		for i := uint16(0); i < e.dl; i++ {
++			e.w.writestr(e.ds)
++		}
++	}
++}
++
+ func (e *jsonEncDriver) EncodeNil() {
+ 	e.w.writeb(jsonLiterals[9:13]) // null
+ }
+@@ -131,19 +197,39 @@ func (e *jsonEncDriver) EncodeBool(b bool) {
+ }
+ 
+ func (e *jsonEncDriver) EncodeFloat32(f float32) {
+-	e.w.writeb(strconv.AppendFloat(e.b[:0], float64(f), 'E', -1, 32))
++	e.encodeFloat(float64(f), 32)
+ }
+ 
+ func (e *jsonEncDriver) EncodeFloat64(f float64) {
+ 	// e.w.writestr(strconv.FormatFloat(f, 'E', -1, 64))
+-	e.w.writeb(strconv.AppendFloat(e.b[:0], f, 'E', -1, 64))
++	e.encodeFloat(f, 64)
++}
++
++func (e *jsonEncDriver) encodeFloat(f float64, numbits int) {
++	x := strconv.AppendFloat(e.b[:0], f, 'G', -1, numbits)
++	e.w.writeb(x)
++	if bytes.IndexByte(x, 'E') == -1 && bytes.IndexByte(x, '.') == -1 {
++		e.w.writen2('.', '0')
++	}
+ }
+ 
+ func (e *jsonEncDriver) EncodeInt(v int64) {
++	if x := e.h.IntegerAsString; x == 'A' || x == 'L' && (v > 1<<53 || v < -(1<<53)) {
++		e.w.writen1('"')
++		e.w.writeb(strconv.AppendInt(e.b[:0], v, 10))
++		e.w.writen1('"')
++		return
++	}
+ 	e.w.writeb(strconv.AppendInt(e.b[:0], v, 10))
+ }
+ 
+ func (e *jsonEncDriver) EncodeUint(v uint64) {
++	if x := e.h.IntegerAsString; x == 'A' || x == 'L' && v > 1<<53 {
++		e.w.writen1('"')
++		e.w.writeb(strconv.AppendUint(e.b[:0], v, 10))
++		e.w.writen1('"')
++		return
++	}
+ 	e.w.writeb(strconv.AppendUint(e.b[:0], v, 10))
+ }
+ 
+@@ -165,11 +251,17 @@ func (e *jsonEncDriver) EncodeRawExt(re *RawExt, en *Encoder) {
+ }
+ 
+ func (e *jsonEncDriver) EncodeArrayStart(length int) {
++	if e.d {
++		e.dl++
++	}
+ 	e.w.writen1('[')
+ 	e.c = containerArrayStart
+ }
+ 
+ func (e *jsonEncDriver) EncodeMapStart(length int) {
++	if e.d {
++		e.dl++
++	}
+ 	e.w.writen1('{')
+ 	e.c = containerMapStart
+ }
+@@ -564,6 +656,11 @@ func (d *jsonDecDriver) decNum(storeBytes bool) {
+ 		d.tok = b
+ 	}
+ 	b := d.tok
++	var str bool
++	if b == '"' {
++		str = true
++		b = d.r.readn1()
++	}
+ 	if !(b == '+' || b == '-' || b == '.' || (b >= '0' && b <= '9')) {
+ 		d.d.errorf("json: decNum: got first char '%c'", b)
+ 		return
+@@ -578,6 +675,10 @@ func (d *jsonDecDriver) decNum(storeBytes bool) {
+ 	n.reset()
+ 	d.bs = d.bs[:0]
+ 
++	if str && storeBytes {
++		d.bs = append(d.bs, '"')
++	}
++
+ 	// The format of a number is as below:
+ 	// parsing:     sign? digit* dot? digit* e?  sign? digit*
+ 	// states:  0   1*    2      3*   4      5*  6     7
+@@ -668,6 +769,14 @@ LOOP:
+ 			default:
+ 				break LOOP
+ 			}
++		case '"':
++			if str {
++				if storeBytes {
++					d.bs = append(d.bs, '"')
++				}
++				b, eof = r.readn1eof()
++			}
++			break LOOP
+ 		default:
+ 			break LOOP
+ 		}
+@@ -822,6 +931,11 @@ func (d *jsonDecDriver) DecodeBytes(bs []byte, isstring, zerocopy bool) (bsOut [
+ 	if isstring {
+ 		return d.bs
+ 	}
++	// if appendStringAsBytes returned a zero-len slice, then treat as nil.
++	// This should only happen for null, and "".
++	if len(d.bs) == 0 {
++		return nil
++	}
+ 	bs0 := d.bs
+ 	slen := base64.StdEncoding.DecodedLen(len(bs0))
+ 	if slen <= cap(bs) {
+@@ -859,6 +973,14 @@ func (d *jsonDecDriver) appendStringAsBytes() {
+ 		}
+ 		d.tok = b
+ 	}
++
++	// handle null as a string
++	if d.tok == 'n' {
++		d.readStrIdx(10, 13) // ull
++		d.bs = d.bs[:0]
++		return
++	}
++
+ 	if d.tok != '"' {
+ 		d.d.errorf("json: expect char '%c' but got char '%c'", '"', d.tok)
+ 	}
+@@ -1033,6 +1155,24 @@ type JsonHandle struct {
+ 	// RawBytesExt, if configured, is used to encode and decode raw bytes in a custom way.
+ 	// If not configured, raw bytes are encoded to/from base64 text.
+ 	RawBytesExt InterfaceExt
++
++	// Indent indicates how a value is encoded.
++	//   - If positive, indent by that number of spaces.
++	//   - If negative, indent by that number of tabs.
++	Indent int8
++
++	// IntegerAsString controls how integers (signed and unsigned) are encoded.
++	//
++	// Per the JSON Spec, JSON numbers are 64-bit floating point numbers.
++	// Consequently, integers > 2^53 cannot be represented as a JSON number without losing precision.
++	// This can be mitigated by configuring how to encode integers.
++	//
++	// IntegerAsString interpretes the following values:
++	//   - if 'L', then encode integers > 2^53 as a json string.
++	//   - if 'A', then encode all integers as a json string
++	//             containing the exact integer representation as a decimal.
++	//   - else    encode all integers as a json number (default)
++	IntegerAsString uint8
+ }
+ 
+ func (h *JsonHandle) SetInterfaceExt(rt reflect.Type, tag uint64, ext InterfaceExt) (err error) {
+@@ -1040,26 +1180,48 @@ func (h *JsonHandle) SetInterfaceExt(rt reflect.Type, tag uint64, ext InterfaceE
+ }
+ 
+ func (h *JsonHandle) newEncDriver(e *Encoder) encDriver {
+-	hd := jsonEncDriver{e: e, w: e.w, h: h}
++	hd := jsonEncDriver{e: e, h: h}
+ 	hd.bs = hd.b[:0]
+-	hd.se.i = h.RawBytesExt
++
++	hd.reset()
++
+ 	return &hd
+ }
+ 
+ func (h *JsonHandle) newDecDriver(d *Decoder) decDriver {
+ 	// d := jsonDecDriver{r: r.(*bytesDecReader), h: h}
+-	hd := jsonDecDriver{d: d, r: d.r, h: h}
++	hd := jsonDecDriver{d: d, h: h}
+ 	hd.bs = hd.b[:0]
+-	hd.se.i = h.RawBytesExt
++	hd.reset()
+ 	return &hd
+ }
+ 
+ func (e *jsonEncDriver) reset() {
+ 	e.w = e.e.w
++	e.se.i = e.h.RawBytesExt
++	if e.bs != nil {
++		e.bs = e.bs[:0]
++	}
++	e.d, e.dt, e.dl, e.ds = false, false, 0, ""
++	e.c = 0
++	if e.h.Indent > 0 {
++		e.d = true
++		e.ds = jsonSpaces[:e.h.Indent]
++	} else if e.h.Indent < 0 {
++		e.d = true
++		e.dt = true
++		e.ds = jsonTabs[:-(e.h.Indent)]
++	}
+ }
+ 
+ func (d *jsonDecDriver) reset() {
+ 	d.r = d.d.r
++	d.se.i = d.h.RawBytesExt
++	if d.bs != nil {
++		d.bs = d.bs[:0]
++	}
++	d.c, d.tok = 0, 0
++	d.n.reset()
+ }
+ 
+ var jsonEncodeTerminate = []byte{' '}
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/msgpack.go b/cmd/vendor/github.com/ugorji/go/codec/msgpack.go
+index 5eb4c96..e79830b 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/msgpack.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/msgpack.go
+@@ -374,7 +374,7 @@ func (d *msgpackDecDriver) DecodeNaked() {
+ 	}
+ 	if n.v == valueTypeUint && d.h.SignedInteger {
+ 		n.v = valueTypeInt
+-		n.i = int64(n.v)
++		n.i = int64(n.u)
+ 	}
+ 	return
+ }
+@@ -561,6 +561,13 @@ func (d *msgpackDecDriver) readNextBd() {
+ 	d.bdRead = true
+ }
+ 
++func (d *msgpackDecDriver) uncacheRead() {
++	if d.bdRead {
++		d.r.unreadn1()
++		d.bdRead = false
++	}
++}
++
+ func (d *msgpackDecDriver) ContainerType() (vt valueType) {
+ 	bd := d.bd
+ 	if bd == mpNil {
+@@ -729,6 +736,7 @@ func (e *msgpackEncDriver) reset() {
+ 
+ func (d *msgpackDecDriver) reset() {
+ 	d.r = d.d.r
++	d.bd, d.bdRead = 0, false
+ }
+ 
+ //--------------------------------------------------
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/rpc.go b/cmd/vendor/github.com/ugorji/go/codec/rpc.go
+index dad53d0..8062bed 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/rpc.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/rpc.go
+@@ -25,7 +25,7 @@ type Rpc interface {
+ }
+ 
+ // RpcCodecBuffered allows access to the underlying bufio.Reader/Writer
+-// used by the rpc connection. It accomodates use-cases where the connection
++// used by the rpc connection. It accommodates use-cases where the connection
+ // should be used by rpc and non-rpc functions, e.g. streaming a file after
+ // sending an rpc response.
+ type RpcCodecBuffered interface {
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/simple.go b/cmd/vendor/github.com/ugorji/go/codec/simple.go
+index c150496..231d503 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/simple.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/simple.go
+@@ -166,6 +166,13 @@ func (d *simpleDecDriver) readNextBd() {
+ 	d.bdRead = true
+ }
+ 
++func (d *simpleDecDriver) uncacheRead() {
++	if d.bdRead {
++		d.r.unreadn1()
++		d.bdRead = false
++	}
++}
++
+ func (d *simpleDecDriver) ContainerType() (vt valueType) {
+ 	if d.bd == simpleVdNil {
+ 		return valueTypeNil
+@@ -474,7 +481,7 @@ func (d *simpleDecDriver) DecodeNaked() {
+ // SimpleHandle is a Handle for a very simple encoding format.
+ //
+ // simple is a simplistic codec similar to binc, but not as compact.
+-//   - Encoding of a value is always preceeded by the descriptor byte (bd)
++//   - Encoding of a value is always preceded by the descriptor byte (bd)
+ //   - True, false, nil are encoded fully in 1 byte (the descriptor)
+ //   - Integers (intXXX, uintXXX) are encoded in 1, 2, 4 or 8 bytes (plus a descriptor byte).
+ //     There are positive (uintXXX and intXXX >= 0) and negative (intXXX < 0) integers.
+@@ -512,6 +519,7 @@ func (e *simpleEncDriver) reset() {
+ 
+ func (d *simpleDecDriver) reset() {
+ 	d.r = d.d.r
++	d.bd, d.bdRead = 0, false
+ }
+ 
+ var _ decDriver = (*simpleDecDriver)(nil)
+diff --git a/cmd/vendor/github.com/ugorji/go/codec/time.go b/cmd/vendor/github.com/ugorji/go/codec/time.go
+index fc4c63e..718b731 100644
+--- a/cmd/vendor/github.com/ugorji/go/codec/time.go
++++ b/cmd/vendor/github.com/ugorji/go/codec/time.go
+@@ -5,11 +5,22 @@ package codec
+ 
+ import (
+ 	"fmt"
++	"reflect"
+ 	"time"
+ )
+ 
+ var (
+-	timeDigits = [...]byte{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}
++	timeDigits   = [...]byte{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}
++	timeExtEncFn = func(rv reflect.Value) (bs []byte, err error) {
++		defer panicToErr(&err)
++		bs = timeExt{}.WriteExt(rv.Interface())
++		return
++	}
++	timeExtDecFn = func(rv reflect.Value, bs []byte) (err error) {
++		defer panicToErr(&err)
++		timeExt{}.ReadExt(rv.Interface(), bs)
++		return
++	}
+ )
+ 
+ type timeExt struct{}
+diff --git a/glide.lock b/glide.lock
+index a9ca37a..462958f 100644
+--- a/glide.lock
++++ b/glide.lock
+@@ -1,5 +1,5 @@
+-hash: 7f6349986c1a1557cb2f4143288f539e1ded6b4bb74e1f9cbbda88127fe8790d
+-updated: 2016-12-01T13:08:06.055744535+01:00
++hash: 18210c68d6ee307f3a92dc2c71089e8c2a63282260b7db51cb19cd5014f708b2
++updated: 2016-12-05T16:54:40.452165107+01:00
+ imports:
+ - name: bitbucket.org/ww/goautoneg
+   version: 75cd24fc2f2c2a2088577d12123ddee5f54e0675
+@@ -101,7 +101,7 @@ imports:
+   subpackages:
+   - assert
+ - name: github.com/ugorji/go
+-  version: f1f1a805ed361a0e078bb537e4ea78cd37dcf065
++  version: 9c7f9b7a2bc3a520f7c7b30b34b7f85f47fe27b6
+   subpackages:
+   - codec
+ - name: github.com/urfave/cli
+diff --git a/glide.yaml b/glide.yaml
+index aba20a4..55b907d 100644
+--- a/glide.yaml
++++ b/glide.yaml
+@@ -60,7 +60,7 @@ import:
+ - package: github.com/spf13/pflag
+   version: 08b1a584251b5b62f458943640fc8ebd4d50aaa5
+ - package: github.com/ugorji/go
+-  version: f1f1a805ed361a0e078bb537e4ea78cd37dcf065
++  version: 9c7f9b7a2bc3a520f7c7b30b34b7f85f47fe27b6
+   subpackages:
+   - codec
+ - package: github.com/urfave/cli

@@ -1,0 +1,152 @@
+commit 13deb324476257d13c678833768810e6045e8e3d
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Fri Feb 19 13:43:48 2016 -0800
+
+    etcdctlv3: add doc for mirror maker
+
+diff --git a/etcdctlv3/README.md b/etcdctlv3/README.md
+index cf7ada7..d3b1325 100644
+--- a/etcdctlv3/README.md
++++ b/etcdctlv3/README.md
+@@ -109,7 +109,6 @@ OK
+ ./etcdctl range foo
+ ```
+ 
+-
+ ### WATCH [options] [key or prefix]
+ 
+ Watch watches events stream on keys or prefixes. The watch command runs until it encounters an error or is terminated by the user.
+@@ -145,4 +144,38 @@ bar
+ 
+ #### Notes
+ 
+-TODO: doc interactive mode
+\ No newline at end of file
++TODO: doc interactive mode
++
++## Utility Commands
++
++### MAKE-MIRROR [options] \<destination\>
++
++[make-mirror][mirror] mirrors a key prefix in an etcd cluster to a destination etcd cluster.
++
++#### Options
++
++- dest-cacert -- TLS certificate authority file for destination cluster
++
++- dest-cert -- TLS certificate file for destination cluster
++
++- dest-key -- TLS key file for destination cluster
++
++- prefix -- The key-value prefix to mirror
++
++#### Return value
++
++Simple reply
++
++- The approximate total number of keys transferred to the destination cluster, updated every 30 seconds.
++
++- Error string if mirroring failed. Exit code is non-zero.
++
++#### Examples
++
++```
++./etcdctl make-mirror mirror.example.com:2379
++10
++18
++```
++
++[mirror]: ./doc/mirror_maker.md
+diff --git a/etcdctlv3/command/make_mirror_command.go b/etcdctlv3/command/make_mirror_command.go
+index 6a29a77..5329468 100644
+--- a/etcdctlv3/command/make_mirror_command.go
++++ b/etcdctlv3/command/make_mirror_command.go
+@@ -16,6 +16,9 @@ package command
+ 
+ import (
+ 	"errors"
++	"fmt"
++	"sync/atomic"
++	"time"
+ 
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
+ 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+@@ -35,7 +38,7 @@ var (
+ // NewMakeMirrorCommand returns the cobra command for "makeMirror".
+ func NewMakeMirrorCommand() *cobra.Command {
+ 	c := &cobra.Command{
+-		Use:   "make-mirror [options] [destination]",
++		Use:   "make-mirror [options] <destination>",
+ 		Short: "make-mirror makes a mirror at the destination etcd cluster",
+ 		Run:   makeMirrorCommandFunc,
+ 	}
+@@ -62,6 +65,15 @@ func makeMirrorCommandFunc(cmd *cobra.Command, args []string) {
+ }
+ 
+ func makeMirror(ctx context.Context, c *clientv3.Client, dc *clientv3.Client) error {
++	total := int64(0)
++
++	go func() {
++		for {
++			time.Sleep(30 * time.Second)
++			fmt.Println(atomic.LoadInt64(&total))
++		}
++	}()
++
+ 	// TODO: remove the prefix of the destination cluster?
+ 	dkv := clientv3.NewKV(dc)
+ 
+@@ -75,6 +87,7 @@ func makeMirror(ctx context.Context, c *clientv3.Client, dc *clientv3.Client) er
+ 			if err != nil {
+ 				return err
+ 			}
++			atomic.AddInt64(&total, 1)
+ 		}
+ 	}
+ 
+@@ -105,8 +118,10 @@ func makeMirror(ctx context.Context, c *clientv3.Client, dc *clientv3.Client) er
+ 			switch ev.Type {
+ 			case storagepb.PUT:
+ 				ops = append(ops, clientv3.OpPut(string(ev.Kv.Key), string(ev.Kv.Value)))
++				atomic.AddInt64(&total, 1)
+ 			case storagepb.DELETE, storagepb.EXPIRE:
+ 				ops = append(ops, clientv3.OpDelete(string(ev.Kv.Key)))
++				atomic.AddInt64(&total, 1)
+ 			default:
+ 				panic("unexpected event type")
+ 			}
+diff --git a/etcdctlv3/doc/mirror_maker.md b/etcdctlv3/doc/mirror_maker.md
+new file mode 100644
+index 0000000..6b14a25
+--- /dev/null
++++ b/etcdctlv3/doc/mirror_maker.md
+@@ -0,0 +1,29 @@
++## Mirror Maker
++
++Mirror maker mirrors a prefix in the key-value space of an etcd cluster into another prefix in another cluster. Mirroring is designed for copying configuration to various clusters distributed around the world. Mirroring usually has very low latency once it completes synchronizing with the initial state. Mirror maker utilizes the etcd watcher facility to immediately inform the mirror of any key modifications. Based on our experiments, the network latency between the mirror maker and the two clusters accounts for most of the latency. If the network is healthy, copying configuration held in etcd to the mirror should take under one second even for a world-wide deployment.
++
++If the mirror maker fails to connect to one of the clusters, the mirroring will pause. Mirroring can  be resumed automatically once connectivity is reestablished.
++
++The mirroring mechanism is unidirectional. Data under the destination cluster’s mirroring prefix should be treated as read only. The mirror maker only mirrors key-value pairs; metadata, such as version number or modification revision, is discarded. However, mirror maker still attempts to preserve update ordering during normal operation, but there is no ordering guarantee during initial sync nor during failure recovery following network interruption. As a rule of thumb, the ordering of the updates on the mirror should not be considered reliable.
++
++```
+++-------------+
++|             |
++|  source     |      +-----------+
++|  cluster    +----> |  mirror   |
++|             |      |  maker    |
+++-------------+      +---+-------+
++                         |
++                         v
++               +-------------+
++               |             |
++               |    mirror  |
++               |    cluster  |
++               |             |
++               +-------------+
++
++```
++
++Mirror-maker is a built-in feature of [etcdctl][etcdctl].
++
++[etcdctl]: ../README.md

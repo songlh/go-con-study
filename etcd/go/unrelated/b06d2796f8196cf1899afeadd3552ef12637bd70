@@ -1,0 +1,141 @@
+commit b06d2796f8196cf1899afeadd3552ef12637bd70
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Wed Apr 9 09:56:18 2014 -0700
+
+    feat: set NOCOW for log directory when in btrfs
+
+diff --git a/etcd/etcd.go b/etcd/etcd.go
+index c4c5db7..8c94ac8 100644
+--- a/etcd/etcd.go
++++ b/etcd/etcd.go
+@@ -33,6 +33,7 @@ import (
+ 	ehttp "github.com/coreos/etcd/http"
+ 	"github.com/coreos/etcd/log"
+ 	"github.com/coreos/etcd/metrics"
++	"github.com/coreos/etcd/pkg/fs"
+ 	"github.com/coreos/etcd/server"
+ 	"github.com/coreos/etcd/store"
+ )
+@@ -102,6 +103,11 @@ func (e *Etcd) Run() {
+ 		log.Warnf("All cached configuration is now ignored. The file %s can be removed.", info)
+ 	}
+ 
++	// Set NOCOW for data directory in btrfs
++	if fs.IsBtrfs(e.Config.DataDir) {
++		fs.SetNOCOW(e.Config.DataDir)
++	}
++
+ 	var mbName string
+ 	if e.Config.Trace() {
+ 		mbName = e.Config.MetricsBucketName()
+diff --git a/pkg/fs/.util_linux.go.swp b/pkg/fs/.util_linux.go.swp
+new file mode 100644
+index 0000000..36326a0
+Binary files /dev/null and b/pkg/fs/.util_linux.go.swp differ
+diff --git a/pkg/fs/fs.go b/pkg/fs/fs.go
+new file mode 100644
+index 0000000..6af3af3
+--- /dev/null
++++ b/pkg/fs/fs.go
+@@ -0,0 +1,60 @@
++package fs
++
++import (
++	"os"
++	"runtime"
++	"syscall"
++	"unsafe"
++
++	"github.com/coreos/etcd/log"
++)
++
++const (
++	// from Linux/include/uapi/linux/magic.h
++	BTRFS_SUPER_MAGIC = 0x9123683E
++
++	// from Linux/include/uapi/linux/fs.h
++	FS_NOCOW_FL = 0x00800000
++	FS_IOC_GETFLAGS = 0x80086601
++	FS_IOC_SETFLAGS = 0x40086602
++)
++
++// IsBtrfs checks whether the file is in btrfs
++func IsBtrfs(path string) bool {
++	// btrfs is developed on linux only
++	if runtime.GOOS != "linux" {
++		return false
++	}
++	var buf syscall.Statfs_t
++	if err := syscall.Statfs(path, &buf); err != nil {
++		log.Warnf("Failed to statfs: %v", err)
++		return false
++	}
++	log.Debugf("The type of path %v is %v", path, buf.Type)
++	if buf.Type != BTRFS_SUPER_MAGIC {
++		return false
++	}
++	log.Infof("The path %v is in btrfs", path)
++	return true
++}
++
++// SetNOCOW sets NOCOW flag for the file
++func SetNOCOW(path string) {
++	file, err := os.Open(path)
++	if err != nil {
++		log.Warnf("Failed to open %v: %v", path, err)
++		return
++	}
++	defer file.Close()
++	var attr int
++	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), FS_IOC_GETFLAGS, uintptr(unsafe.Pointer(&attr))); errno != 0 {
++		log.Warnf("Failed to get file flags: %v", errno.Error())
++		return
++	}
++	attr |= FS_NOCOW_FL
++	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), FS_IOC_SETFLAGS, uintptr(unsafe.Pointer(&attr))); errno != 0 {
++		log.Warnf("Failed to set file flags: %v", errno.Error())
++		return
++	}
++	log.Infof("Set NOCOW to path %v succeed", path)
++}
+diff --git a/pkg/fs/fs_test.go b/pkg/fs/fs_test.go
+new file mode 100644
+index 0000000..5098b3e
+--- /dev/null
++++ b/pkg/fs/fs_test.go
+@@ -0,0 +1,21 @@
++package fs
++
++import (
++	"os/exec"
++	"strings"
++	"testing"
++)
++
++func TestSetNOCOW(t *testing.T) {
++	if IsBtrfs("/") {
++		SetNOCOW("/")
++		cmd := exec.Command("lsattr", "/")
++		out, err := cmd.Output()
++		if err != nil {
++			t.Fatal("Failed executing lsattr")
++		}
++		if strings.Contains(string(out), "---------------C") {
++			t.Fatal("Failed setting NOCOW:\n", out)
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+index 981649b..cf2a2e8 100755
+--- a/test.sh
++++ b/test.sh
+@@ -23,6 +23,9 @@ go test -v ./server/v2/tests
+ go test -i ./mod/lock/v2/tests
+ go test -v ./mod/lock/v2/tests
+ 
++go test -i ./pkg/fs
++go test -v ./pkg/fs
++
+ go test -i ./tests/functional
+ ETCD_BIN_PATH=$(pwd)/bin/etcd go test -v ./tests/functional
+ 

@@ -1,0 +1,61 @@
+commit dfed636e5ab92b975d1e972ba7acae2438b6f871
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Wed Aug 23 14:28:07 2017 -0700
+
+    integration: check concurrent auth ops don't cause old rev errors
+
+diff --git a/integration/v3_auth_test.go b/integration/v3_auth_test.go
+index d0965a7..03ea88c 100644
+--- a/integration/v3_auth_test.go
++++ b/integration/v3_auth_test.go
+@@ -15,6 +15,8 @@
+ package integration
+ 
+ import (
++	"fmt"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -292,3 +294,41 @@ func TestV3AuthNonAuthorizedRPCs(t *testing.T) {
+ 		t.Fatalf("could put key (%v), it should cause an error of permission denied", respput)
+ 	}
+ }
++
++func TestV3AuthOldRevConcurrent(t *testing.T) {
++	defer testutil.AfterTest(t)
++	clus := NewClusterV3(t, &ClusterConfig{Size: 1})
++	defer clus.Terminate(t)
++
++	authSetupRoot(t, toGRPC(clus.Client(0)).Auth)
++
++	c, cerr := clientv3.New(clientv3.Config{
++		Endpoints:   clus.Client(0).Endpoints(),
++		DialTimeout: 5 * time.Second,
++		Username:    "root",
++		Password:    "123",
++	})
++	testutil.AssertNil(t, cerr)
++	defer c.Close()
++
++	var wg sync.WaitGroup
++	f := func(i int) {
++		defer wg.Done()
++		role, user := fmt.Sprintf("test-role-%d", i), fmt.Sprintf("test-user-%d", i)
++		_, err := c.RoleAdd(context.TODO(), role)
++		testutil.AssertNil(t, err)
++		_, err = c.RoleGrantPermission(context.TODO(), role, "", clientv3.GetPrefixRangeEnd(""), clientv3.PermissionType(clientv3.PermReadWrite))
++		testutil.AssertNil(t, err)
++		_, err = c.UserAdd(context.TODO(), user, "123")
++		testutil.AssertNil(t, err)
++		_, err = c.Put(context.TODO(), "a", "b")
++		testutil.AssertNil(t, err)
++	}
++	// needs concurrency to trigger
++	numRoles := 2
++	wg.Add(numRoles)
++	for i := 0; i < numRoles; i++ {
++		go f(i)
++	}
++	wg.Wait()
++}

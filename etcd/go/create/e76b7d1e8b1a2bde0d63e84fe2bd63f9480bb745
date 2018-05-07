@@ -1,0 +1,1028 @@
+commit e76b7d1e8b1a2bde0d63e84fe2bd63f9480bb745
+Author: Ben Johnson <benbjohnson@yahoo.com>
+Date:   Wed Dec 4 22:24:04 2013 -0700
+
+    Add mod/lock version.
+
+diff --git a/mod/lock/acquire_handler.go b/mod/lock/acquire_handler.go
+deleted file mode 100644
+index db5cbba..0000000
+--- a/mod/lock/acquire_handler.go
++++ /dev/null
+@@ -1,128 +0,0 @@
+-package lock
+-
+-import (
+-	"net/http"
+-	"path"
+-	"strconv"
+-	"time"
+-
+-	"github.com/coreos/go-etcd/etcd"
+-	"github.com/gorilla/mux"
+-)
+-
+-// acquireHandler attempts to acquire a lock on the given key.
+-// The "key" parameter specifies the resource to lock.
+-// The "ttl" parameter specifies how long the lock will persist for.
+-// The "timeout" parameter specifies how long the request should wait for the lock.
+-func (h *handler) acquireHandler(w http.ResponseWriter, req *http.Request) {
+-	h.client.SyncCluster()
+-
+-	// Setup connection watcher.
+-	closeNotifier, _ := w.(http.CloseNotifier)
+-	closeChan := closeNotifier.CloseNotify()
+-
+-	// Parse "key" and "ttl" query parameters.
+-	vars := mux.Vars(req)
+-	keypath := path.Join(prefix, vars["key"])
+-	ttl, err := strconv.Atoi(req.FormValue("ttl"))
+-	if err != nil {
+-		http.Error(w, "invalid ttl: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-	
+-	// Parse "timeout" parameter.
+-	var timeout int
+-	if len(req.FormValue("timeout")) == 0 {
+-		timeout = -1
+-	} else if timeout, err = strconv.Atoi(req.FormValue("timeout")); err != nil {
+-		http.Error(w, "invalid timeout: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-	timeout = timeout + 1
+-
+-	// Create an incrementing id for the lock.
+-	resp, err := h.client.AddChild(keypath, "-", uint64(ttl))
+-	if err != nil {
+-		http.Error(w, "add lock index error: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-	indexpath := resp.Key
+-
+-	// Keep updating TTL to make sure lock request is not expired before acquisition.
+-	stop := make(chan bool)
+-	go h.ttlKeepAlive(indexpath, ttl, stop)
+-
+-	// Monitor for broken connection.
+-	stopWatchChan := make(chan bool)
+-	go func() {
+-		select {
+-		case <-closeChan:
+-			stopWatchChan <- true
+-		case <-stop:
+-			// Stop watching for connection disconnect.
+-		}
+-	}()
+-
+-	// Extract the lock index.
+-	index, _ := strconv.Atoi(path.Base(resp.Key))
+-
+-	// Wait until we successfully get a lock or we get a failure.
+-	var success bool
+-	for {
+-		// Read all indices.
+-		resp, err = h.client.GetAll(keypath, true)
+-		if err != nil {
+-			http.Error(w, "lock children lookup error: " + err.Error(), http.StatusInternalServerError)
+-			break
+-		}
+-		indices := extractResponseIndices(resp)
+-		waitIndex := resp.ModifiedIndex
+-		prevIndex := findPrevIndex(indices, index)
+-
+-		// If there is no previous index then we have the lock.
+-		if prevIndex == 0 {
+-			success = true
+-			break
+-		}
+-
+-		// Otherwise watch previous index until it's gone.
+-		_, err = h.client.Watch(path.Join(keypath, strconv.Itoa(prevIndex)), waitIndex, nil, stopWatchChan)
+-		if err == etcd.ErrWatchStoppedByUser {
+-			break
+-		} else if err != nil {
+-			http.Error(w, "lock watch error: " + err.Error(), http.StatusInternalServerError)
+-			break
+-		}
+-	}
+-
+-	// Check for connection disconnect before we write the lock index.
+-	select {
+-	case <-stopWatchChan:
+-		success = false
+-	default:
+-	}
+-
+-	// Stop the ttl keep-alive.
+-	close(stop)
+-
+-	if success {
+-		// Write lock index to response body if we acquire the lock.
+-		h.client.Update(indexpath, "-", uint64(ttl))
+-		w.Write([]byte(strconv.Itoa(index)))
+-	} else {
+-		// Make sure key is deleted if we couldn't acquire.
+-		h.client.Delete(indexpath)
+-	}
+-}
+-
+-// ttlKeepAlive continues to update a key's TTL until the stop channel is closed.
+-func (h *handler) ttlKeepAlive(k string, ttl int, stop chan bool) {
+-	for {
+-		select {
+-		case <-time.After(time.Duration(ttl / 2) * time.Second):
+-			h.client.Update(k, "-", uint64(ttl))
+-		case <-stop:
+-			return
+-		}
+-	}
+-}
+diff --git a/mod/lock/get_index_handler.go b/mod/lock/get_index_handler.go
+deleted file mode 100644
+index 2bb97a8..0000000
+--- a/mod/lock/get_index_handler.go
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package lock
+-
+-import (
+-	"net/http"
+-	"path"
+-	"strconv"
+-
+-	"github.com/gorilla/mux"
+-)
+-
+-// getIndexHandler retrieves the current lock index.
+-func (h *handler) getIndexHandler(w http.ResponseWriter, req *http.Request) {
+-	h.client.SyncCluster()
+-
+-	vars := mux.Vars(req)
+-	keypath := path.Join(prefix, vars["key"])
+-
+-	// Read all indices.
+-	resp, err := h.client.GetAll(keypath, true)
+-	if err != nil {
+-		http.Error(w, "lock children lookup error: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-
+-	// Write out the index of the last one to the response body.
+-	indices := extractResponseIndices(resp)
+-	if len(indices) > 0 {
+-		w.Write([]byte(strconv.Itoa(indices[0])))
+-	}
+-}
+diff --git a/mod/lock/handler.go b/mod/lock/handler.go
+deleted file mode 100644
+index 43e1491..0000000
+--- a/mod/lock/handler.go
++++ /dev/null
+@@ -1,58 +0,0 @@
+-package lock
+-
+-import (
+-	"net/http"
+-	"path"
+-	"strconv"
+-	"sort"
+-
+-	"github.com/gorilla/mux"
+-	"github.com/coreos/go-etcd/etcd"
+-)
+-
+-const prefix = "/_etcd/mod/lock"
+-
+-// handler manages the lock HTTP request.
+-type handler struct {
+-	*mux.Router
+-	client *etcd.Client
+-}
+-
+-// NewHandler creates an HTTP handler that can be registered on a router.
+-func NewHandler(addr string) (http.Handler) {
+-	h := &handler{
+-		Router: mux.NewRouter(),
+-		client: etcd.NewClient([]string{addr}),
+-	}
+-	h.StrictSlash(false)
+-	h.HandleFunc("/{key:.*}", h.getIndexHandler).Methods("GET")
+-	h.HandleFunc("/{key:.*}", h.acquireHandler).Methods("POST")
+-	h.HandleFunc("/{key_with_index:.*}", h.renewLockHandler).Methods("PUT")
+-	h.HandleFunc("/{key_with_index:.*}", h.releaseLockHandler).Methods("DELETE")
+-	return h
+-}
+-
+-
+-// extractResponseIndices extracts a sorted list of indicies from a response.
+-func extractResponseIndices(resp *etcd.Response) []int {
+-	var indices []int
+-	for _, kv := range resp.Kvs {
+-		if index, _ := strconv.Atoi(path.Base(kv.Key)); index > 0 {
+-			indices = append(indices, index)
+-		}
+-	}
+-	sort.Ints(indices)
+-	return indices
+-}
+-
+-// findPrevIndex retrieves the previous index before the given index.
+-func findPrevIndex(indices []int, idx int) int {
+-	var prevIndex int
+-	for _, index := range indices {
+-		if index == idx {
+-			break
+-		}
+-		prevIndex = index
+-	}
+-	return prevIndex
+-}
+diff --git a/mod/lock/release_handler.go b/mod/lock/release_handler.go
+deleted file mode 100644
+index 09251f2..0000000
+--- a/mod/lock/release_handler.go
++++ /dev/null
+@@ -1,24 +0,0 @@
+-package lock
+-
+-import (
+-	"path"
+-	"net/http"
+-
+-	"github.com/gorilla/mux"
+-)
+-
+-// releaseLockHandler deletes the lock.
+-func (h *handler) releaseLockHandler(w http.ResponseWriter, req *http.Request) {
+-	h.client.SyncCluster()
+-
+-	vars := mux.Vars(req)
+-	keypath := path.Join(prefix, vars["key_with_index"])
+-
+-	// Delete the lock.
+-	_, err := h.client.Delete(keypath)
+-	if err != nil {
+-		http.Error(w, "delete lock index error: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-}
+-
+diff --git a/mod/lock/renew_handler.go b/mod/lock/renew_handler.go
+deleted file mode 100644
+index 7933931..0000000
+--- a/mod/lock/renew_handler.go
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package lock
+-
+-import (
+-	"path"
+-	"net/http"
+-	"strconv"
+-
+-	"github.com/gorilla/mux"
+-)
+-
+-// renewLockHandler attempts to update the TTL on an existing lock.
+-// Returns a 200 OK if successful. Returns non-200 on error.
+-func (h *handler) renewLockHandler(w http.ResponseWriter, req *http.Request) {
+-	h.client.SyncCluster()
+-
+-	vars := mux.Vars(req)
+-	keypath := path.Join(prefix, vars["key_with_index"])
+-	ttl, err := strconv.Atoi(req.FormValue("ttl"))
+-	if err != nil {
+-		http.Error(w, "invalid ttl: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-
+-	// Renew the lock, if it exists.
+-	_, err = h.client.Update(keypath, "-", uint64(ttl))
+-	if err != nil {
+-		http.Error(w, "renew lock index error: " + err.Error(), http.StatusInternalServerError)
+-		return
+-	}
+-}
+diff --git a/mod/lock/tests/handler_test.go b/mod/lock/tests/handler_test.go
+deleted file mode 100644
+index 7e9091a..0000000
+--- a/mod/lock/tests/handler_test.go
++++ /dev/null
+@@ -1,188 +0,0 @@
+-package lock
+-
+-import (
+-	"fmt"
+-	"testing"
+-	"time"
+-
+-	"github.com/coreos/etcd/server"
+-	"github.com/coreos/etcd/tests"
+-	"github.com/stretchr/testify/assert"
+-)
+-
+-// Ensure that a lock can be acquired and released.
+-func TestModLockAcquireAndRelease(t *testing.T) {
+-	tests.RunServer(func(s *server.Server) {
+-		// Acquire lock.
+-		body, err := testAcquireLock(s, "foo", 10)
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		// Check that we have the lock.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		// Release lock.
+-		body, err = testReleaseLock(s, "foo", 2)
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "")
+-
+-		// Check that we have the lock.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "")
+-	})
+-}
+-
+-// Ensure that a lock can be acquired and another process is blocked until released.
+-func TestModLockBlockUntilAcquire(t *testing.T) {
+-	tests.RunServer(func(s *server.Server) {
+-		c := make(chan bool)
+-
+-		// Acquire lock #1.
+-		go func() {
+-			body, err := testAcquireLock(s, "foo", 10)
+-			assert.NoError(t, err)
+-			assert.Equal(t, body, "2")
+-			c <- true
+-		}()
+-		<- c
+-
+-		// Acquire lock #2.
+-		go func() {
+-			c <- true
+-			body, err := testAcquireLock(s, "foo", 10)
+-			assert.NoError(t, err)
+-			assert.Equal(t, body, "4")
+-		}()
+-		<- c
+-
+-		time.Sleep(1 * time.Second)
+-
+-		// Check that we have the lock #1.
+-		body, err := testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		// Release lock #1.
+-		body, err = testReleaseLock(s, "foo", 2)
+-		assert.NoError(t, err)
+-
+-		// Check that we have lock #2.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "4")
+-
+-		// Release lock #2.
+-		body, err = testReleaseLock(s, "foo", 4)
+-		assert.NoError(t, err)
+-
+-		// Check that we have no lock.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "")
+-	})
+-}
+-
+-// Ensure that a lock will be released after the TTL.
+-func TestModLockExpireAndRelease(t *testing.T) {
+-	tests.RunServer(func(s *server.Server) {
+-		c := make(chan bool)
+-
+-		// Acquire lock #1.
+-		go func() {
+-			body, err := testAcquireLock(s, "foo", 2)
+-			assert.NoError(t, err)
+-			assert.Equal(t, body, "2")
+-			c <- true
+-		}()
+-		<- c
+-
+-		// Acquire lock #2.
+-		go func() {
+-			c <- true
+-			body, err := testAcquireLock(s, "foo", 10)
+-			assert.NoError(t, err)
+-			assert.Equal(t, body, "4")
+-		}()
+-		<- c
+-
+-		time.Sleep(1 * time.Second)
+-
+-		// Check that we have the lock #1.
+-		body, err := testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		// Wait for lock #1 TTL.
+-		time.Sleep(2 * time.Second)
+-
+-		// Check that we have lock #2.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "4")
+-	})
+-}
+-
+-// Ensure that a lock can be renewed.
+-func TestModLockRenew(t *testing.T) {
+-	tests.RunServer(func(s *server.Server) {
+-		// Acquire lock.
+-		body, err := testAcquireLock(s, "foo", 3)
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		time.Sleep(2 * time.Second)
+-
+-		// Check that we have the lock.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		// Renew lock.
+-		body, err = testRenewLock(s, "foo", 2, 3)
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "")
+-
+-		time.Sleep(2 * time.Second)
+-
+-		// Check that we still have the lock.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "2")
+-
+-		time.Sleep(2 * time.Second)
+-
+-		// Check that lock was released.
+-		body, err = testGetLockIndex(s, "foo")
+-		assert.NoError(t, err)
+-		assert.Equal(t, body, "")
+-	})
+-}
+-
+-
+-
+-func testAcquireLock(s *server.Server, key string, ttl int) (string, error) {
+-	resp, err := tests.PostForm(fmt.Sprintf("%s/mod/lock/%s?ttl=%d", s.URL(), key, ttl), nil)
+-	ret := tests.ReadBody(resp)
+-	return string(ret), err
+-}
+-
+-func testGetLockIndex(s *server.Server, key string) (string, error) {
+-	resp, err := tests.Get(fmt.Sprintf("%s/mod/lock/%s", s.URL(), key))
+-	ret := tests.ReadBody(resp)
+-	return string(ret), err
+-}
+-
+-func testReleaseLock(s *server.Server, key string, index int) (string, error) {
+-	resp, err := tests.DeleteForm(fmt.Sprintf("%s/mod/lock/%s/%d", s.URL(), key, index), nil)
+-	ret := tests.ReadBody(resp)
+-	return string(ret), err
+-}
+-
+-func testRenewLock(s *server.Server, key string, index int, ttl int) (string, error) {
+-	resp, err := tests.PutForm(fmt.Sprintf("%s/mod/lock/%s/%d?ttl=%d", s.URL(), key, index, ttl), nil)
+-	ret := tests.ReadBody(resp)
+-	return string(ret), err
+-}
+diff --git a/mod/lock/v2/acquire_handler.go b/mod/lock/v2/acquire_handler.go
+new file mode 100644
+index 0000000..de82cdd
+--- /dev/null
++++ b/mod/lock/v2/acquire_handler.go
+@@ -0,0 +1,128 @@
++package v2
++
++import (
++	"net/http"
++	"path"
++	"strconv"
++	"time"
++
++	"github.com/coreos/go-etcd/etcd"
++	"github.com/gorilla/mux"
++)
++
++// acquireHandler attempts to acquire a lock on the given key.
++// The "key" parameter specifies the resource to lock.
++// The "ttl" parameter specifies how long the lock will persist for.
++// The "timeout" parameter specifies how long the request should wait for the lock.
++func (h *handler) acquireHandler(w http.ResponseWriter, req *http.Request) {
++	h.client.SyncCluster()
++
++	// Setup connection watcher.
++	closeNotifier, _ := w.(http.CloseNotifier)
++	closeChan := closeNotifier.CloseNotify()
++
++	// Parse "key" and "ttl" query parameters.
++	vars := mux.Vars(req)
++	keypath := path.Join(prefix, vars["key"])
++	ttl, err := strconv.Atoi(req.FormValue("ttl"))
++	if err != nil {
++		http.Error(w, "invalid ttl: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++	
++	// Parse "timeout" parameter.
++	var timeout int
++	if len(req.FormValue("timeout")) == 0 {
++		timeout = -1
++	} else if timeout, err = strconv.Atoi(req.FormValue("timeout")); err != nil {
++		http.Error(w, "invalid timeout: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++	timeout = timeout + 1
++
++	// Create an incrementing id for the lock.
++	resp, err := h.client.AddChild(keypath, "-", uint64(ttl))
++	if err != nil {
++		http.Error(w, "add lock index error: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++	indexpath := resp.Key
++
++	// Keep updating TTL to make sure lock request is not expired before acquisition.
++	stop := make(chan bool)
++	go h.ttlKeepAlive(indexpath, ttl, stop)
++
++	// Monitor for broken connection.
++	stopWatchChan := make(chan bool)
++	go func() {
++		select {
++		case <-closeChan:
++			stopWatchChan <- true
++		case <-stop:
++			// Stop watching for connection disconnect.
++		}
++	}()
++
++	// Extract the lock index.
++	index, _ := strconv.Atoi(path.Base(resp.Key))
++
++	// Wait until we successfully get a lock or we get a failure.
++	var success bool
++	for {
++		// Read all indices.
++		resp, err = h.client.GetAll(keypath, true)
++		if err != nil {
++			http.Error(w, "lock children lookup error: " + err.Error(), http.StatusInternalServerError)
++			break
++		}
++		indices := extractResponseIndices(resp)
++		waitIndex := resp.ModifiedIndex
++		prevIndex := findPrevIndex(indices, index)
++
++		// If there is no previous index then we have the lock.
++		if prevIndex == 0 {
++			success = true
++			break
++		}
++
++		// Otherwise watch previous index until it's gone.
++		_, err = h.client.Watch(path.Join(keypath, strconv.Itoa(prevIndex)), waitIndex, nil, stopWatchChan)
++		if err == etcd.ErrWatchStoppedByUser {
++			break
++		} else if err != nil {
++			http.Error(w, "lock watch error: " + err.Error(), http.StatusInternalServerError)
++			break
++		}
++	}
++
++	// Check for connection disconnect before we write the lock index.
++	select {
++	case <-stopWatchChan:
++		success = false
++	default:
++	}
++
++	// Stop the ttl keep-alive.
++	close(stop)
++
++	if success {
++		// Write lock index to response body if we acquire the lock.
++		h.client.Update(indexpath, "-", uint64(ttl))
++		w.Write([]byte(strconv.Itoa(index)))
++	} else {
++		// Make sure key is deleted if we couldn't acquire.
++		h.client.Delete(indexpath)
++	}
++}
++
++// ttlKeepAlive continues to update a key's TTL until the stop channel is closed.
++func (h *handler) ttlKeepAlive(k string, ttl int, stop chan bool) {
++	for {
++		select {
++		case <-time.After(time.Duration(ttl / 2) * time.Second):
++			h.client.Update(k, "-", uint64(ttl))
++		case <-stop:
++			return
++		}
++	}
++}
+diff --git a/mod/lock/v2/get_index_handler.go b/mod/lock/v2/get_index_handler.go
+new file mode 100644
+index 0000000..2393da7
+--- /dev/null
++++ b/mod/lock/v2/get_index_handler.go
+@@ -0,0 +1,30 @@
++package v2
++
++import (
++	"net/http"
++	"path"
++	"strconv"
++
++	"github.com/gorilla/mux"
++)
++
++// getIndexHandler retrieves the current lock index.
++func (h *handler) getIndexHandler(w http.ResponseWriter, req *http.Request) {
++	h.client.SyncCluster()
++
++	vars := mux.Vars(req)
++	keypath := path.Join(prefix, vars["key"])
++
++	// Read all indices.
++	resp, err := h.client.GetAll(keypath, true)
++	if err != nil {
++		http.Error(w, "lock children lookup error: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	// Write out the index of the last one to the response body.
++	indices := extractResponseIndices(resp)
++	if len(indices) > 0 {
++		w.Write([]byte(strconv.Itoa(indices[0])))
++	}
++}
+diff --git a/mod/lock/v2/handler.go b/mod/lock/v2/handler.go
+new file mode 100644
+index 0000000..2713758
+--- /dev/null
++++ b/mod/lock/v2/handler.go
+@@ -0,0 +1,58 @@
++package v2
++
++import (
++	"net/http"
++	"path"
++	"strconv"
++	"sort"
++
++	"github.com/gorilla/mux"
++	"github.com/coreos/go-etcd/etcd"
++)
++
++const prefix = "/_etcd/mod/lock"
++
++// handler manages the lock HTTP request.
++type handler struct {
++	*mux.Router
++	client *etcd.Client
++}
++
++// NewHandler creates an HTTP handler that can be registered on a router.
++func NewHandler(addr string) (http.Handler) {
++	h := &handler{
++		Router: mux.NewRouter(),
++		client: etcd.NewClient([]string{addr}),
++	}
++	h.StrictSlash(false)
++	h.HandleFunc("/{key:.*}", h.getIndexHandler).Methods("GET")
++	h.HandleFunc("/{key:.*}", h.acquireHandler).Methods("POST")
++	h.HandleFunc("/{key_with_index:.*}", h.renewLockHandler).Methods("PUT")
++	h.HandleFunc("/{key_with_index:.*}", h.releaseLockHandler).Methods("DELETE")
++	return h
++}
++
++
++// extractResponseIndices extracts a sorted list of indicies from a response.
++func extractResponseIndices(resp *etcd.Response) []int {
++	var indices []int
++	for _, kv := range resp.Kvs {
++		if index, _ := strconv.Atoi(path.Base(kv.Key)); index > 0 {
++			indices = append(indices, index)
++		}
++	}
++	sort.Ints(indices)
++	return indices
++}
++
++// findPrevIndex retrieves the previous index before the given index.
++func findPrevIndex(indices []int, idx int) int {
++	var prevIndex int
++	for _, index := range indices {
++		if index == idx {
++			break
++		}
++		prevIndex = index
++	}
++	return prevIndex
++}
+diff --git a/mod/lock/v2/release_handler.go b/mod/lock/v2/release_handler.go
+new file mode 100644
+index 0000000..b41157e
+--- /dev/null
++++ b/mod/lock/v2/release_handler.go
+@@ -0,0 +1,24 @@
++package v2
++
++import (
++	"path"
++	"net/http"
++
++	"github.com/gorilla/mux"
++)
++
++// releaseLockHandler deletes the lock.
++func (h *handler) releaseLockHandler(w http.ResponseWriter, req *http.Request) {
++	h.client.SyncCluster()
++
++	vars := mux.Vars(req)
++	keypath := path.Join(prefix, vars["key_with_index"])
++
++	// Delete the lock.
++	_, err := h.client.Delete(keypath)
++	if err != nil {
++		http.Error(w, "delete lock index error: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++}
++
+diff --git a/mod/lock/v2/renew_handler.go b/mod/lock/v2/renew_handler.go
+new file mode 100644
+index 0000000..cdd65b3
+--- /dev/null
++++ b/mod/lock/v2/renew_handler.go
+@@ -0,0 +1,30 @@
++package v2
++
++import (
++	"path"
++	"net/http"
++	"strconv"
++
++	"github.com/gorilla/mux"
++)
++
++// renewLockHandler attempts to update the TTL on an existing lock.
++// Returns a 200 OK if successful. Returns non-200 on error.
++func (h *handler) renewLockHandler(w http.ResponseWriter, req *http.Request) {
++	h.client.SyncCluster()
++
++	vars := mux.Vars(req)
++	keypath := path.Join(prefix, vars["key_with_index"])
++	ttl, err := strconv.Atoi(req.FormValue("ttl"))
++	if err != nil {
++		http.Error(w, "invalid ttl: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	// Renew the lock, if it exists.
++	_, err = h.client.Update(keypath, "-", uint64(ttl))
++	if err != nil {
++		http.Error(w, "renew lock index error: " + err.Error(), http.StatusInternalServerError)
++		return
++	}
++}
+diff --git a/mod/lock/v2/tests/handler_test.go b/mod/lock/v2/tests/handler_test.go
+new file mode 100644
+index 0000000..b589865
+--- /dev/null
++++ b/mod/lock/v2/tests/handler_test.go
+@@ -0,0 +1,188 @@
++package lock
++
++import (
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/coreos/etcd/server"
++	"github.com/coreos/etcd/tests"
++	"github.com/stretchr/testify/assert"
++)
++
++// Ensure that a lock can be acquired and released.
++func TestModLockAcquireAndRelease(t *testing.T) {
++	tests.RunServer(func(s *server.Server) {
++		// Acquire lock.
++		body, err := testAcquireLock(s, "foo", 10)
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		// Check that we have the lock.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		// Release lock.
++		body, err = testReleaseLock(s, "foo", 2)
++		assert.NoError(t, err)
++		assert.Equal(t, body, "")
++
++		// Check that we have the lock.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "")
++	})
++}
++
++// Ensure that a lock can be acquired and another process is blocked until released.
++func TestModLockBlockUntilAcquire(t *testing.T) {
++	tests.RunServer(func(s *server.Server) {
++		c := make(chan bool)
++
++		// Acquire lock #1.
++		go func() {
++			body, err := testAcquireLock(s, "foo", 10)
++			assert.NoError(t, err)
++			assert.Equal(t, body, "2")
++			c <- true
++		}()
++		<- c
++
++		// Acquire lock #2.
++		go func() {
++			c <- true
++			body, err := testAcquireLock(s, "foo", 10)
++			assert.NoError(t, err)
++			assert.Equal(t, body, "4")
++		}()
++		<- c
++
++		time.Sleep(1 * time.Second)
++
++		// Check that we have the lock #1.
++		body, err := testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		// Release lock #1.
++		body, err = testReleaseLock(s, "foo", 2)
++		assert.NoError(t, err)
++
++		// Check that we have lock #2.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "4")
++
++		// Release lock #2.
++		body, err = testReleaseLock(s, "foo", 4)
++		assert.NoError(t, err)
++
++		// Check that we have no lock.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "")
++	})
++}
++
++// Ensure that a lock will be released after the TTL.
++func TestModLockExpireAndRelease(t *testing.T) {
++	tests.RunServer(func(s *server.Server) {
++		c := make(chan bool)
++
++		// Acquire lock #1.
++		go func() {
++			body, err := testAcquireLock(s, "foo", 2)
++			assert.NoError(t, err)
++			assert.Equal(t, body, "2")
++			c <- true
++		}()
++		<- c
++
++		// Acquire lock #2.
++		go func() {
++			c <- true
++			body, err := testAcquireLock(s, "foo", 10)
++			assert.NoError(t, err)
++			assert.Equal(t, body, "4")
++		}()
++		<- c
++
++		time.Sleep(1 * time.Second)
++
++		// Check that we have the lock #1.
++		body, err := testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		// Wait for lock #1 TTL.
++		time.Sleep(2 * time.Second)
++
++		// Check that we have lock #2.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "4")
++	})
++}
++
++// Ensure that a lock can be renewed.
++func TestModLockRenew(t *testing.T) {
++	tests.RunServer(func(s *server.Server) {
++		// Acquire lock.
++		body, err := testAcquireLock(s, "foo", 3)
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		time.Sleep(2 * time.Second)
++
++		// Check that we have the lock.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		// Renew lock.
++		body, err = testRenewLock(s, "foo", 2, 3)
++		assert.NoError(t, err)
++		assert.Equal(t, body, "")
++
++		time.Sleep(2 * time.Second)
++
++		// Check that we still have the lock.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "2")
++
++		time.Sleep(2 * time.Second)
++
++		// Check that lock was released.
++		body, err = testGetLockIndex(s, "foo")
++		assert.NoError(t, err)
++		assert.Equal(t, body, "")
++	})
++}
++
++
++
++func testAcquireLock(s *server.Server, key string, ttl int) (string, error) {
++	resp, err := tests.PostForm(fmt.Sprintf("%s/mod/lock/v2/%s?ttl=%d", s.URL(), key, ttl), nil)
++	ret := tests.ReadBody(resp)
++	return string(ret), err
++}
++
++func testGetLockIndex(s *server.Server, key string) (string, error) {
++	resp, err := tests.Get(fmt.Sprintf("%s/mod/lock/v2/%s", s.URL(), key))
++	ret := tests.ReadBody(resp)
++	return string(ret), err
++}
++
++func testReleaseLock(s *server.Server, key string, index int) (string, error) {
++	resp, err := tests.DeleteForm(fmt.Sprintf("%s/mod/lock/v2/%s/%d", s.URL(), key, index), nil)
++	ret := tests.ReadBody(resp)
++	return string(ret), err
++}
++
++func testRenewLock(s *server.Server, key string, index int, ttl int) (string, error) {
++	resp, err := tests.PutForm(fmt.Sprintf("%s/mod/lock/v2/%s/%d?ttl=%d", s.URL(), key, index, ttl), nil)
++	ret := tests.ReadBody(resp)
++	return string(ret), err
++}
+diff --git a/mod/mod.go b/mod/mod.go
+index 7c0194f..b5625db 100644
+--- a/mod/mod.go
++++ b/mod/mod.go
+@@ -6,7 +6,7 @@ import (
+ 	"path"
+ 
+ 	"github.com/coreos/etcd/mod/dashboard"
+-	"github.com/coreos/etcd/mod/lock"
++	lock2 "github.com/coreos/etcd/mod/lock/v2"
+ 	"github.com/gorilla/mux"
+ )
+ 
+@@ -23,6 +23,6 @@ func HttpHandler(addr string) http.Handler {
+ 	r.PathPrefix("/dashboard/").Handler(http.StripPrefix("/dashboard/", dashboard.HttpHandler()))
+ 
+ 	// TODO: Use correct addr.
+-	r.PathPrefix("/lock").Handler(http.StripPrefix("/lock", lock.NewHandler(addr)))
++	r.PathPrefix("/lock/v2").Handler(http.StripPrefix("/lock/v2", lock2.NewHandler(addr)))
+ 	return r
+ }
+diff --git a/test.sh b/test.sh
+index cb4c51f..ae40d82 100755
+--- a/test.sh
++++ b/test.sh
+@@ -2,7 +2,7 @@
+ set -e
+ 
+ if [ -z "$PKG" ]; then
+-    PKG="./store ./server ./server/v2/tests ./mod/lock/tests"
++    PKG="./store ./server ./server/v2/tests ./mod/lock/v2/tests"
+ fi
+ 
+ # Get GOPATH, etc from build

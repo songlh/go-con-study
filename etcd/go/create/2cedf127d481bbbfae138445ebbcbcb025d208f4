@@ -1,0 +1,90 @@
+commit 2cedf127d481bbbfae138445ebbcbcb025d208f4
+Author: Jonathan Boulle <jonathanboulle@gmail.com>
+Date:   Wed Nov 12 15:02:48 2014 -0800
+
+    raft: block Stop() on n.done, support idempotency
+
+diff --git a/raft/node.go b/raft/node.go
+index e554e3e..35750e7 100644
+--- a/raft/node.go
++++ b/raft/node.go
+@@ -210,8 +210,15 @@ func newNode() node {
+ }
+ 
+ func (n *node) Stop() {
+-	n.stop <- struct{}{}
+-	<-n.stop
++	select {
++	case n.stop <- struct{}{}:
++		// Not already stopped, so trigger it
++	case <-n.done:
++		// Node has already been stopped - no need to do anything
++		return
++	}
++	// Block until the stop has been acknowledged by run()
++	<-n.done
+ }
+ 
+ func (n *node) run(r *raft) {
+@@ -306,7 +313,6 @@ func (n *node) run(r *raft) {
+ 			r.raftLog.stableTo(prevLastUnstablei)
+ 			advancec = nil
+ 		case <-n.stop:
+-			n.stop <- struct{}{}
+ 			close(n.done)
+ 			return
+ 		}
+diff --git a/raft/node_test.go b/raft/node_test.go
+index a2f43d2..7e6617d 100644
+--- a/raft/node_test.go
++++ b/raft/node_test.go
+@@ -141,7 +141,7 @@ func TestBlockProposal(t *testing.T) {
+ }
+ 
+ // TestNodeTick ensures that node.Tick() will increase the
+-// elapsed of the underly raft state machine.
++// elapsed of the underlying raft state machine.
+ func TestNodeTick(t *testing.T) {
+ 	n := newNode()
+ 	r := newRaft(1, []uint64{1}, 10, 1)
+@@ -154,6 +154,40 @@ func TestNodeTick(t *testing.T) {
+ 	}
+ }
+ 
++// TestNodeStop ensures that node.Stop() blocks until the node has stopped
++// processing, and that it is idempotent
++func TestNodeStop(t *testing.T) {
++	n := newNode()
++	r := newRaft(1, []uint64{1}, 10, 1)
++	donec := make(chan struct{})
++
++	go func() {
++		n.run(r)
++		close(donec)
++	}()
++
++	elapsed := r.elapsed
++	n.Tick()
++	n.Stop()
++
++	select {
++	case <-donec:
++	case <-time.After(time.Second):
++		t.Fatalf("timed out waiting for node to stop!")
++	}
++
++	if r.elapsed != elapsed+1 {
++		t.Errorf("elapsed = %d, want %d", r.elapsed, elapsed+1)
++	}
++	// Further ticks should have no effect, the node is stopped.
++	n.Tick()
++	if r.elapsed != elapsed+1 {
++		t.Errorf("elapsed = %d, want %d", r.elapsed, elapsed+1)
++	}
++	// Subsequent Stops should have no effect.
++	n.Stop()
++}
++
+ func TestReadyContainUpdates(t *testing.T) {
+ 	tests := []struct {
+ 		rd       Ready

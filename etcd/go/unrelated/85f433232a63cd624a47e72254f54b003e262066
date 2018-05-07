@@ -1,0 +1,281 @@
+commit 85f433232a63cd624a47e72254f54b003e262066
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Sat Jun 3 11:02:08 2017 -0700
+
+    *: clear rarer shellcheck errors on scripts
+    
+    Clean up the tail of the warnings
+
+diff --git a/build b/build
+index 4f5b805..36be42e 100755
+--- a/build
++++ b/build
+@@ -3,9 +3,7 @@
+ # set some environment variables
+ ORG_PATH="github.com/coreos"
+ REPO_PATH="${ORG_PATH}/etcd"
+-export GO15VENDOREXPERIMENT="1"
+ 
+-eval $(go env)
+ GIT_SHA=`git rev-parse --short HEAD || echo "GitNotFound"`
+ if [ ! -z "$FAILPOINTS" ]; then
+ 	GIT_SHA="$GIT_SHA"-FAILPOINTS
+@@ -17,11 +15,7 @@ GO_LDFLAGS="$GO_LDFLAGS -X ${REPO_PATH}/cmd/vendor/${REPO_PATH}/version.GitSHA=$
+ # enable/disable failpoints
+ toggle_failpoints() {
+ 	FAILPKGS="etcdserver/ mvcc/backend/"
+-
+-	mode="disable"
+-	if [ ! -z "$FAILPOINTS" ]; then mode="enable"; fi
+-	if [ ! -z "$1" ]; then mode="$1"; fi
+-
++	mode="$1"
+ 	if which gofail >/dev/null 2>&1; then
+ 		gofail "$mode" $FAILPKGS
+ 	elif [ "$mode" != "disable" ]; then
+@@ -30,19 +24,26 @@ toggle_failpoints() {
+ 	fi
+ }
+ 
++toggle_failpoints_default() {
++	mode="disable"
++	if [ ! -z "$FAILPOINTS" ]; then mode="enable"; fi
++	toggle_failpoints "$mode"
++}
++
+ etcd_build() {
+ 	out="bin"
+ 	if [ -n "${BINDIR}" ]; then out="${BINDIR}"; fi
+-	toggle_failpoints
++	toggle_failpoints_default
+ 	# Static compilation is useful when etcd is run in a container
+ 	CGO_ENABLED=0 go build $GO_BUILD_FLAGS -installsuffix cgo -ldflags "$GO_LDFLAGS" -o ${out}/etcd ${REPO_PATH}/cmd/etcd || return
+ 	CGO_ENABLED=0 go build $GO_BUILD_FLAGS -installsuffix cgo -ldflags "$GO_LDFLAGS" -o ${out}/etcdctl ${REPO_PATH}/cmd/etcdctl || return
+ }
+ 
+ etcd_setup_gopath() {
+-	CDIR=$(cd `dirname "$0"` && pwd)
++	d=$(dirname "$0")
++	CDIR=$(cd "$d" && pwd)
+ 	cd "$CDIR"
+-	etcdGOPATH=${CDIR}/gopath
++	etcdGOPATH="${CDIR}/gopath"
+ 	# preserve old gopath to support building with unvendored tooling deps (e.g., gofail)
+ 	if [ -n "$GOPATH" ]; then
+ 		GOPATH=":$GOPATH"
+@@ -53,7 +54,7 @@ etcd_setup_gopath() {
+ 	ln -s ${CDIR}/cmd/vendor ${etcdGOPATH}/src
+ }
+ 
+-toggle_failpoints
++toggle_failpoints_default
+ 
+ # only build when called directly, not sourced
+ if echo "$0" | grep "build$" >/dev/null; then
+diff --git a/scripts/build-aci b/scripts/build-aci
+index 76e0d02..b7efb2b 100755
+--- a/scripts/build-aci
++++ b/scripts/build-aci
+@@ -71,7 +71,7 @@ acbuild --debug port add peer tcp 2380
+ 
+ acbuild --debug copy "$TMPHOSTS" /etc/hosts
+ 
+-acbuild --debug label add arch $(go2aci ${GOARCH})
++acbuild --debug label add arch "$(go2aci ${GOARCH})"
+ 
+ # mkdir default data-dir
+ mkdir -p .acbuild/currentaci/rootfs/var/lib/etcd
+diff --git a/scripts/build-docker b/scripts/build-docker
+index 5c01321..b7aea2b 100755
+--- a/scripts/build-docker
++++ b/scripts/build-docker
+@@ -17,8 +17,7 @@ if [ -z ${BINARYDIR} ]; then
+ 	BINARYDIR="${RELEASE}"
+ 	TARFILE="${RELEASE}.tar.gz"
+ 	TARURL="https://github.com/coreos/etcd/releases/download/${1}/${TARFILE}"
+-	curl -f -L -o ${TARFILE} ${TARURL}
+-	if [ $? != 0 ]; then
++	if ! curl -f -L -o ${TARFILE} ${TARURL} ; then
+ 		echo "Failed to download ${TARURL}."
+ 		exit 1
+ 	fi
+diff --git a/scripts/genproto.sh b/scripts/genproto.sh
+index a288128..1b46073 100755
+--- a/scripts/genproto.sh
++++ b/scripts/genproto.sh
+@@ -57,7 +57,7 @@ popd
+ 
+ for dir in ${DIRS}; do
+ 	pushd ${dir}
+-		protoc --gofast_out=plugins=grpc,import_prefix=github.com/coreos/:. -I=.:"${GOGOPROTO_PATH}":"${COREOS_ROOT}":"${GRPC_GATEWAY_ROOT}/third_party/googleapis" *.proto
++		protoc --gofast_out=plugins=grpc,import_prefix=github.com/coreos/:. -I=".:${GOGOPROTO_PATH}:${COREOS_ROOT}:${GRPC_GATEWAY_ROOT}/third_party/googleapis" *.proto
+ 		sed -i.bak -E "s/github\.com\/coreos\/(gogoproto|github\.com|golang\.org|google\.golang\.org)/\1/g" *.pb.go
+ 		sed -i.bak -E 's/github\.com\/coreos\/(errors|fmt|io)/\1/g' *.pb.go
+ 		sed -i.bak -E 's/import _ \"gogoproto\"//g' *.pb.go
+diff --git a/scripts/release.sh b/scripts/release.sh
+index d6c6edb..1c84669 100755
+--- a/scripts/release.sh
++++ b/scripts/release.sh
+@@ -21,7 +21,7 @@ if ! command -v docker >/dev/null; then
+     exit 1
+ fi
+ 
+-ETCD_ROOT=$(dirname "${BASH_SOURCE}")/..
++ETCD_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+ 
+ pushd ${ETCD_ROOT} >/dev/null
+ 	echo Building etcd binary...
+diff --git a/scripts/updatedep.sh b/scripts/updatedep.sh
+index a76e626..651aa3c 100755
+--- a/scripts/updatedep.sh
++++ b/scripts/updatedep.sh
+@@ -43,7 +43,7 @@ pushd "${GLIDE_VC_ROOT}"
+ popd
+ 
+ if [ -n "$1" ]; then
+-	echo "glide get on $(echo $1)"
++	echo "glide get on $1"
+ 	matches=`grep "name: $1" glide.lock`
+ 	if [ ! -z "$matches" ]; then
+ 		echo "glide update on $1"
+diff --git a/test b/test
+index bca5a0b..ffd8e1d 100755
+--- a/test
++++ b/test
+@@ -23,6 +23,8 @@ if [ -z "$PASSES" ]; then
+ 	PASSES="fmt bom dep compile build unit"
+ fi
+ 
++USERPKG=${PKG:-}
++
+ # Invoke ./cover for HTML output
+ COVER=${COVER:-"-cover"}
+ 
+@@ -31,41 +33,39 @@ IGNORE_PKGS="(cmd/|etcdserverpb|rafttest|gopath.proto|v3lockpb|v3electionpb)"
+ INTEGRATION_PKGS="(integration|e2e|contrib|functional-tester)"
+ 
+ # all github.com/coreos/etcd/whatever pkgs that are not auto-generated / tools
+-PKGS=`find . -name \*.go | while read a; do dirname $a; done | sort | uniq | egrep -v "$IGNORE_PKGS" | egrep -v "(tools/|contrib/|e2e|pb)" | sed "s|\.|${REPO_PATH}|g"`
++PKGS=`find . -name \*.go | while read a; do dirname $a; done | sort | uniq | egrep -v "$IGNORE_PKGS" | egrep -v "(tools/|contrib/|e2e|pb)" | sed "s|\.|${REPO_PATH}|g" | xargs echo`
+ # pkg1,pkg2,pkg3
+-PKGS_COMMA=`echo ${PKGS} | sed 's/ /,/g'`
++PKGS_COMMA=${PKGS// /,}
+ 
+ TEST_PKGS=`find . -name \*_test.go | while read a; do dirname $a; done | sort | uniq | egrep -v "$IGNORE_PKGS" | sed "s|\./||g"`
+-FORMATTABLE=`find . -name \*.go | while read a; do echo $(dirname $a)/"*.go"; done | sort | uniq | egrep -v "$IGNORE_PKGS" | sed "s|\./||g"`
++FORMATTABLE=`find . -name \*.go | while read a; do echo "$(dirname $a)/*.go"; done | sort | uniq | egrep -v "$IGNORE_PKGS" | sed "s|\./||g"`
+ TESTABLE_AND_FORMATTABLE=`echo "$TEST_PKGS" | egrep -v "$INTEGRATION_PKGS"`
+ 
+-# TODO: 'client' pkg fails with gosimple from generated files
+-# TODO: 'rafttest' is failing with unused
+-STATIC_ANALYSIS_PATHS=`find . -name \*.go | while read a; do dirname $a; done | sort | uniq | egrep -v "$IGNORE_PKGS" | grep -v 'client'`
+-
+-if [ -z "$GOARCH" ]; then
+-	GOARCH=$(go env GOARCH);
+-fi
+-
+-# user has not provided PKG override
+-if [ -z "$PKG" ]; then
++# check if user provided PKG override
++if [ -z "${USERPKG}" ]; then
+ 	TEST=$TESTABLE_AND_FORMATTABLE
+ 	FMT=$FORMATTABLE
+-
+-# user has provided PKG override
+ else
+ 	# strip out leading dotslashes and trailing slashes from PKG=./foo/
+-	TEST=${PKG/#./}
++	TEST=${USERPKG/#./}
+ 	TEST=${TEST/#\//}
+ 	TEST=${TEST/%\//}
+-
+ 	# only run gofmt on packages provided by user
+ 	FMT="$TEST"
+ fi
+ 
+ # split TEST into an array and prepend REPO_PATH to each local package
+ split=(${TEST// / })
+-TEST=${split[@]/#/${REPO_PATH}/}
++TEST=${split/#/${REPO_PATH}/}
++
++# TODO: 'client' pkg fails with gosimple from generated files
++# TODO: 'rafttest' is failing with unused
++STATIC_ANALYSIS_PATHS=`find . -name \*.go | while read a; do dirname $a; done | sort | uniq | egrep -v "$IGNORE_PKGS" | grep -v 'client'`
++
++if [ -z "$GOARCH" ]; then
++	GOARCH=$(go env GOARCH);
++fi
++
+ 
+ # determine whether target supports race detection
+ if [ "$GOARCH" == "amd64" ]; then
+@@ -235,7 +235,7 @@ function fmt_pass {
+ 		shellcheckResult=$(shellcheck -fgcc build test scripts/* 2>&1 || true)
+ 		if [ -n "${shellcheckResult}" ]; then
+ 			# mask the most common ones; fix later
+-			SHELLCHECK_MASK="SC(2086|2006|2068|2196|2035|2162|2046|2076)"
++			SHELLCHECK_MASK="SC(2086|2006|2068|2196|2035|2162|2076)"
+ 			errs=$(echo "${shellcheckResult}" | egrep -v "${SHELLCHECK_MASK}" || true)
+ 			if [ -n "${errs}" ]; then
+ 				echo -e "shellcheck checking failed:\n${shellcheckResult}\n===\nFailed:\n${errs}"
+@@ -248,7 +248,7 @@ function fmt_pass {
+ 
+ 	echo "Checking documentation style..."
+ 	# eschew you
+-	yous=`find . -name \*.md | xargs egrep --color "[Yy]ou[r]?[ '.,;]" | grep -v /v2/ || true`
++	yous=`find . -name \*.md -exec egrep --color "[Yy]ou[r]?[ '.,;]" {} + | grep -v /v2/ || true`
+ 	if [ ! -z "$yous" ]; then
+ 		echo -e "found 'you' in documentation:\n${yous}"
+ 		exit 255
+@@ -289,7 +289,7 @@ function fmt_pass {
+ 			# TODO: resolve these after go1.8 migration
+ 			SIMPLE_CHECK_MASK="S(1024)"
+ 			if echo "${gosimpleResult}" | egrep -v "$SIMPLE_CHECK_MASK"; then
+-				echo -e "gosimple checking ${path} failed:\n${gosimpleResult}"
++				echo -e "gosimple checking failed:\n${gosimpleResult}"
+ 				exit 255
+ 			else
+ 				echo -e "gosimple warning:\n${gosimpleResult}"
+@@ -318,7 +318,7 @@ function fmt_pass {
+ 			# See https://github.com/dominikh/go-tools/tree/master/cmd/staticcheck
+ 			STATIC_CHECK_MASK="SA(1019|2002)"
+ 			if echo "${staticcheckResult}" | egrep -v "$STATIC_CHECK_MASK"; then
+-				echo -e "staticcheck checking ${path} failed:\n${staticcheckResult}"
++				echo -e "staticcheck checking failed:\n${staticcheckResult}"
+ 				exit 255
+ 			else
+ 				suppressed=`echo "${staticcheckResult}" | sed 's/ /\n/g' | grep "(SA" | sort | uniq -c`
+@@ -330,16 +330,20 @@ function fmt_pass {
+ 	fi
+ 
+ 	echo "Checking for license header..."
+-	licRes=$(for file in $(find . -type f -iname '*.go' ! -path './cmd/*' ! -path './gopath.proto/*'); do
+-			head -n3 "${file}" | grep -Eq "(Copyright|generated|GENERATED)" || echo -e "  ${file}"
+-		done;)
++	licRes=""
++	files=$(find . -type f -iname '*.go' ! -path './cmd/*' ! -path './gopath.proto/*')
++	for file in $files; do
++		if ! head -n3 "${file}" | grep -Eq "(Copyright|generated|GENERATED)" ; then
++			licRes="${licRes}"$(echo -e "  ${file}")
++		fi
++	done
+ 	if [ -n "${licRes}" ]; then
+ 		echo -e "license header checking failed:\n${licRes}"
+ 		exit 255
+ 	fi
+ 
+ 	echo "Checking commit titles..."
+-	git log --oneline `git merge-base HEAD master`...HEAD | while read l; do
++	git log --oneline "$(git merge-base HEAD master)"...HEAD | while read l; do
+ 		commitMsg=`echo "$l" | cut -f2- -d' '`
+ 		if [[ "$commitMsg" == Merge* ]]; then
+ 			# ignore "Merge pull" commits
+@@ -371,7 +375,7 @@ function bom_pass {
+ 		--override-file bill-of-materials.override.json \
+ 		github.com/coreos/etcd github.com/coreos/etcd/etcdctl >bom-now.json || true
+ 	if ! diff bill-of-materials.json bom-now.json; then
+-		echo vendored licenses do not match given bill of materials
++		echo "vendored licenses do not match given bill of materials"
+ 		exit 255
+ 	fi
+ 	rm bom-now.json

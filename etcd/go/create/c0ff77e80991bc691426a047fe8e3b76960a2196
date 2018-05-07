@@ -1,0 +1,365 @@
+commit c0ff77e80991bc691426a047fe8e3b76960a2196
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Apr 28 11:24:06 2016 -0700
+
+    local-tester: procfile, faults, and network bridge
+    
+    Creates a local fault injected cluster and stresser for etcd.
+    
+    Usage: goreman -f tools/local-tester/Procfile start
+
+diff --git a/tools/local-tester/Procfile b/tools/local-tester/Procfile
+new file mode 100644
+index 0000000..bb70bfa
+--- /dev/null
++++ b/tools/local-tester/Procfile
+@@ -0,0 +1,21 @@
++# Use goreman to run `go get github.com/mattn/goreman`
++
++# peer bridges
++pbridge1: tools/local-tester/bridge/bridge 127.0.0.1:11111 127.0.0.1:12380
++pbridge2: tools/local-tester/bridge/bridge 127.0.0.1:22222 127.0.0.1:22380
++pbridge3: tools/local-tester/bridge/bridge 127.0.0.1:33333 127.0.0.1:32380
++
++# client bridges
++cbridge1: tools/local-tester/bridge/bridge 127.0.0.1:2379 127.0.0.1:11119
++cbridge2: tools/local-tester/bridge/bridge 127.0.0.1:22379 127.0.0.1:22229
++cbridge3: tools/local-tester/bridge/bridge 127.0.0.1:32379 127.0.0.1:33339
++
++faults: tools/local-tester/faults.sh
++
++stress-put: tools/benchmark/benchmark --endpoints=127.0.0.1:2379,127.0.0.1:22379,127.0.0.1:32379 --clients=27 --conns=3 put --sequential-keys --key-space-size=100000 --total=100000
++
++etcd1: bin/etcd --name infra1 --snapshot-count=1000 --listen-client-urls http://127.0.0.1:11119 --advertise-client-urls http://127.0.0.1:2379 --listen-peer-urls http://127.0.0.1:12380 --initial-advertise-peer-urls http://127.0.0.1:11111 --initial-cluster-token etcd-cluster-1 --initial-cluster 'infra1=http://127.0.0.1:11111,infra2=http://127.0.0.1:22222,infra3=http://127.0.0.1:33333' --initial-cluster-state new --enable-pprof
++etcd2: bin/etcd --name infra2 --snapshot-count=1000 --listen-client-urls http://127.0.0.1:22229 --advertise-client-urls http://127.0.0.1:22379 --listen-peer-urls http://127.0.0.1:22380 --initial-advertise-peer-urls http://127.0.0.1:22222 --initial-cluster-token etcd-cluster-1 --initial-cluster 'infra1=http://127.0.0.1:11111,infra2=http://127.0.0.1:22222,infra3=http://127.0.0.1:33333' --initial-cluster-state new --enable-pprof
++etcd3: bin/etcd --name infra3 --snapshot-count=1000 --listen-client-urls http://127.0.0.1:33339 --advertise-client-urls http://127.0.0.1:32379 --listen-peer-urls http://127.0.0.1:32380 --initial-advertise-peer-urls http://127.0.0.1:33333 --initial-cluster-token etcd-cluster-1 --initial-cluster 'infra1=http://127.0.0.1:11111,infra2=http://127.0.0.1:22222,infra3=http://127.0.0.1:33333' --initial-cluster-state new --enable-pprof
++# in future, use proxy to listen on 2379
++#proxy: bin/etcd --name infra-proxy1 --proxy=on --listen-client-urls http://127.0.0.1:2378 --initial-cluster 'infra1=http://127.0.0.1:12380,infra2=http://127.0.0.1:22380,infra3=http://127.0.0.1:32380' --enable-pprof
+diff --git a/tools/local-tester/README.md b/tools/local-tester/README.md
+new file mode 100644
+index 0000000..62e96d1
+--- /dev/null
++++ b/tools/local-tester/README.md
+@@ -0,0 +1,25 @@
++# etcd local-tester
++
++The etcd local-tester runs a fault injected cluster using local processes. It sets up an etcd cluster with unreliable network bridges on its peer and client interfaces. The cluster runs with a constant stream of `Put` requests to simulate client usage. A fault injection script periodically kills cluster members and disrupts bridge connectivity.
++
++# Requirements
++
++local-tester depends on `goreman` to manage its processes and `bash` to run fault injection.
++
++# Building
++
++local-tester needs `etcd`, `benchmark`, and `bridge` binaries. To build these binaries, run the following from the etcd repository root:
++
++```sh
++./build
++pushd tools/benchmark/ && go build && popd
++pushd tools/local-tester/bridge && go build && popd
++```
++
++# Running
++
++The fault injected cluster is invoked with `goreman`:
++
++```sh
++goreman -f tools/local-tester/Procfile start
++```
+diff --git a/tools/local-tester/bridge/bridge.go b/tools/local-tester/bridge/bridge.go
+new file mode 100644
+index 0000000..aa03461
+--- /dev/null
++++ b/tools/local-tester/bridge/bridge.go
+@@ -0,0 +1,220 @@
++// Copyright 2016 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package main is the entry point for the local tester network bridge.
++package main
++
++import (
++	"flag"
++	"io"
++	"io/ioutil"
++	"log"
++	"math/rand"
++	"net"
++	"os"
++	"sync"
++	"time"
++)
++
++func bridge(conn net.Conn, remoteAddr string) {
++	outconn, err := net.Dial("tcp", os.Args[2])
++	if err != nil {
++		log.Println("oops:", err)
++		return
++	}
++	log.Printf("bridging %v <-> %v\n", outconn.LocalAddr(), outconn.RemoteAddr())
++	go io.Copy(conn, outconn)
++	io.Copy(outconn, conn)
++}
++
++func blackhole(conn net.Conn) {
++	log.Printf("blackholing connection %v <-> %v\n", conn.LocalAddr(), conn.RemoteAddr())
++	io.Copy(ioutil.Discard, conn)
++	conn.Close()
++}
++
++func readRemoteOnly(conn net.Conn, remoteAddr string) {
++	outconn, err := net.Dial("tcp", os.Args[2])
++	if err != nil {
++		log.Println("oops:", err)
++		return
++	}
++	log.Printf("one way %v <- %v\n", outconn.LocalAddr(), outconn.RemoteAddr())
++	io.Copy(conn, outconn)
++}
++
++func writeRemoteOnly(conn net.Conn, remoteAddr string) {
++	outconn, err := net.Dial("tcp", os.Args[2])
++	if err != nil {
++		log.Println("oops:", err)
++		return
++	}
++	log.Printf("one way %v -> %v\n", outconn.LocalAddr(), outconn.RemoteAddr())
++	io.Copy(outconn, conn)
++}
++
++func randCopy(conn net.Conn, outconn net.Conn) {
++	for rand.Intn(10) > 0 {
++		b := make([]byte, 4096)
++		n, err := outconn.Read(b)
++		if err != nil {
++			return
++		}
++		_, err = conn.Write(b[:n])
++		if err != nil {
++			return
++		}
++	}
++}
++
++func randomBlackhole(conn net.Conn, remoteAddr string) {
++	outconn, err := net.Dial("tcp", os.Args[2])
++	if err != nil {
++		log.Println("oops:", err)
++		return
++	}
++	log.Printf("random blackhole: connection %v <-/-> %v\n", outconn.LocalAddr(), outconn.RemoteAddr())
++
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		randCopy(conn, outconn)
++		wg.Done()
++	}()
++	go func() {
++		randCopy(outconn, conn)
++		wg.Done()
++	}()
++	wg.Wait()
++	conn.Close()
++	outconn.Close()
++}
++
++type config struct {
++	delayAccept bool
++	resetListen bool
++
++	connFaultRate   float64
++	immediateClose  bool
++	blackhole       bool
++	timeClose       bool
++	writeRemoteOnly bool
++	readRemoteOnly  bool
++	randomBlackhole bool
++}
++
++type acceptFaultFunc func()
++type connFaultFunc func(net.Conn)
++
++func main() {
++	var cfg config
++
++	flag.BoolVar(&cfg.delayAccept, "delay-accept", true, "delays accepting new connections")
++	flag.BoolVar(&cfg.resetListen, "reset-listen", true, "resets the listening port")
++
++	flag.Float64Var(&cfg.connFaultRate, "conn-fault-rate", 0.25, "rate of faulty connections")
++	flag.BoolVar(&cfg.immediateClose, "immediate-close", true, "close after accept")
++	flag.BoolVar(&cfg.blackhole, "blackhole", true, "reads nothing, writes go nowhere")
++	flag.BoolVar(&cfg.timeClose, "time-close", true, "close after random time")
++	flag.BoolVar(&cfg.writeRemoteOnly, "write-remote-only", true, "only write, no read")
++	flag.BoolVar(&cfg.readRemoteOnly, "read-remote-only", true, "only read, no write")
++	flag.BoolVar(&cfg.randomBlackhole, "random-blockhole", true, "blackhole after data xfer")
++	flag.Parse()
++
++	lAddr := flag.Args()[0]
++	fwdAddr := flag.Args()[1]
++	log.Println("listening on ", lAddr)
++	log.Println("forwarding to ", fwdAddr)
++	l, err := net.Listen("tcp", lAddr)
++	if err != nil {
++		log.Fatal(err)
++	}
++	defer l.Close()
++
++	acceptFaults := []acceptFaultFunc{func() {}}
++	if cfg.delayAccept {
++		f := func() {
++			log.Println("delaying accept")
++			time.Sleep(3 * time.Second)
++		}
++		acceptFaults = append(acceptFaults, f)
++	}
++	if cfg.resetListen {
++		f := func() {
++			log.Println("reset listen port")
++			l.Close()
++			newListener, err := net.Listen("tcp", lAddr)
++			if err != nil {
++				log.Fatal(err)
++			}
++			l = newListener
++
++		}
++		acceptFaults = append(acceptFaults, f)
++	}
++
++	connFaults := []connFaultFunc{func(c net.Conn) { bridge(c, fwdAddr) }}
++	if cfg.immediateClose {
++		f := func(c net.Conn) {
++			log.Println("terminating connection immediately")
++			c.Close()
++		}
++		connFaults = append(connFaults, f)
++	}
++	if cfg.blackhole {
++		connFaults = append(connFaults, blackhole)
++	}
++	if cfg.timeClose {
++		f := func(c net.Conn) {
++			go func() {
++				t := time.Duration(rand.Intn(5)+1) * time.Second
++				time.Sleep(t)
++				log.Printf("killing connection %v <-> %v after %v\n",
++					c.LocalAddr(),
++					c.RemoteAddr(),
++					t)
++				c.Close()
++			}()
++			bridge(c, fwdAddr)
++		}
++		connFaults = append(connFaults, f)
++	}
++	if cfg.writeRemoteOnly {
++		f := func(c net.Conn) { writeRemoteOnly(c, fwdAddr) }
++		connFaults = append(connFaults, f)
++	}
++	if cfg.readRemoteOnly {
++		f := func(c net.Conn) { readRemoteOnly(c, fwdAddr) }
++		connFaults = append(connFaults, f)
++	}
++	if cfg.randomBlackhole {
++		f := func(c net.Conn) { randomBlackhole(c, fwdAddr) }
++		connFaults = append(connFaults, f)
++	}
++
++	for {
++		acceptFaults[rand.Intn(len(acceptFaults))]()
++		conn, err := l.Accept()
++		if err != nil {
++			log.Fatal(err)
++		}
++
++		r := rand.Intn(len(connFaults))
++		if rand.Intn(100) > int(100.0*cfg.connFaultRate) {
++			r = 0
++		}
++		go connFaults[r](conn)
++	}
++
++}
+diff --git a/tools/local-tester/faults.sh b/tools/local-tester/faults.sh
+new file mode 100755
+index 0000000..be61002
+--- /dev/null
++++ b/tools/local-tester/faults.sh
+@@ -0,0 +1,65 @@
++#!/bin/bash
++
++PROCFILE="tools/local-tester/Procfile"
++
++function wait_time {
++	expr $RANDOM % 10 + 1
++}
++
++function cycle {
++	for a; do
++		echo "cycling $a"
++		goreman -f $PROCFILE run stop $a || echo "could not stop $a"
++		sleep `wait_time`s
++		goreman -f $PROCFILE run restart $a || echo "could not restart $a"
++	done
++}
++
++function cycle_members {
++	cycle etcd1 etcd2 etcd3
++}
++function cycle_pbridge {
++	cycle pbridge1 pbridge2 pbridge3
++}
++function cycle_cbridge {
++	cycle cbridge1 cbridge2 cbridge3
++}
++function cycle_stresser {
++	cycle stress-put
++}
++
++function kill_maj {
++	idx="etcd"`expr $RANDOM % 3 + 1`
++	idx2="$idx"
++	while [ "$idx" == "$idx2" ]; do
++		idx2="etcd"`expr $RANDOM % 3 + 1`
++	done
++	echo "kill majority $idx $idx2"
++	goreman -f $PROCFILE run stop $idx || echo "could not stop $idx"
++	goreman -f $PROCFILE run stop $idx2 || echo "could not stop $idx2"
++	sleep `wait_time`s
++	goreman -f $PROCFILE run restart $idx || echo "could not restart $idx"
++	goreman -f $PROCFILE run restart $idx2 || echo "could not restart $idx2"
++}
++
++function kill_all {
++	for a in etcd1 etcd2 etcd3; do
++		goreman -f $PROCFILE run stop $a || echo "could not stop $a"
++	done
++	sleep `wait_time`s
++	for a in etcd1 etcd2 etcd3; do
++		goreman -f $PROCFILE run restart $a || echo "could not restart $a"
++	done
++}
++
++function choose {
++	faults=(cycle_members kill_maj kill_all cycle_pbridge cycle_cbridge cycle_stresser)
++	fault=${faults[`expr $RANDOM % ${#faults[@]}`]}
++	echo $fault
++	$fault || echo "failed: $fault"
++}
++
++sleep 2s
++while [ 1 ]; do
++	choose
++done

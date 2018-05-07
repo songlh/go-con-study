@@ -1,0 +1,2579 @@
+commit 01be21985de16b3dd79598c1789b249c8f6fcd9f
+Author: Xiang Li <xiang.li@coreos.com>
+Date:   Tue Sep 2 21:39:16 2014 -0700
+
+    third_party: remove go-etcd/go-systemd dependencies
+
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/add_child.go b/third_party/github.com/coreos/go-etcd/etcd/add_child.go
+deleted file mode 100644
+index 53af6d2..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/add_child.go
++++ /dev/null
+@@ -1,23 +0,0 @@
+-package etcd
+-
+-// Add a new directory with a random etcd-generated key under the given path.
+-func (c *Client) AddChildDir(key string, ttl uint64) (*Response, error) {
+-	raw, err := c.post(key, "", ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// Add a new file with a random etcd-generated key under the given path.
+-func (c *Client) AddChild(key string, value string, ttl uint64) (*Response, error) {
+-	raw, err := c.post(key, value, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/add_child_test.go b/third_party/github.com/coreos/go-etcd/etcd/add_child_test.go
+deleted file mode 100644
+index 26223ff..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/add_child_test.go
++++ /dev/null
+@@ -1,73 +0,0 @@
+-package etcd
+-
+-import "testing"
+-
+-func TestAddChild(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("fooDir", true)
+-		c.Delete("nonexistentDir", true)
+-	}()
+-
+-	c.CreateDir("fooDir", 5)
+-
+-	_, err := c.AddChild("fooDir", "v0", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	_, err = c.AddChild("fooDir", "v1", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	resp, err := c.Get("fooDir", true, false)
+-	// The child with v0 should proceed the child with v1 because it's added
+-	// earlier, so it should have a lower key.
+-	if !(len(resp.Node.Nodes) == 2 && (resp.Node.Nodes[0].Value == "v0" && resp.Node.Nodes[1].Value == "v1")) {
+-		t.Fatalf("AddChild 1 failed.  There should be two chlidren whose values are v0 and v1, respectively."+
+-			"  The response was: %#v", resp)
+-	}
+-
+-	// Creating a child under a nonexistent directory should succeed.
+-	// The directory should be created.
+-	resp, err = c.AddChild("nonexistentDir", "foo", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-}
+-
+-func TestAddChildDir(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("fooDir", true)
+-		c.Delete("nonexistentDir", true)
+-	}()
+-
+-	c.CreateDir("fooDir", 5)
+-
+-	_, err := c.AddChildDir("fooDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	_, err = c.AddChildDir("fooDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	resp, err := c.Get("fooDir", true, false)
+-	// The child with v0 should proceed the child with v1 because it's added
+-	// earlier, so it should have a lower key.
+-	if !(len(resp.Node.Nodes) == 2 && (len(resp.Node.Nodes[0].Nodes) == 0 && len(resp.Node.Nodes[1].Nodes) == 0)) {
+-		t.Fatalf("AddChildDir 1 failed.  There should be two chlidren whose values are v0 and v1, respectively."+
+-			"  The response was: %#v", resp)
+-	}
+-
+-	// Creating a child under a nonexistent directory should succeed.
+-	// The directory should be created.
+-	resp, err = c.AddChildDir("nonexistentDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/client.go b/third_party/github.com/coreos/go-etcd/etcd/client.go
+deleted file mode 100644
+index 48ba9b4..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/client.go
++++ /dev/null
+@@ -1,405 +0,0 @@
+-package etcd
+-
+-import (
+-	"crypto/tls"
+-	"crypto/x509"
+-	"encoding/json"
+-	"errors"
+-	"io"
+-	"io/ioutil"
+-	"net"
+-	"net/http"
+-	"net/url"
+-	"os"
+-	"path"
+-	"time"
+-)
+-
+-// See SetConsistency for how to use these constants.
+-const (
+-	// Using strings rather than iota because the consistency level
+-	// could be persisted to disk, so it'd be better to use
+-	// human-readable values.
+-	STRONG_CONSISTENCY = "STRONG"
+-	WEAK_CONSISTENCY   = "WEAK"
+-)
+-
+-const (
+-	defaultBufferSize = 10
+-)
+-
+-type Config struct {
+-	CertFile    string        `json:"certFile"`
+-	KeyFile     string        `json:"keyFile"`
+-	CaCertFile  []string      `json:"caCertFiles"`
+-	Timeout     time.Duration `json:"timeout"`
+-	Consistency string        `json: "consistency"`
+-}
+-
+-type Client struct {
+-	config      Config   `json:"config"`
+-	cluster     *Cluster `json:"cluster"`
+-	httpClient  *http.Client
+-	persistence io.Writer
+-	cURLch      chan string
+-	keyPrefix   string
+-}
+-
+-// NewClient create a basic client that is configured to be used
+-// with the given machine list.
+-func NewClient(machines []string) *Client {
+-	config := Config{
+-		// default timeout is one second
+-		Timeout: time.Second,
+-		// default consistency level is STRONG
+-		Consistency: STRONG_CONSISTENCY,
+-	}
+-
+-	client := &Client{
+-		cluster:   NewCluster(machines),
+-		config:    config,
+-		keyPrefix: path.Join(version, "keys"),
+-	}
+-
+-	client.initHTTPClient()
+-	client.saveConfig()
+-
+-	return client
+-}
+-
+-// NewTLSClient create a basic client with TLS configuration
+-func NewTLSClient(machines []string, cert, key, caCert string) (*Client, error) {
+-	// overwrite the default machine to use https
+-	if len(machines) == 0 {
+-		machines = []string{"https://127.0.0.1:4001"}
+-	}
+-
+-	config := Config{
+-		// default timeout is one second
+-		Timeout: time.Second,
+-		// default consistency level is STRONG
+-		Consistency: STRONG_CONSISTENCY,
+-		CertFile:    cert,
+-		KeyFile:     key,
+-		CaCertFile:  make([]string, 0),
+-	}
+-
+-	client := &Client{
+-		cluster:   NewCluster(machines),
+-		config:    config,
+-		keyPrefix: path.Join(version, "keys"),
+-	}
+-
+-	err := client.initHTTPSClient(cert, key)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	err = client.AddRootCA(caCert)
+-
+-	client.saveConfig()
+-
+-	return client, nil
+-}
+-
+-// NewClientFromFile creates a client from a given file path.
+-// The given file is expected to use the JSON format.
+-func NewClientFromFile(fpath string) (*Client, error) {
+-	fi, err := os.Open(fpath)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	defer func() {
+-		if err := fi.Close(); err != nil {
+-			panic(err)
+-		}
+-	}()
+-
+-	return NewClientFromReader(fi)
+-}
+-
+-// NewClientFromReader creates a Client configured from a given reader.
+-// The configuration is expected to use the JSON format.
+-func NewClientFromReader(reader io.Reader) (*Client, error) {
+-	c := new(Client)
+-
+-	b, err := ioutil.ReadAll(reader)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	err = json.Unmarshal(b, c)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if c.config.CertFile == "" {
+-		c.initHTTPClient()
+-	} else {
+-		err = c.initHTTPSClient(c.config.CertFile, c.config.KeyFile)
+-	}
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	for _, caCert := range c.config.CaCertFile {
+-		if err := c.AddRootCA(caCert); err != nil {
+-			return nil, err
+-		}
+-	}
+-
+-	return c, nil
+-}
+-
+-// Override the Client's HTTP Transport object
+-func (c *Client) SetTransport(tr *http.Transport) {
+-	c.httpClient.Transport = tr
+-}
+-
+-// SetKeyPrefix changes the key prefix from the default `/v2/keys` to whatever
+-// is set.
+-func (c *Client) SetKeyPrefix(prefix string) {
+-	c.keyPrefix = prefix
+-}
+-
+-// initHTTPClient initializes a HTTP client for etcd client
+-func (c *Client) initHTTPClient() {
+-	tr := &http.Transport{
+-		Dial: dialTimeout,
+-		TLSClientConfig: &tls.Config{
+-			InsecureSkipVerify: true,
+-		},
+-	}
+-	c.httpClient = &http.Client{Transport: tr}
+-}
+-
+-// initHTTPClient initializes a HTTPS client for etcd client
+-func (c *Client) initHTTPSClient(cert, key string) error {
+-	if cert == "" || key == "" {
+-		return errors.New("Require both cert and key path")
+-	}
+-
+-	tlsCert, err := tls.LoadX509KeyPair(cert, key)
+-	if err != nil {
+-		return err
+-	}
+-
+-	tlsConfig := &tls.Config{
+-		Certificates:       []tls.Certificate{tlsCert},
+-		InsecureSkipVerify: true,
+-	}
+-
+-	tr := &http.Transport{
+-		TLSClientConfig: tlsConfig,
+-		Dial:            dialTimeout,
+-	}
+-
+-	c.httpClient = &http.Client{Transport: tr}
+-	return nil
+-}
+-
+-// SetPersistence sets a writer to which the config will be
+-// written every time it's changed.
+-func (c *Client) SetPersistence(writer io.Writer) {
+-	c.persistence = writer
+-}
+-
+-// SetConsistency changes the consistency level of the client.
+-//
+-// When consistency is set to STRONG_CONSISTENCY, all requests,
+-// including GET, are sent to the leader.  This means that, assuming
+-// the absence of leader failures, GET requests are guaranteed to see
+-// the changes made by previous requests.
+-//
+-// When consistency is set to WEAK_CONSISTENCY, other requests
+-// are still sent to the leader, but GET requests are sent to a
+-// random server from the server pool.  This reduces the read
+-// load on the leader, but it's not guaranteed that the GET requests
+-// will see changes made by previous requests (they might have not
+-// yet been committed on non-leader servers).
+-func (c *Client) SetConsistency(consistency string) error {
+-	if !(consistency == STRONG_CONSISTENCY || consistency == WEAK_CONSISTENCY) {
+-		return errors.New("The argument must be either STRONG_CONSISTENCY or WEAK_CONSISTENCY.")
+-	}
+-	c.config.Consistency = consistency
+-	return nil
+-}
+-
+-// AddRootCA adds a root CA cert for the etcd client
+-func (c *Client) AddRootCA(caCert string) error {
+-	if c.httpClient == nil {
+-		return errors.New("Client has not been initialized yet!")
+-	}
+-
+-	certBytes, err := ioutil.ReadFile(caCert)
+-	if err != nil {
+-		return err
+-	}
+-
+-	tr, ok := c.httpClient.Transport.(*http.Transport)
+-
+-	if !ok {
+-		panic("AddRootCA(): Transport type assert should not fail")
+-	}
+-
+-	if tr.TLSClientConfig.RootCAs == nil {
+-		caCertPool := x509.NewCertPool()
+-		ok = caCertPool.AppendCertsFromPEM(certBytes)
+-		if ok {
+-			tr.TLSClientConfig.RootCAs = caCertPool
+-		}
+-		tr.TLSClientConfig.InsecureSkipVerify = false
+-	} else {
+-		ok = tr.TLSClientConfig.RootCAs.AppendCertsFromPEM(certBytes)
+-	}
+-
+-	if !ok {
+-		err = errors.New("Unable to load caCert")
+-	}
+-
+-	c.config.CaCertFile = append(c.config.CaCertFile, caCert)
+-	c.saveConfig()
+-
+-	return err
+-}
+-
+-// SetCluster updates cluster information using the given machine list.
+-func (c *Client) SetCluster(machines []string) bool {
+-	success := c.internalSyncCluster(machines)
+-	return success
+-}
+-
+-func (c *Client) GetCluster() []string {
+-	return c.cluster.Machines
+-}
+-
+-// SyncCluster updates the cluster information using the internal machine list.
+-func (c *Client) SyncCluster() bool {
+-	return c.internalSyncCluster(c.cluster.Machines)
+-}
+-
+-// internalSyncCluster syncs cluster information using the given machine list.
+-func (c *Client) internalSyncCluster(machines []string) bool {
+-	for _, machine := range machines {
+-		httpPath := c.createHttpPath(machine, path.Join(version, "machines"))
+-		resp, err := c.httpClient.Get(httpPath)
+-		if err != nil {
+-			// try another machine in the cluster
+-			continue
+-		} else {
+-			b, err := ioutil.ReadAll(resp.Body)
+-			resp.Body.Close()
+-			if err != nil {
+-				// try another machine in the cluster
+-				continue
+-			}
+-
+-			// update Machines List
+-			c.cluster.updateFromStr(string(b))
+-
+-			// update leader
+-			// the first one in the machine list is the leader
+-			c.cluster.switchLeader(0)
+-
+-			logger.Debug("sync.machines ", c.cluster.Machines)
+-			c.saveConfig()
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-// createHttpPath creates a complete HTTP URL.
+-// serverName should contain both the host name and a port number, if any.
+-func (c *Client) createHttpPath(serverName string, _path string) string {
+-	u, err := url.Parse(serverName)
+-	if err != nil {
+-		panic(err)
+-	}
+-
+-	u.Path = path.Join(u.Path, _path)
+-
+-	if u.Scheme == "" {
+-		u.Scheme = "http"
+-	}
+-	return u.String()
+-}
+-
+-// Dial with timeout.
+-func dialTimeout(network, addr string) (net.Conn, error) {
+-	return net.DialTimeout(network, addr, time.Second)
+-}
+-
+-func (c *Client) OpenCURL() {
+-	c.cURLch = make(chan string, defaultBufferSize)
+-}
+-
+-func (c *Client) CloseCURL() {
+-	c.cURLch = nil
+-}
+-
+-func (c *Client) sendCURL(command string) {
+-	go func() {
+-		select {
+-		case c.cURLch <- command:
+-		default:
+-		}
+-	}()
+-}
+-
+-func (c *Client) RecvCURL() string {
+-	return <-c.cURLch
+-}
+-
+-// saveConfig saves the current config using c.persistence.
+-func (c *Client) saveConfig() error {
+-	if c.persistence != nil {
+-		b, err := json.Marshal(c)
+-		if err != nil {
+-			return err
+-		}
+-
+-		_, err = c.persistence.Write(b)
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-// MarshalJSON implements the Marshaller interface
+-// as defined by the standard JSON package.
+-func (c *Client) MarshalJSON() ([]byte, error) {
+-	b, err := json.Marshal(struct {
+-		Config  Config   `json:"config"`
+-		Cluster *Cluster `json:"cluster"`
+-	}{
+-		Config:  c.config,
+-		Cluster: c.cluster,
+-	})
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return b, nil
+-}
+-
+-// UnmarshalJSON implements the Unmarshaller interface
+-// as defined by the standard JSON package.
+-func (c *Client) UnmarshalJSON(b []byte) error {
+-	temp := struct {
+-		Config  Config   `json: "config"`
+-		Cluster *Cluster `json: "cluster"`
+-	}{}
+-	err := json.Unmarshal(b, &temp)
+-	if err != nil {
+-		return err
+-	}
+-
+-	c.cluster = temp.Cluster
+-	c.config = temp.Config
+-	return nil
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/client_test.go b/third_party/github.com/coreos/go-etcd/etcd/client_test.go
+deleted file mode 100644
+index c245e47..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/client_test.go
++++ /dev/null
+@@ -1,96 +0,0 @@
+-package etcd
+-
+-import (
+-	"encoding/json"
+-	"fmt"
+-	"net"
+-	"net/url"
+-	"os"
+-	"testing"
+-)
+-
+-// To pass this test, we need to create a cluster of 3 machines
+-// The server should be listening on 127.0.0.1:4001, 4002, 4003
+-func TestSync(t *testing.T) {
+-	fmt.Println("Make sure there are three nodes at 0.0.0.0:4001-4003")
+-
+-	// Explicit trailing slash to ensure this doesn't reproduce:
+-	// https://github.com/coreos/go-etcd/issues/82
+-	c := NewClient([]string{"http://127.0.0.1:4001/"})
+-
+-	success := c.SyncCluster()
+-	if !success {
+-		t.Fatal("cannot sync machines")
+-	}
+-
+-	for _, m := range c.GetCluster() {
+-		u, err := url.Parse(m)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		if u.Scheme != "http" {
+-			t.Fatal("scheme must be http")
+-		}
+-
+-		host, _, err := net.SplitHostPort(u.Host)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		if host != "127.0.0.1" {
+-			t.Fatal("Host must be 127.0.0.1")
+-		}
+-	}
+-
+-	badMachines := []string{"abc", "edef"}
+-
+-	success = c.SetCluster(badMachines)
+-
+-	if success {
+-		t.Fatal("should not sync on bad machines")
+-	}
+-
+-	goodMachines := []string{"127.0.0.1:4002"}
+-
+-	success = c.SetCluster(goodMachines)
+-
+-	if !success {
+-		t.Fatal("cannot sync machines")
+-	} else {
+-		fmt.Println(c.cluster.Machines)
+-	}
+-
+-}
+-
+-func TestPersistence(t *testing.T) {
+-	c := NewClient(nil)
+-	c.SyncCluster()
+-
+-	fo, err := os.Create("config.json")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer func() {
+-		if err := fo.Close(); err != nil {
+-			panic(err)
+-		}
+-	}()
+-
+-	c.SetPersistence(fo)
+-	err = c.saveConfig()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	c2, err := NewClientFromFile("config.json")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// Verify that the two clients have the same config
+-	b1, _ := json.Marshal(c)
+-	b2, _ := json.Marshal(c2)
+-
+-	if string(b1) != string(b2) {
+-		t.Fatalf("The two configs should be equal!")
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/cluster.go b/third_party/github.com/coreos/go-etcd/etcd/cluster.go
+deleted file mode 100644
+index aaa2054..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/cluster.go
++++ /dev/null
+@@ -1,51 +0,0 @@
+-package etcd
+-
+-import (
+-	"net/url"
+-	"strings"
+-)
+-
+-type Cluster struct {
+-	Leader   string   `json:"leader"`
+-	Machines []string `json:"machines"`
+-}
+-
+-func NewCluster(machines []string) *Cluster {
+-	// if an empty slice was sent in then just assume HTTP 4001 on localhost
+-	if len(machines) == 0 {
+-		machines = []string{"http://127.0.0.1:4001"}
+-	}
+-
+-	// default leader and machines
+-	return &Cluster{
+-		Leader:   machines[0],
+-		Machines: machines,
+-	}
+-}
+-
+-// switchLeader switch the current leader to machines[num]
+-func (cl *Cluster) switchLeader(num int) {
+-	logger.Debugf("switch.leader[from %v to %v]",
+-		cl.Leader, cl.Machines[num])
+-
+-	cl.Leader = cl.Machines[num]
+-}
+-
+-func (cl *Cluster) updateFromStr(machines string) {
+-	cl.Machines = strings.Split(machines, ", ")
+-}
+-
+-func (cl *Cluster) updateLeader(leader string) {
+-	logger.Debugf("update.leader[%s,%s]", cl.Leader, leader)
+-	cl.Leader = leader
+-}
+-
+-func (cl *Cluster) updateLeaderFromURL(u *url.URL) {
+-	var leader string
+-	if u.Scheme == "" {
+-		leader = "http://" + u.Host
+-	} else {
+-		leader = u.Scheme + "://" + u.Host
+-	}
+-	cl.updateLeader(leader)
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete.go
+deleted file mode 100644
+index 924778d..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete.go
++++ /dev/null
+@@ -1,34 +0,0 @@
+-package etcd
+-
+-import "fmt"
+-
+-func (c *Client) CompareAndDelete(key string, prevValue string, prevIndex uint64) (*Response, error) {
+-	raw, err := c.RawCompareAndDelete(key, prevValue, prevIndex)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-func (c *Client) RawCompareAndDelete(key string, prevValue string, prevIndex uint64) (*RawResponse, error) {
+-	if prevValue == "" && prevIndex == 0 {
+-		return nil, fmt.Errorf("You must give either prevValue or prevIndex.")
+-	}
+-
+-	options := options{}
+-	if prevValue != "" {
+-		options["prevValue"] = prevValue
+-	}
+-	if prevIndex != 0 {
+-		options["prevIndex"] = prevIndex
+-	}
+-
+-	raw, err := c.delete(key, options)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw, err
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete_test.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete_test.go
+deleted file mode 100644
+index 223e50f..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete_test.go
++++ /dev/null
+@@ -1,46 +0,0 @@
+-package etcd
+-
+-import (
+-	"testing"
+-)
+-
+-func TestCompareAndDelete(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-	}()
+-
+-	c.Set("foo", "bar", 5)
+-
+-	// This should succeed an correct prevValue
+-	resp, err := c.CompareAndDelete("foo", "bar", 0)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.PrevNode.Value == "bar" && resp.PrevNode.Key == "/foo" && resp.PrevNode.TTL == 5) {
+-		t.Fatalf("CompareAndDelete 1 prevNode failed: %#v", resp)
+-	}
+-
+-	resp, _ = c.Set("foo", "bar", 5)
+-	// This should fail because it gives an incorrect prevValue
+-	_, err = c.CompareAndDelete("foo", "xxx", 0)
+-	if err == nil {
+-		t.Fatalf("CompareAndDelete 2 should have failed.  The response is: %#v", resp)
+-	}
+-
+-	// This should succeed because it gives an correct prevIndex
+-	resp, err = c.CompareAndDelete("foo", "", resp.Node.ModifiedIndex)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.PrevNode.Value == "bar" && resp.PrevNode.Key == "/foo" && resp.PrevNode.TTL == 5) {
+-		t.Fatalf("CompareAndSwap 3 prevNode failed: %#v", resp)
+-	}
+-
+-	c.Set("foo", "bar", 5)
+-	// This should fail because it gives an incorrect prevIndex
+-	resp, err = c.CompareAndDelete("foo", "", 29817514)
+-	if err == nil {
+-		t.Fatalf("CompareAndDelete 4 should have failed.  The response is: %#v", resp)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go
+deleted file mode 100644
+index 0beaee5..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package etcd
+-
+-import "fmt"
+-
+-func (c *Client) CompareAndSwap(key string, value string, ttl uint64,
+-	prevValue string, prevIndex uint64) (*Response, error) {
+-	raw, err := c.RawCompareAndSwap(key, value, ttl, prevValue, prevIndex)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-func (c *Client) RawCompareAndSwap(key string, value string, ttl uint64,
+-	prevValue string, prevIndex uint64) (*RawResponse, error) {
+-	if prevValue == "" && prevIndex == 0 {
+-		return nil, fmt.Errorf("You must give either prevValue or prevIndex.")
+-	}
+-
+-	options := options{}
+-	if prevValue != "" {
+-		options["prevValue"] = prevValue
+-	}
+-	if prevIndex != 0 {
+-		options["prevIndex"] = prevIndex
+-	}
+-
+-	raw, err := c.put(key, value, ttl, options)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw, err
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap_test.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap_test.go
+deleted file mode 100644
+index 14a1b00..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap_test.go
++++ /dev/null
+@@ -1,57 +0,0 @@
+-package etcd
+-
+-import (
+-	"testing"
+-)
+-
+-func TestCompareAndSwap(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-	}()
+-
+-	c.Set("foo", "bar", 5)
+-
+-	// This should succeed
+-	resp, err := c.CompareAndSwap("foo", "bar2", 5, "bar", 0)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Value == "bar2" && resp.Node.Key == "/foo" && resp.Node.TTL == 5) {
+-		t.Fatalf("CompareAndSwap 1 failed: %#v", resp)
+-	}
+-
+-	if !(resp.PrevNode.Value == "bar" && resp.PrevNode.Key == "/foo" && resp.PrevNode.TTL == 5) {
+-		t.Fatalf("CompareAndSwap 1 prevNode failed: %#v", resp)
+-	}
+-
+-	// This should fail because it gives an incorrect prevValue
+-	resp, err = c.CompareAndSwap("foo", "bar3", 5, "xxx", 0)
+-	if err == nil {
+-		t.Fatalf("CompareAndSwap 2 should have failed.  The response is: %#v", resp)
+-	}
+-
+-	resp, err = c.Set("foo", "bar", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// This should succeed
+-	resp, err = c.CompareAndSwap("foo", "bar2", 5, "", resp.Node.ModifiedIndex)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Value == "bar2" && resp.Node.Key == "/foo" && resp.Node.TTL == 5) {
+-		t.Fatalf("CompareAndSwap 3 failed: %#v", resp)
+-	}
+-
+-	if !(resp.PrevNode.Value == "bar" && resp.PrevNode.Key == "/foo" && resp.PrevNode.TTL == 5) {
+-		t.Fatalf("CompareAndSwap 3 prevNode failed: %#v", resp)
+-	}
+-
+-	// This should fail because it gives an incorrect prevIndex
+-	resp, err = c.CompareAndSwap("foo", "bar3", 5, "", 29817514)
+-	if err == nil {
+-		t.Fatalf("CompareAndSwap 4 should have failed.  The response is: %#v", resp)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/config.json b/third_party/github.com/coreos/go-etcd/etcd/config.json
+deleted file mode 100644
+index bfb85cc..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/config.json
++++ /dev/null
+@@ -1 +0,0 @@
+-{"config":{"certFile":"","keyFile":"","caCertFiles":null,"timeout":1000000000,"Consistency":"STRONG"},"cluster":{"leader":"http://127.0.0.1:4001","machines":["http://127.0.0.1:4001"]}}
+\ No newline at end of file
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/debug.go b/third_party/github.com/coreos/go-etcd/etcd/debug.go
+deleted file mode 100644
+index fce23f0..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/debug.go
++++ /dev/null
+@@ -1,53 +0,0 @@
+-package etcd
+-
+-import (
+-	"io/ioutil"
+-	"log"
+-	"strings"
+-)
+-
+-type Logger interface {
+-	Debug(args ...interface{})
+-	Debugf(fmt string, args ...interface{})
+-	Warning(args ...interface{})
+-	Warningf(fmt string, args ...interface{})
+-}
+-
+-var logger Logger
+-
+-func SetLogger(log Logger) {
+-	logger = log
+-}
+-
+-func GetLogger() Logger {
+-	return logger
+-}
+-
+-type defaultLogger struct {
+-	log *log.Logger
+-}
+-
+-func (p *defaultLogger) Debug(args ...interface{}) {
+-	p.log.Println(args)
+-}
+-
+-func (p *defaultLogger) Debugf(fmt string, args ...interface{}) {
+-	// Append newline if necessary
+-	if !strings.HasSuffix(fmt, "\n") {
+-		fmt = fmt + "\n"
+-	}
+-	p.log.Printf(fmt, args)
+-}
+-
+-func (p *defaultLogger) Warning(args ...interface{}) {
+-	p.Debug(args)
+-}
+-
+-func (p *defaultLogger) Warningf(fmt string, args ...interface{}) {
+-	p.Debugf(fmt, args)
+-}
+-
+-func init() {
+-	// Default logger uses the go default log.
+-	SetLogger(&defaultLogger{log.New(ioutil.Discard, "go-etcd", log.LstdFlags)})
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/delete.go b/third_party/github.com/coreos/go-etcd/etcd/delete.go
+deleted file mode 100644
+index 6c60e4d..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/delete.go
++++ /dev/null
+@@ -1,40 +0,0 @@
+-package etcd
+-
+-// Delete deletes the given key.
+-//
+-// When recursive set to false, if the key points to a
+-// directory the method will fail.
+-//
+-// When recursive set to true, if the key points to a file,
+-// the file will be deleted; if the key points to a directory,
+-// then everything under the directory (including all child directories)
+-// will be deleted.
+-func (c *Client) Delete(key string, recursive bool) (*Response, error) {
+-	raw, err := c.RawDelete(key, recursive, false)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// DeleteDir deletes an empty directory or a key value pair
+-func (c *Client) DeleteDir(key string) (*Response, error) {
+-	raw, err := c.RawDelete(key, false, true)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-func (c *Client) RawDelete(key string, recursive bool, dir bool) (*RawResponse, error) {
+-	ops := options{
+-		"recursive": recursive,
+-		"dir":       dir,
+-	}
+-
+-	return c.delete(key, ops)
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/delete_test.go b/third_party/github.com/coreos/go-etcd/etcd/delete_test.go
+deleted file mode 100644
+index 5904971..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/delete_test.go
++++ /dev/null
+@@ -1,81 +0,0 @@
+-package etcd
+-
+-import (
+-	"testing"
+-)
+-
+-func TestDelete(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-	}()
+-
+-	c.Set("foo", "bar", 5)
+-	resp, err := c.Delete("foo", false)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Node.Value == "") {
+-		t.Fatalf("Delete failed with %s", resp.Node.Value)
+-	}
+-
+-	if !(resp.PrevNode.Value == "bar") {
+-		t.Fatalf("Delete PrevNode failed with %s", resp.Node.Value)
+-	}
+-
+-	resp, err = c.Delete("foo", false)
+-	if err == nil {
+-		t.Fatalf("Delete should have failed because the key foo did not exist.  "+
+-			"The response was: %v", resp)
+-	}
+-}
+-
+-func TestDeleteAll(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-		c.Delete("fooDir", true)
+-	}()
+-
+-	c.SetDir("foo", 5)
+-	// test delete an empty dir
+-	resp, err := c.DeleteDir("foo")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Node.Value == "") {
+-		t.Fatalf("DeleteAll 1 failed: %#v", resp)
+-	}
+-
+-	if !(resp.PrevNode.Dir == true && resp.PrevNode.Value == "") {
+-		t.Fatalf("DeleteAll 1 PrevNode failed: %#v", resp)
+-	}
+-
+-	c.CreateDir("fooDir", 5)
+-	c.Set("fooDir/foo", "bar", 5)
+-	_, err = c.DeleteDir("fooDir")
+-	if err == nil {
+-		t.Fatal("should not able to delete a non-empty dir with deletedir")
+-	}
+-
+-	resp, err = c.Delete("fooDir", true)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Node.Value == "") {
+-		t.Fatalf("DeleteAll 2 failed: %#v", resp)
+-	}
+-
+-	if !(resp.PrevNode.Dir == true && resp.PrevNode.Value == "") {
+-		t.Fatalf("DeleteAll 2 PrevNode failed: %#v", resp)
+-	}
+-
+-	resp, err = c.Delete("foo", true)
+-	if err == nil {
+-		t.Fatalf("DeleteAll should have failed because the key foo did not exist.  "+
+-			"The response was: %v", resp)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/error.go b/third_party/github.com/coreos/go-etcd/etcd/error.go
+deleted file mode 100644
+index 7e69287..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/error.go
++++ /dev/null
+@@ -1,48 +0,0 @@
+-package etcd
+-
+-import (
+-	"encoding/json"
+-	"fmt"
+-)
+-
+-const (
+-	ErrCodeEtcdNotReachable = 501
+-)
+-
+-var (
+-	errorMap = map[int]string{
+-		ErrCodeEtcdNotReachable: "All the given peers are not reachable",
+-	}
+-)
+-
+-type EtcdError struct {
+-	ErrorCode int    `json:"errorCode"`
+-	Message   string `json:"message"`
+-	Cause     string `json:"cause,omitempty"`
+-	Index     uint64 `json:"index"`
+-}
+-
+-func (e EtcdError) Error() string {
+-	return fmt.Sprintf("%v: %v (%v) [%v]", e.ErrorCode, e.Message, e.Cause, e.Index)
+-}
+-
+-func newError(errorCode int, cause string, index uint64) *EtcdError {
+-	return &EtcdError{
+-		ErrorCode: errorCode,
+-		Message:   errorMap[errorCode],
+-		Cause:     cause,
+-		Index:     index,
+-	}
+-}
+-
+-func handleError(b []byte) error {
+-	etcdErr := new(EtcdError)
+-
+-	err := json.Unmarshal(b, etcdErr)
+-	if err != nil {
+-		logger.Warningf("cannot unmarshal etcd error: %v", err)
+-		return err
+-	}
+-
+-	return etcdErr
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/get.go b/third_party/github.com/coreos/go-etcd/etcd/get.go
+deleted file mode 100644
+index 7988f1a..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/get.go
++++ /dev/null
+@@ -1,27 +0,0 @@
+-package etcd
+-
+-// Get gets the file or directory associated with the given key.
+-// If the key points to a directory, files and directories under
+-// it will be returned in sorted or unsorted order, depending on
+-// the sort flag.
+-// If recursive is set to false, contents under child directories
+-// will not be returned.
+-// If recursive is set to true, all the contents will be returned.
+-func (c *Client) Get(key string, sort, recursive bool) (*Response, error) {
+-	raw, err := c.RawGet(key, sort, recursive)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-func (c *Client) RawGet(key string, sort, recursive bool) (*RawResponse, error) {
+-	ops := options{
+-		"recursive": recursive,
+-		"sorted":    sort,
+-	}
+-
+-	return c.get(key, ops)
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/get_test.go b/third_party/github.com/coreos/go-etcd/etcd/get_test.go
+deleted file mode 100644
+index eccae18..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/get_test.go
++++ /dev/null
+@@ -1,131 +0,0 @@
+-package etcd
+-
+-import (
+-	"reflect"
+-	"testing"
+-)
+-
+-// cleanNode scrubs Expiration, ModifiedIndex and CreatedIndex of a node.
+-func cleanNode(n *Node) {
+-	n.Expiration = nil
+-	n.ModifiedIndex = 0
+-	n.CreatedIndex = 0
+-}
+-
+-// cleanResult scrubs a result object two levels deep of Expiration,
+-// ModifiedIndex and CreatedIndex.
+-func cleanResult(result *Response) {
+-	//  TODO(philips): make this recursive.
+-	cleanNode(result.Node)
+-	for i, _ := range result.Node.Nodes {
+-		cleanNode(&result.Node.Nodes[i])
+-		for j, _ := range result.Node.Nodes[i].Nodes {
+-			cleanNode(&result.Node.Nodes[i].Nodes[j])
+-		}
+-	}
+-}
+-
+-func TestGet(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-	}()
+-
+-	c.Set("foo", "bar", 5)
+-
+-	result, err := c.Get("foo", false, false)
+-
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if result.Node.Key != "/foo" || result.Node.Value != "bar" {
+-		t.Fatalf("Get failed with %s %s %v", result.Node.Key, result.Node.Value, result.Node.TTL)
+-	}
+-
+-	result, err = c.Get("goo", false, false)
+-	if err == nil {
+-		t.Fatalf("should not be able to get non-exist key")
+-	}
+-}
+-
+-func TestGetAll(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("fooDir", true)
+-	}()
+-
+-	c.CreateDir("fooDir", 5)
+-	c.Set("fooDir/k0", "v0", 5)
+-	c.Set("fooDir/k1", "v1", 5)
+-
+-	// Return kv-pairs in sorted order
+-	result, err := c.Get("fooDir", true, false)
+-
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	expected := Nodes{
+-		Node{
+-			Key:   "/fooDir/k0",
+-			Value: "v0",
+-			TTL:   5,
+-		},
+-		Node{
+-			Key:   "/fooDir/k1",
+-			Value: "v1",
+-			TTL:   5,
+-		},
+-	}
+-
+-	cleanResult(result)
+-
+-	if !reflect.DeepEqual(result.Node.Nodes, expected) {
+-		t.Fatalf("(actual) %v != (expected) %v", result.Node.Nodes, expected)
+-	}
+-
+-	// Test the `recursive` option
+-	c.CreateDir("fooDir/childDir", 5)
+-	c.Set("fooDir/childDir/k2", "v2", 5)
+-
+-	// Return kv-pairs in sorted order
+-	result, err = c.Get("fooDir", true, true)
+-
+-	cleanResult(result)
+-
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	expected = Nodes{
+-		Node{
+-			Key: "/fooDir/childDir",
+-			Dir: true,
+-			Nodes: Nodes{
+-				Node{
+-					Key:   "/fooDir/childDir/k2",
+-					Value: "v2",
+-					TTL:   5,
+-				},
+-			},
+-			TTL: 5,
+-		},
+-		Node{
+-			Key:   "/fooDir/k0",
+-			Value: "v0",
+-			TTL:   5,
+-		},
+-		Node{
+-			Key:   "/fooDir/k1",
+-			Value: "v1",
+-			TTL:   5,
+-		},
+-	}
+-
+-	cleanResult(result)
+-
+-	if !reflect.DeepEqual(result.Node.Nodes, expected) {
+-		t.Fatalf("(actual) %v != (expected) %v", result.Node.Nodes, expected)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/options.go b/third_party/github.com/coreos/go-etcd/etcd/options.go
+deleted file mode 100644
+index 335a0c2..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/options.go
++++ /dev/null
+@@ -1,72 +0,0 @@
+-package etcd
+-
+-import (
+-	"fmt"
+-	"net/url"
+-	"reflect"
+-)
+-
+-type options map[string]interface{}
+-
+-// An internally-used data structure that represents a mapping
+-// between valid options and their kinds
+-type validOptions map[string]reflect.Kind
+-
+-// Valid options for GET, PUT, POST, DELETE
+-// Using CAPITALIZED_UNDERSCORE to emphasize that these
+-// values are meant to be used as constants.
+-var (
+-	VALID_GET_OPTIONS = validOptions{
+-		"recursive":  reflect.Bool,
+-		"consistent": reflect.Bool,
+-		"sorted":     reflect.Bool,
+-		"wait":       reflect.Bool,
+-		"waitIndex":  reflect.Uint64,
+-	}
+-
+-	VALID_PUT_OPTIONS = validOptions{
+-		"prevValue": reflect.String,
+-		"prevIndex": reflect.Uint64,
+-		"prevExist": reflect.Bool,
+-		"dir":       reflect.Bool,
+-	}
+-
+-	VALID_POST_OPTIONS = validOptions{}
+-
+-	VALID_DELETE_OPTIONS = validOptions{
+-		"recursive": reflect.Bool,
+-		"dir":       reflect.Bool,
+-		"prevValue": reflect.String,
+-		"prevIndex": reflect.Uint64,
+-	}
+-)
+-
+-// Convert options to a string of HTML parameters
+-func (ops options) toParameters(validOps validOptions) (string, error) {
+-	p := "?"
+-	values := url.Values{}
+-
+-	if ops == nil {
+-		return "", nil
+-	}
+-
+-	for k, v := range ops {
+-		// Check if the given option is valid (that it exists)
+-		kind := validOps[k]
+-		if kind == reflect.Invalid {
+-			return "", fmt.Errorf("Invalid option: %v", k)
+-		}
+-
+-		// Check if the given option is of the valid type
+-		t := reflect.TypeOf(v)
+-		if kind != t.Kind() {
+-			return "", fmt.Errorf("Option %s should be of %v kind, not of %v kind.",
+-				k, kind, t.Kind())
+-		}
+-
+-		values.Set(k, fmt.Sprintf("%v", v))
+-	}
+-
+-	p += values.Encode()
+-	return p, nil
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/requests.go b/third_party/github.com/coreos/go-etcd/etcd/requests.go
+deleted file mode 100644
+index c16f7d4..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/requests.go
++++ /dev/null
+@@ -1,249 +0,0 @@
+-package etcd
+-
+-import (
+-	"fmt"
+-	"io/ioutil"
+-	"math/rand"
+-	"net/http"
+-	"net/url"
+-	"path"
+-	"strings"
+-	"time"
+-)
+-
+-// get issues a GET request
+-func (c *Client) get(key string, options options) (*RawResponse, error) {
+-	// If consistency level is set to STRONG, append
+-	// the `consistent` query string.
+-	if c.config.Consistency == STRONG_CONSISTENCY {
+-		options["consistent"] = true
+-	}
+-
+-	str, err := options.toParameters(VALID_GET_OPTIONS)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	resp, err := c.sendKeyRequest("GET", key, str, nil)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return resp, nil
+-}
+-
+-// put issues a PUT request
+-func (c *Client) put(key string, value string, ttl uint64,
+-	options options) (*RawResponse, error) {
+-
+-	str, err := options.toParameters(VALID_PUT_OPTIONS)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	resp, err := c.sendKeyRequest("PUT", key, str, buildValues(value, ttl))
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return resp, nil
+-}
+-
+-// post issues a POST request
+-func (c *Client) post(key string, value string, ttl uint64) (*RawResponse, error) {
+-	resp, err := c.sendKeyRequest("POST", key, "", buildValues(value, ttl))
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return resp, nil
+-}
+-
+-// delete issues a DELETE request
+-func (c *Client) delete(key string, options options) (*RawResponse, error) {
+-	str, err := options.toParameters(VALID_DELETE_OPTIONS)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	resp, err := c.sendKeyRequest("DELETE", key, str, nil)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return resp, nil
+-}
+-
+-// sendKeyRequest sends a HTTP request and returns a Response as defined by etcd
+-func (c *Client) sendKeyRequest(method string, key string, params string,
+-	values url.Values) (*RawResponse, error) {
+-
+-	var req *http.Request
+-	var resp *http.Response
+-	var httpPath string
+-	var err error
+-	var b []byte
+-
+-	trial := 0
+-
+-	logger.Debugf("%s %s %s [%s]", method, key, params, c.cluster.Leader)
+-
+-	// Build the request path if no prefix exists
+-	relativePath := path.Join(c.keyPrefix, key) + params
+-
+-	// if we connect to a follower, we will retry until we found a leader
+-	for {
+-		trial++
+-		logger.Debug("begin trail ", trial)
+-		if trial > 2*len(c.cluster.Machines) {
+-			return nil, newError(ErrCodeEtcdNotReachable,
+-				"Tried to connect to each peer twice and failed", 0)
+-		}
+-
+-		if method == "GET" && c.config.Consistency == WEAK_CONSISTENCY {
+-			// If it's a GET and consistency level is set to WEAK,
+-			// then use a random machine.
+-			httpPath = c.getHttpPath(true, relativePath)
+-		} else {
+-			// Else use the leader.
+-			httpPath = c.getHttpPath(false, relativePath)
+-		}
+-
+-		// Return a cURL command if curlChan is set
+-		if c.cURLch != nil {
+-			command := fmt.Sprintf("curl -X %s %s", method, httpPath)
+-			for key, value := range values {
+-				command += fmt.Sprintf(" -d %s=%s", key, value[0])
+-			}
+-			c.sendCURL(command)
+-		}
+-
+-		logger.Debug("send.request.to ", httpPath, " | method ", method)
+-
+-		if values == nil {
+-			req, _ = http.NewRequest(method, httpPath, nil)
+-		} else {
+-			req, _ = http.NewRequest(method, httpPath,
+-				strings.NewReader(values.Encode()))
+-
+-			req.Header.Set("Content-Type",
+-				"application/x-www-form-urlencoded; param=value")
+-		}
+-
+-		// network error, change a machine!
+-		if resp, err = c.httpClient.Do(req); err != nil {
+-			logger.Debug("network error: ", err.Error())
+-			c.cluster.switchLeader(trial % len(c.cluster.Machines))
+-			time.Sleep(time.Millisecond * 200)
+-			continue
+-		}
+-
+-		if resp != nil {
+-			logger.Debug("recv.response.from ", httpPath)
+-
+-			var ok bool
+-			ok, b = c.handleResp(resp)
+-
+-			if !ok {
+-				continue
+-			}
+-
+-			logger.Debug("recv.success.", httpPath)
+-			break
+-		}
+-
+-		// should not reach here
+-		// err and resp should not be nil at the same time
+-		logger.Debug("error.from ", httpPath)
+-		return nil, err
+-	}
+-
+-	r := &RawResponse{
+-		StatusCode: resp.StatusCode,
+-		Body:       b,
+-		Header:     resp.Header,
+-	}
+-
+-	return r, nil
+-}
+-
+-// handleResp handles the responses from the etcd server
+-// If status code is OK, read the http body and return it as byte array
+-// If status code is TemporaryRedirect, update leader.
+-// If status code is InternalServerError, sleep for 200ms.
+-func (c *Client) handleResp(resp *http.Response) (bool, []byte) {
+-	defer resp.Body.Close()
+-
+-	code := resp.StatusCode
+-
+-	if code == http.StatusTemporaryRedirect {
+-		u, err := resp.Location()
+-
+-		if err != nil {
+-			logger.Warning(err)
+-		} else {
+-			c.cluster.updateLeaderFromURL(u)
+-		}
+-
+-		return false, nil
+-
+-	} else if code == http.StatusInternalServerError {
+-		time.Sleep(time.Millisecond * 200)
+-
+-	} else if validHttpStatusCode[code] {
+-		b, err := ioutil.ReadAll(resp.Body)
+-
+-		if err != nil {
+-			return false, nil
+-		}
+-
+-		return true, b
+-	}
+-
+-	logger.Warning("bad status code ", resp.StatusCode)
+-	return false, nil
+-}
+-
+-func (c *Client) getHttpPath(random bool, s ...string) string {
+-	var machine string
+-
+-	if random {
+-		machine = c.cluster.Machines[rand.Intn(len(c.cluster.Machines))]
+-	} else {
+-		machine = c.cluster.Leader
+-	}
+-
+-	return machine + "/" + strings.Join(s, "/")
+-}
+-
+-// buildValues builds a url.Values map according to the given value and ttl
+-func buildValues(value string, ttl uint64) url.Values {
+-	v := url.Values{}
+-
+-	if value != "" {
+-		v.Set("value", value)
+-	}
+-
+-	if ttl > 0 {
+-		v.Set("ttl", fmt.Sprintf("%v", ttl))
+-	}
+-
+-	return v
+-}
+-
+-// convert key string to http path exclude version
+-// for example: key[foo] -> path[foo]
+-// key[] -> path[/]
+-func keyToPath(key string) string {
+-	clean := path.Clean(key)
+-
+-	if clean == "" || clean == "." {
+-		return "/"
+-	}
+-
+-	return clean
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/requests_test.go b/third_party/github.com/coreos/go-etcd/etcd/requests_test.go
+deleted file mode 100644
+index a7160c1..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/requests_test.go
++++ /dev/null
+@@ -1,50 +0,0 @@
+-package etcd
+-
+-import (
+-	"path"
+-	"testing"
+-)
+-
+-func testKey(t *testing.T, in, exp string) {
+-	if keyToPath(in) != exp {
+-		t.Errorf("Expected %s got %s", exp, keyToPath(in))
+-	}
+-}
+-
+-// TestKeyToPath ensures the key cleaning funciton keyToPath works in a number
+-// of cases.
+-func TestKeyToPath(t *testing.T) {
+-	testKey(t, "", "/")
+-	testKey(t, "/", "/")
+-	testKey(t, "///", "/")
+-	testKey(t, "hello/world/", "hello/world")
+-	testKey(t, "///hello////world/../", "/hello")
+-}
+-
+-func testPath(t *testing.T, c *Client, in, exp string) {
+-	out := c.getHttpPath(false, in)
+-
+-	if out != exp {
+-		t.Errorf("Expected %s got %s", exp, out)
+-	}
+-}
+-
+-// TestHttpPath ensures that the URLs generated make sense for the given keys
+-func TestHttpPath(t *testing.T) {
+-	c := NewClient(nil)
+-
+-	testPath(t, c,
+-		path.Join(c.keyPrefix, "hello") + "?prevInit=true",
+-		"http://127.0.0.1:4001/v2/keys/hello?prevInit=true")
+-
+-	testPath(t, c,
+-		path.Join(c.keyPrefix, "///hello///world") + "?prevInit=true",
+-		"http://127.0.0.1:4001/v2/keys/hello/world?prevInit=true")
+-
+-	c = NewClient([]string{"https://discovery.etcd.io"})
+-	c.SetKeyPrefix("")
+-
+-	testPath(t, c,
+-		path.Join(c.keyPrefix, "hello") + "?prevInit=true",
+-		"https://discovery.etcd.io/hello?prevInit=true")
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/response.go b/third_party/github.com/coreos/go-etcd/etcd/response.go
+deleted file mode 100644
+index a72c2d8..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/response.go
++++ /dev/null
+@@ -1,88 +0,0 @@
+-package etcd
+-
+-import (
+-	"encoding/json"
+-	"net/http"
+-	"strconv"
+-	"time"
+-)
+-
+-const (
+-	rawResponse = iota
+-	normalResponse
+-)
+-
+-type responseType int
+-
+-type RawResponse struct {
+-	StatusCode int
+-	Body       []byte
+-	Header     http.Header
+-}
+-
+-var (
+-	validHttpStatusCode = map[int]bool{
+-		http.StatusCreated:            true,
+-		http.StatusOK:                 true,
+-		http.StatusBadRequest:         true,
+-		http.StatusNotFound:           true,
+-		http.StatusPreconditionFailed: true,
+-		http.StatusForbidden:          true,
+-	}
+-)
+-
+-func (rr *RawResponse) toResponse() (*Response, error) {
+-	if rr.StatusCode != http.StatusOK && rr.StatusCode != http.StatusCreated {
+-		return nil, handleError(rr.Body)
+-	}
+-
+-	resp := new(Response)
+-
+-	err := json.Unmarshal(rr.Body, resp)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// attach index and term to response
+-	resp.EtcdIndex, _ = strconv.ParseUint(rr.Header.Get("X-Etcd-Index"), 10, 64)
+-	resp.RaftIndex, _ = strconv.ParseUint(rr.Header.Get("X-Raft-Index"), 10, 64)
+-	resp.RaftTerm, _ = strconv.ParseUint(rr.Header.Get("X-Raft-Term"), 10, 64)
+-
+-	return resp, nil
+-}
+-
+-type Response struct {
+-	Action    string `json:"action"`
+-	Node      *Node  `json:"node"`
+-	PrevNode  *Node  `json:"prevNode,omitempty"`
+-	EtcdIndex uint64 `json:"etcdIndex"`
+-	RaftIndex uint64 `json:"raftIndex"`
+-	RaftTerm  uint64 `json:"raftTerm"`
+-}
+-
+-type Node struct {
+-	Key           string     `json:"key, omitempty"`
+-	Value         string     `json:"value,omitempty"`
+-	Dir           bool       `json:"dir,omitempty"`
+-	Expiration    *time.Time `json:"expiration,omitempty"`
+-	TTL           int64      `json:"ttl,omitempty"`
+-	Nodes         Nodes      `json:"nodes,omitempty"`
+-	ModifiedIndex uint64     `json:"modifiedIndex,omitempty"`
+-	CreatedIndex  uint64     `json:"createdIndex,omitempty"`
+-}
+-
+-type Nodes []Node
+-
+-// interfaces for sorting
+-func (ns Nodes) Len() int {
+-	return len(ns)
+-}
+-
+-func (ns Nodes) Less(i, j int) bool {
+-	return ns[i].Key < ns[j].Key
+-}
+-
+-func (ns Nodes) Swap(i, j int) {
+-	ns[i], ns[j] = ns[j], ns[i]
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/set_curl_chan_test.go b/third_party/github.com/coreos/go-etcd/etcd/set_curl_chan_test.go
+deleted file mode 100644
+index 756e317..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/set_curl_chan_test.go
++++ /dev/null
+@@ -1,42 +0,0 @@
+-package etcd
+-
+-import (
+-	"fmt"
+-	"testing"
+-)
+-
+-func TestSetCurlChan(t *testing.T) {
+-	c := NewClient(nil)
+-	c.OpenCURL()
+-
+-	defer func() {
+-		c.Delete("foo", true)
+-	}()
+-
+-	_, err := c.Set("foo", "bar", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	expected := fmt.Sprintf("curl -X PUT %s/v2/keys/foo -d value=bar -d ttl=5",
+-		c.cluster.Leader)
+-	actual := c.RecvCURL()
+-	if expected != actual {
+-		t.Fatalf(`Command "%s" is not equal to expected value "%s"`,
+-			actual, expected)
+-	}
+-
+-	c.SetConsistency(STRONG_CONSISTENCY)
+-	_, err = c.Get("foo", false, false)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	expected = fmt.Sprintf("curl -X GET %s/v2/keys/foo?consistent=true&recursive=false&sorted=false",
+-		c.cluster.Leader)
+-	actual = c.RecvCURL()
+-	if expected != actual {
+-		t.Fatalf(`Command "%s" is not equal to expected value "%s"`,
+-			actual, expected)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/set_update_create.go b/third_party/github.com/coreos/go-etcd/etcd/set_update_create.go
+deleted file mode 100644
+index ab420d8..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/set_update_create.go
++++ /dev/null
+@@ -1,121 +0,0 @@
+-package etcd
+-
+-// Set sets the given key to the given value.
+-// It will create a new key value pair or replace the old one.
+-// It will not replace a existing directory.
+-func (c *Client) Set(key string, value string, ttl uint64) (*Response, error) {
+-	raw, err := c.RawSet(key, value, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// Set sets the given key to a directory.
+-// It will create a new directory or replace the old key value pair by a directory.
+-// It will not replace a existing directory.
+-func (c *Client) SetDir(key string, ttl uint64) (*Response, error) {
+-	raw, err := c.RawSetDir(key, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// CreateDir creates a directory. It succeeds only if
+-// the given key does not yet exist.
+-func (c *Client) CreateDir(key string, ttl uint64) (*Response, error) {
+-	raw, err := c.RawCreateDir(key, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// UpdateDir updates the given directory. It succeeds only if the
+-// given key already exists.
+-func (c *Client) UpdateDir(key string, ttl uint64) (*Response, error) {
+-	raw, err := c.RawUpdateDir(key, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// Create creates a file with the given value under the given key.  It succeeds
+-// only if the given key does not yet exist.
+-func (c *Client) Create(key string, value string, ttl uint64) (*Response, error) {
+-	raw, err := c.RawCreate(key, value, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-// Update updates the given key to the given value.  It succeeds only if the
+-// given key already exists.
+-func (c *Client) Update(key string, value string, ttl uint64) (*Response, error) {
+-	raw, err := c.RawUpdate(key, value, ttl)
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return raw.toResponse()
+-}
+-
+-func (c *Client) RawUpdateDir(key string, ttl uint64) (*RawResponse, error) {
+-	ops := options{
+-		"prevExist": true,
+-		"dir":       true,
+-	}
+-
+-	return c.put(key, "", ttl, ops)
+-}
+-
+-func (c *Client) RawCreateDir(key string, ttl uint64) (*RawResponse, error) {
+-	ops := options{
+-		"prevExist": false,
+-		"dir":       true,
+-	}
+-
+-	return c.put(key, "", ttl, ops)
+-}
+-
+-func (c *Client) RawSet(key string, value string, ttl uint64) (*RawResponse, error) {
+-	return c.put(key, value, ttl, nil)
+-}
+-
+-func (c *Client) RawSetDir(key string, ttl uint64) (*RawResponse, error) {
+-	ops := options{
+-		"dir": true,
+-	}
+-
+-	return c.put(key, "", ttl, ops)
+-}
+-
+-func (c *Client) RawUpdate(key string, value string, ttl uint64) (*RawResponse, error) {
+-	ops := options{
+-		"prevExist": true,
+-	}
+-
+-	return c.put(key, value, ttl, ops)
+-}
+-
+-func (c *Client) RawCreate(key string, value string, ttl uint64) (*RawResponse, error) {
+-	ops := options{
+-		"prevExist": false,
+-	}
+-
+-	return c.put(key, value, ttl, ops)
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/set_update_create_test.go b/third_party/github.com/coreos/go-etcd/etcd/set_update_create_test.go
+deleted file mode 100644
+index 2003c59..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/set_update_create_test.go
++++ /dev/null
+@@ -1,204 +0,0 @@
+-package etcd
+-
+-import (
+-	"testing"
+-)
+-
+-func TestSet(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-	}()
+-
+-	resp, err := c.Set("foo", "bar", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if resp.Node.Key != "/foo" || resp.Node.Value != "bar" || resp.Node.TTL != 5 {
+-		t.Fatalf("Set 1 failed: %#v", resp)
+-	}
+-	if resp.PrevNode != nil {
+-		t.Fatalf("Set 1 PrevNode failed: %#v", resp)
+-	}
+-
+-	resp, err = c.Set("foo", "bar2", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/foo" && resp.Node.Value == "bar2" && resp.Node.TTL == 5) {
+-		t.Fatalf("Set 2 failed: %#v", resp)
+-	}
+-	if resp.PrevNode.Key != "/foo" || resp.PrevNode.Value != "bar" || resp.Node.TTL != 5 {
+-		t.Fatalf("Set 2 PrevNode failed: %#v", resp)
+-	}
+-}
+-
+-func TestUpdate(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-		c.Delete("nonexistent", true)
+-	}()
+-
+-	resp, err := c.Set("foo", "bar", 5)
+-
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// This should succeed.
+-	resp, err = c.Update("foo", "wakawaka", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Action == "update" && resp.Node.Key == "/foo" && resp.Node.TTL == 5) {
+-		t.Fatalf("Update 1 failed: %#v", resp)
+-	}
+-	if !(resp.PrevNode.Key == "/foo" && resp.PrevNode.Value == "bar" && resp.Node.TTL == 5) {
+-		t.Fatalf("Update 1 prevValue failed: %#v", resp)
+-	}
+-
+-	// This should fail because the key does not exist.
+-	resp, err = c.Update("nonexistent", "whatever", 5)
+-	if err == nil {
+-		t.Fatalf("The key %v did not exist, so the update should have failed."+
+-			"The response was: %#v", resp.Node.Key, resp)
+-	}
+-}
+-
+-func TestCreate(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("newKey", true)
+-	}()
+-
+-	newKey := "/newKey"
+-	newValue := "/newValue"
+-
+-	// This should succeed
+-	resp, err := c.Create(newKey, newValue, 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Action == "create" && resp.Node.Key == newKey &&
+-		resp.Node.Value == newValue && resp.Node.TTL == 5) {
+-		t.Fatalf("Create 1 failed: %#v", resp)
+-	}
+-	if resp.PrevNode != nil {
+-		t.Fatalf("Create 1 PrevNode failed: %#v", resp)
+-	}
+-
+-	// This should fail, because the key is already there
+-	resp, err = c.Create(newKey, newValue, 5)
+-	if err == nil {
+-		t.Fatalf("The key %v did exist, so the creation should have failed."+
+-			"The response was: %#v", resp.Node.Key, resp)
+-	}
+-}
+-
+-func TestSetDir(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("foo", true)
+-		c.Delete("fooDir", true)
+-	}()
+-
+-	resp, err := c.CreateDir("fooDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/fooDir" && resp.Node.Value == "" && resp.Node.TTL == 5) {
+-		t.Fatalf("SetDir 1 failed: %#v", resp)
+-	}
+-	if resp.PrevNode != nil {
+-		t.Fatalf("SetDir 1 PrevNode failed: %#v", resp)
+-	}
+-
+-	// This should fail because /fooDir already points to a directory
+-	resp, err = c.CreateDir("/fooDir", 5)
+-	if err == nil {
+-		t.Fatalf("fooDir already points to a directory, so SetDir should have failed."+
+-			"The response was: %#v", resp)
+-	}
+-
+-	_, err = c.Set("foo", "bar", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// This should succeed
+-	// It should replace the key
+-	resp, err = c.SetDir("foo", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/foo" && resp.Node.Value == "" && resp.Node.TTL == 5) {
+-		t.Fatalf("SetDir 2 failed: %#v", resp)
+-	}
+-	if !(resp.PrevNode.Key == "/foo" && resp.PrevNode.Value == "bar" && resp.PrevNode.TTL == 5) {
+-		t.Fatalf("SetDir 2 failed: %#v", resp)
+-	}
+-}
+-
+-func TestUpdateDir(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("fooDir", true)
+-	}()
+-
+-	resp, err := c.CreateDir("fooDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// This should succeed.
+-	resp, err = c.UpdateDir("fooDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Action == "update" && resp.Node.Key == "/fooDir" &&
+-		resp.Node.Value == "" && resp.Node.TTL == 5) {
+-		t.Fatalf("UpdateDir 1 failed: %#v", resp)
+-	}
+-	if !(resp.PrevNode.Key == "/fooDir" && resp.PrevNode.Dir == true && resp.PrevNode.TTL == 5) {
+-		t.Fatalf("UpdateDir 1 PrevNode failed: %#v", resp)
+-	}
+-
+-	// This should fail because the key does not exist.
+-	resp, err = c.UpdateDir("nonexistentDir", 5)
+-	if err == nil {
+-		t.Fatalf("The key %v did not exist, so the update should have failed."+
+-			"The response was: %#v", resp.Node.Key, resp)
+-	}
+-}
+-
+-func TestCreateDir(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("fooDir", true)
+-	}()
+-
+-	// This should succeed
+-	resp, err := c.CreateDir("fooDir", 5)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if !(resp.Action == "create" && resp.Node.Key == "/fooDir" &&
+-		resp.Node.Value == "" && resp.Node.TTL == 5) {
+-		t.Fatalf("CreateDir 1 failed: %#v", resp)
+-	}
+-	if resp.PrevNode != nil {
+-		t.Fatalf("CreateDir 1 PrevNode failed: %#v", resp)
+-	}
+-
+-	// This should fail, because the key is already there
+-	resp, err = c.CreateDir("fooDir", 5)
+-	if err == nil {
+-		t.Fatalf("The key %v did exist, so the creation should have failed."+
+-			"The response was: %#v", resp.Node.Key, resp)
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/version.go b/third_party/github.com/coreos/go-etcd/etcd/version.go
+deleted file mode 100644
+index b3d05df..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/version.go
++++ /dev/null
+@@ -1,3 +0,0 @@
+-package etcd
+-
+-const version = "v2"
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/watch.go b/third_party/github.com/coreos/go-etcd/etcd/watch.go
+deleted file mode 100644
+index 1e1ac74..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/watch.go
++++ /dev/null
+@@ -1,121 +0,0 @@
+-package etcd
+-
+-import (
+-	"errors"
+-)
+-
+-// Errors introduced by the Watch command.
+-var (
+-	ErrWatchStoppedByUser = errors.New("Watch stopped by the user via stop channel")
+-)
+-
+-// If recursive is set to true the watch returns the first change under the given
+-// prefix since the given index.
+-//
+-// If recursive is set to false the watch returns the first change to the given key
+-// since the given index.
+-//
+-// To watch for the latest change, set waitIndex = 0.
+-//
+-// If a receiver channel is given, it will be a long-term watch. Watch will block at the
+-//channel. After someone receives the channel, it will go on to watch that
+-// prefix.  If a stop channel is given, the client can close long-term watch using
+-// the stop channel.
+-func (c *Client) Watch(prefix string, waitIndex uint64, recursive bool,
+-	receiver chan *Response, stop chan bool) (*Response, error) {
+-	logger.Debugf("watch %s [%s]", prefix, c.cluster.Leader)
+-	if receiver == nil {
+-		raw, err := c.watchOnce(prefix, waitIndex, recursive, stop)
+-
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		return raw.toResponse()
+-	}
+-
+-	for {
+-		raw, err := c.watchOnce(prefix, waitIndex, recursive, stop)
+-
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		resp, err := raw.toResponse()
+-
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		waitIndex = resp.Node.ModifiedIndex + 1
+-		receiver <- resp
+-	}
+-
+-	return nil, nil
+-}
+-
+-func (c *Client) RawWatch(prefix string, waitIndex uint64, recursive bool,
+-	receiver chan *RawResponse, stop chan bool) (*RawResponse, error) {
+-
+-	logger.Debugf("rawWatch %s [%s]", prefix, c.cluster.Leader)
+-	if receiver == nil {
+-		return c.watchOnce(prefix, waitIndex, recursive, stop)
+-	}
+-
+-	for {
+-		raw, err := c.watchOnce(prefix, waitIndex, recursive, stop)
+-
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		resp, err := raw.toResponse()
+-
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		waitIndex = resp.Node.ModifiedIndex + 1
+-		receiver <- raw
+-	}
+-
+-	return nil, nil
+-}
+-
+-// helper func
+-// return when there is change under the given prefix
+-func (c *Client) watchOnce(key string, waitIndex uint64, recursive bool, stop chan bool) (*RawResponse, error) {
+-
+-	respChan := make(chan *RawResponse, 1)
+-	errChan := make(chan error)
+-
+-	go func() {
+-		options := options{
+-			"wait": true,
+-		}
+-		if waitIndex > 0 {
+-			options["waitIndex"] = waitIndex
+-		}
+-		if recursive {
+-			options["recursive"] = true
+-		}
+-
+-		resp, err := c.get(key, options)
+-
+-		if err != nil {
+-			errChan <- err
+-			return
+-		}
+-
+-		respChan <- resp
+-	}()
+-
+-	select {
+-	case resp := <-respChan:
+-		return resp, nil
+-	case err := <-errChan:
+-		return nil, err
+-	case <-stop:
+-		return nil, ErrWatchStoppedByUser
+-	}
+-}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/watch_test.go b/third_party/github.com/coreos/go-etcd/etcd/watch_test.go
+deleted file mode 100644
+index 9b46648..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/watch_test.go
++++ /dev/null
+@@ -1,106 +0,0 @@
+-package etcd
+-
+-import (
+-	"fmt"
+-	"testing"
+-	"time"
+-)
+-
+-func TestWatch(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("watch_foo", true)
+-	}()
+-
+-	go setHelper("watch_foo", "bar", c)
+-
+-	resp, err := c.Watch("watch_foo", 0, false, nil, nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/watch_foo" && resp.Node.Value == "bar") {
+-		t.Fatalf("Watch 1 failed: %#v", resp)
+-	}
+-
+-	go setHelper("watch_foo", "bar", c)
+-
+-	resp, err = c.Watch("watch_foo", resp.Node.ModifiedIndex+1, false, nil, nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/watch_foo" && resp.Node.Value == "bar") {
+-		t.Fatalf("Watch 2 failed: %#v", resp)
+-	}
+-
+-	ch := make(chan *Response, 10)
+-	stop := make(chan bool, 1)
+-
+-	go setLoop("watch_foo", "bar", c)
+-
+-	go receiver(ch, stop)
+-
+-	_, err = c.Watch("watch_foo", 0, false, ch, stop)
+-	if err != ErrWatchStoppedByUser {
+-		t.Fatalf("Watch returned a non-user stop error")
+-	}
+-}
+-
+-func TestWatchAll(t *testing.T) {
+-	c := NewClient(nil)
+-	defer func() {
+-		c.Delete("watch_foo", true)
+-	}()
+-
+-	go setHelper("watch_foo/foo", "bar", c)
+-
+-	resp, err := c.Watch("watch_foo", 0, true, nil, nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/watch_foo/foo" && resp.Node.Value == "bar") {
+-		t.Fatalf("WatchAll 1 failed: %#v", resp)
+-	}
+-
+-	go setHelper("watch_foo/foo", "bar", c)
+-
+-	resp, err = c.Watch("watch_foo", resp.Node.ModifiedIndex+1, true, nil, nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if !(resp.Node.Key == "/watch_foo/foo" && resp.Node.Value == "bar") {
+-		t.Fatalf("WatchAll 2 failed: %#v", resp)
+-	}
+-
+-	ch := make(chan *Response, 10)
+-	stop := make(chan bool, 1)
+-
+-	go setLoop("watch_foo/foo", "bar", c)
+-
+-	go receiver(ch, stop)
+-
+-	_, err = c.Watch("watch_foo", 0, true, ch, stop)
+-	if err != ErrWatchStoppedByUser {
+-		t.Fatalf("Watch returned a non-user stop error")
+-	}
+-}
+-
+-func setHelper(key, value string, c *Client) {
+-	time.Sleep(time.Second)
+-	c.Set(key, value, 100)
+-}
+-
+-func setLoop(key, value string, c *Client) {
+-	time.Sleep(time.Second)
+-	for i := 0; i < 10; i++ {
+-		newValue := fmt.Sprintf("%s_%v", value, i)
+-		c.Set(key, newValue, 100)
+-		time.Sleep(time.Second / 10)
+-	}
+-}
+-
+-func receiver(c chan *Response, stop chan bool) {
+-	for i := 0; i < 10; i++ {
+-		<-c
+-	}
+-	stop <- true
+-}
+diff --git a/third_party/github.com/coreos/go-systemd/journal/send.go b/third_party/github.com/coreos/go-systemd/journal/send.go
+deleted file mode 100644
+index 7e7dab4..0000000
+--- a/third_party/github.com/coreos/go-systemd/journal/send.go
++++ /dev/null
+@@ -1,152 +0,0 @@
+-// Package journal provides write bindings to the systemd journal
+-package journal
+-
+-import (
+-	"bytes"
+-	"encoding/binary"
+-	"errors"
+-	"fmt"
+-	"io"
+-	"io/ioutil"
+-	"net"
+-	"os"
+-	"strconv"
+-	"strings"
+-	"syscall"
+-)
+-
+-// Priority of a journal message
+-type Priority int
+-
+-const (
+-	PriEmerg Priority = iota
+-	PriAlert
+-	PriCrit
+-	PriErr
+-	PriWarning
+-	PriNotice
+-	PriInfo
+-	PriDebug
+-)
+-
+-var conn net.Conn
+-
+-func init() {
+-	var err error
+-	conn, err = net.Dial("unixgram", "/run/systemd/journal/socket")
+-	if err != nil {
+-		conn = nil
+-	}
+-}
+-
+-// Enabled returns true iff the systemd journal is available for logging
+-func Enabled() bool {
+-	return conn != nil
+-}
+-
+-// Send a message to the systemd journal. vars is a map of journald fields to
+-// values.  Fields must be composed of uppercase letters, numbers, and
+-// underscores, but must not start with an underscore. Within these
+-// restrictions, any arbitrary field name may be used.  Some names have special
+-// significance: see the journalctl documentation
+-// (http://www.freedesktop.org/software/systemd/man/systemd.journal-fields.html)
+-// for more details.  vars may be nil.
+-func Send(message string, priority Priority, vars map[string]string) error {
+-	if conn == nil {
+-		return journalError("could not connect to journald socket")
+-	}
+-
+-	data := new(bytes.Buffer)
+-	appendVariable(data, "PRIORITY", strconv.Itoa(int(priority)))
+-	appendVariable(data, "MESSAGE", message)
+-	for k, v := range vars {
+-		appendVariable(data, k, v)
+-	}
+-
+-	_, err := io.Copy(conn, data)
+-	if err != nil && isSocketSpaceError(err) {
+-		file, err := tempFd()
+-		if err != nil {
+-			return journalError(err.Error())
+-		}
+-		_, err = io.Copy(file, data)
+-		if err != nil {
+-			return journalError(err.Error())
+-		}
+-
+-		rights := syscall.UnixRights(int(file.Fd()))
+-
+-		/* this connection should always be a UnixConn, but better safe than sorry */
+-		unixConn, ok := conn.(*net.UnixConn)
+-		if !ok {
+-			return journalError("can't send file through non-Unix connection")
+-		}
+-		unixConn.WriteMsgUnix([]byte{}, rights, nil)
+-	} else if err != nil {
+-		return journalError(err.Error())
+-	}
+-	return nil
+-}
+-
+-func appendVariable(w io.Writer, name, value string) {
+-	if !validVarName(name) {
+-		journalError("variable name contains invalid character, ignoring")
+-	}
+-	if strings.ContainsRune(value, '\n') {
+-		/* When the value contains a newline, we write:
+-		 * - the variable name, followed by a newline
+-		 * - the size (in 64bit little endian format)
+-		 * - the data, followed by a newline
+-		 */
+-		fmt.Fprintln(w, name)
+-		binary.Write(w, binary.LittleEndian, uint64(len(value)))
+-		fmt.Fprintln(w, value)
+-	} else {
+-		/* just write the variable and value all on one line */
+-		fmt.Fprintln(w, "%s=%s", name, value)
+-	}
+-}
+-
+-func validVarName(name string) bool {
+-	/* The variable name must be in uppercase and consist only of characters,
+-	 * numbers and underscores, and may not begin with an underscore. (from the docs)
+-	 */
+-
+-	valid := name[0] != '_'
+-	for _, c := range name {
+-		valid = valid && ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9') || c == '_'
+-	}
+-	return valid
+-}
+-
+-func isSocketSpaceError(err error) bool {
+-	opErr, ok := err.(*net.OpError)
+-	if !ok {
+-		return false
+-	}
+-
+-	sysErr, ok := opErr.Err.(syscall.Errno)
+-	if !ok {
+-		return false
+-	}
+-
+-	return sysErr == syscall.EMSGSIZE || sysErr == syscall.ENOBUFS
+-}
+-
+-func tempFd() (*os.File, error) {
+-	file, err := ioutil.TempFile("/dev/shm/", "journal.XXXXX")
+-	if err != nil {
+-		return nil, err
+-	}
+-	syscall.Unlink(file.Name())
+-	if err != nil {
+-		return nil, err
+-	}
+-	return file, nil
+-}
+-
+-func journalError(s string) error {
+-	s = "journal error: " + s
+-	fmt.Fprintln(os.Stderr, s)
+-	return errors.New(s)
+-}

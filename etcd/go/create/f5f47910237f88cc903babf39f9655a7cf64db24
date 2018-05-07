@@ -1,0 +1,55 @@
+commit f5f47910237f88cc903babf39f9655a7cf64db24
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Fri Mar 31 18:09:19 2017 -0700
+
+    integration: test cluster terminates quickly
+
+diff --git a/integration/cluster.go b/integration/cluster.go
+index b9bc6b9..5ebd18f 100644
+--- a/integration/cluster.go
++++ b/integration/cluster.go
+@@ -313,9 +313,15 @@ func (c *cluster) removeMember(t *testing.T, id uint64) error {
+ }
+ 
+ func (c *cluster) Terminate(t *testing.T) {
++	var wg sync.WaitGroup
++	wg.Add(len(c.Members))
+ 	for _, m := range c.Members {
+-		m.Terminate(t)
++		go func(mm *member) {
++			defer wg.Done()
++			mm.Terminate(t)
++		}(m)
+ 	}
++	wg.Wait()
+ }
+ 
+ func (c *cluster) waitMembersMatch(t *testing.T, membs []client.Member) {
+diff --git a/integration/cluster_test.go b/integration/cluster_test.go
+index 6e85ba3..e356564 100644
+--- a/integration/cluster_test.go
++++ b/integration/cluster_test.go
+@@ -568,3 +568,23 @@ func TestTransferLeader(t *testing.T) {
+ 		t.Fatalf("expected old leader %d != new leader %d", oldLeadID, newLeadIDs[0])
+ 	}
+ }
++
++func TestSpeedyTerminate(t *testing.T) {
++	defer testutil.AfterTest(t)
++	clus := NewClusterV3(t, &ClusterConfig{Size: 3})
++	// Stop/Restart so requests will time out on lost leaders
++	for i := 0; i < 3; i++ {
++		clus.Members[i].Stop(t)
++		clus.Members[i].Restart(t)
++	}
++	donec := make(chan struct{})
++	go func() {
++		defer close(donec)
++		clus.Terminate(t)
++	}()
++	select {
++	case <-time.After(10 * time.Second):
++		t.Fatalf("cluster took too long to terminate")
++	case <-donec:
++	}
++}

@@ -1,0 +1,148 @@
+commit 6f0723f23fade97603d18a761c6dad43e9e7970a
+Author: Gyu-Ho Lee <gyuhox@gmail.com>
+Date:   Wed Mar 8 10:18:19 2017 -0800
+
+    lease: guard 'Lease.itemSet' from concurrent writes
+    
+    Fix https://github.com/coreos/etcd/issues/7448.
+    
+    Affected if etcd builds with Go 1.8+.
+    
+    Signed-off-by: Gyu-Ho Lee <gyuhox@gmail.com>
+
+diff --git a/lease/lessor.go b/lease/lessor.go
+index 323e9a2..385bd76 100644
+--- a/lease/lessor.go
++++ b/lease/lessor.go
+@@ -252,10 +252,7 @@ func (le *lessor) Revoke(id LeaseID) error {
+ 
+ 	// sort keys so deletes are in same order among all members,
+ 	// otherwise the backened hashes will be different
+-	keys := make([]string, 0, len(l.itemSet))
+-	for item := range l.itemSet {
+-		keys = append(keys, item.Key)
+-	}
++	keys := l.Keys()
+ 	sort.StringSlice(keys).Sort()
+ 	for _, key := range keys {
+ 		_, _, err := le.rd.TxnDeleteRange(tid, []byte(key), nil)
+@@ -367,10 +364,12 @@ func (le *lessor) Attach(id LeaseID, items []LeaseItem) error {
+ 		return ErrLeaseNotFound
+ 	}
+ 
++	l.mu.Lock()
+ 	for _, it := range items {
+ 		l.itemSet[it] = struct{}{}
+ 		le.itemMap[it] = id
+ 	}
++	l.mu.Unlock()
+ 	return nil
+ }
+ 
+@@ -392,10 +391,12 @@ func (le *lessor) Detach(id LeaseID, items []LeaseItem) error {
+ 		return ErrLeaseNotFound
+ 	}
+ 
++	l.mu.Lock()
+ 	for _, it := range items {
+ 		delete(l.itemSet, it)
+ 		delete(le.itemMap, it)
+ 	}
++	l.mu.Unlock()
+ 	return nil
+ }
+ 
+@@ -506,6 +507,8 @@ type Lease struct {
+ 	// expiry is time when lease should expire; must be 64-bit aligned.
+ 	expiry monotime.Time
+ 
++	// mu protects concurrent accesses to itemSet
++	mu      sync.RWMutex
+ 	itemSet map[LeaseItem]struct{}
+ 	revokec chan struct{}
+ }
+@@ -544,10 +547,12 @@ func (l *Lease) forever() { atomic.StoreUint64((*uint64)(&l.expiry), uint64(fore
+ 
+ // Keys returns all the keys attached to the lease.
+ func (l *Lease) Keys() []string {
++	l.mu.RLock()
+ 	keys := make([]string, 0, len(l.itemSet))
+ 	for k := range l.itemSet {
+ 		keys = append(keys, k.Key)
+ 	}
++	l.mu.RUnlock()
+ 	return keys
+ }
+ 
+diff --git a/lease/lessor_test.go b/lease/lessor_test.go
+index dfcd77f..97793f6 100644
+--- a/lease/lessor_test.go
++++ b/lease/lessor_test.go
+@@ -15,11 +15,13 @@
+ package lease
+ 
+ import (
++	"fmt"
+ 	"io/ioutil"
+ 	"os"
+ 	"path"
+ 	"reflect"
+ 	"sort"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -77,6 +79,53 @@ func TestLessorGrant(t *testing.T) {
+ 	be.BatchTx().Unlock()
+ }
+ 
++// TestLeaseConcurrentKeys ensures Lease.Keys method calls are guarded
++// from concurrent map writes on 'itemSet'.
++func TestLeaseConcurrentKeys(t *testing.T) {
++	dir, be := NewTestBackend(t)
++	defer os.RemoveAll(dir)
++	defer be.Close()
++
++	fd := &fakeDeleter{}
++
++	le := newLessor(be, minLeaseTTL)
++	le.SetRangeDeleter(fd)
++
++	// grant a lease with long term (100 seconds) to
++	// avoid early termination during the test.
++	l, err := le.Grant(1, 100)
++	if err != nil {
++		t.Fatalf("could not grant lease for 100s ttl (%v)", err)
++	}
++
++	itemn := 10
++	items := make([]LeaseItem, itemn)
++	for i := 0; i < itemn; i++ {
++		items[i] = LeaseItem{Key: fmt.Sprintf("foo%d", i)}
++	}
++	if err = le.Attach(l.ID, items); err != nil {
++		t.Fatalf("failed to attach items to the lease: %v", err)
++	}
++
++	donec := make(chan struct{})
++	go func() {
++		le.Detach(l.ID, items)
++		close(donec)
++	}()
++
++	var wg sync.WaitGroup
++	wg.Add(itemn)
++	for i := 0; i < itemn; i++ {
++		go func() {
++			defer wg.Done()
++			l.Keys()
++		}()
++	}
++
++	<-donec
++	wg.Wait()
++}
++
+ // TestLessorRevoke ensures Lessor can revoke a lease.
+ // The items in the revoked lease should be removed from
+ // the backend.

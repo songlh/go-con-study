@@ -1,0 +1,98 @@
+commit 4d2aa80ecf0f276e1323ee55abd48d5d64fe017e
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Thu Feb 16 13:18:59 2017 -0800
+
+    clientv3: add cluster version checking
+
+diff --git a/clientv3/client.go b/clientv3/client.go
+index ecda653..7cfb0b0 100644
+--- a/clientv3/client.go
++++ b/clientv3/client.go
+@@ -20,6 +20,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"net/url"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -35,6 +36,7 @@ import (
+ 
+ var (
+ 	ErrNoAvailableEndpoints = errors.New("etcdclient: no available endpoints")
++	ErrOldCluster           = errors.New("etcdclient: old cluster version")
+ )
+ 
+ // Client provides and manages an etcd v3 client session.
+@@ -358,10 +360,57 @@ func newClient(cfg *Config) (*Client, error) {
+ 	client.Auth = NewAuth(client)
+ 	client.Maintenance = NewMaintenance(client)
+ 
++	if cfg.RejectOldCluster {
++		if err := client.checkVersion(); err != nil {
++			client.Close()
++			return nil, err
++		}
++	}
++
+ 	go client.autoSync()
+ 	return client, nil
+ }
+ 
++func (c *Client) checkVersion() (err error) {
++	var wg sync.WaitGroup
++	errc := make(chan error, len(c.cfg.Endpoints))
++	ctx, cancel := context.WithCancel(c.ctx)
++	if c.cfg.DialTimeout > 0 {
++		ctx, _ = context.WithTimeout(ctx, c.cfg.DialTimeout)
++	}
++	wg.Add(len(c.cfg.Endpoints))
++	for _, ep := range c.cfg.Endpoints {
++		// if cluster is current, any endpoint gives a recent version
++		go func(e string) {
++			defer wg.Done()
++			resp, rerr := c.Status(ctx, e)
++			if rerr != nil {
++				errc <- rerr
++				return
++			}
++			vs := strings.Split(resp.Version, ".")
++			maj, min := 0, 0
++			if len(vs) >= 2 {
++				maj, rerr = strconv.Atoi(vs[0])
++				min, rerr = strconv.Atoi(vs[1])
++			}
++			if maj < 3 || (maj == 3 && min < 2) {
++				rerr = ErrOldCluster
++			}
++			errc <- rerr
++		}(ep)
++	}
++	// wait for success
++	for i := 0; i < len(c.cfg.Endpoints); i++ {
++		if err = <-errc; err == nil {
++			break
++		}
++	}
++	cancel()
++	wg.Wait()
++	return err
++}
++
+ // ActiveConnection returns the current in-use connection
+ func (c *Client) ActiveConnection() *grpc.ClientConn { return c.conn }
+ 
+diff --git a/clientv3/config.go b/clientv3/config.go
+index 69bfe5d..dda72a7 100644
+--- a/clientv3/config.go
++++ b/clientv3/config.go
+@@ -42,6 +42,9 @@ type Config struct {
+ 	// Password is a password for authentication.
+ 	Password string `json:"password"`
+ 
++	// RejectOldCluster when set will refuse to create a client against an outdated cluster.
++	RejectOldCluster bool `json:"reject-old-cluster"`
++
+ 	// DialOptions is a list of dial options for the grpc client (e.g., for interceptors).
+ 	DialOptions []grpc.DialOption
+ 

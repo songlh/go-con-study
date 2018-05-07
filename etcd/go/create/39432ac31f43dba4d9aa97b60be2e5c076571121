@@ -1,0 +1,132 @@
+commit 39432ac31f43dba4d9aa97b60be2e5c076571121
+Author: Joe Betz <jpbetz@google.com>
+Date:   Thu Aug 3 21:19:04 2017 -0700
+
+    etcdctlv3: Add option to defrag a data directory directly, for cases where etcd is not running.
+
+diff --git a/Documentation/op-guide/maintenance.md b/Documentation/op-guide/maintenance.md
+index ea91714..b513ba2 100644
+--- a/Documentation/op-guide/maintenance.md
++++ b/Documentation/op-guide/maintenance.md
+@@ -47,6 +47,12 @@ $ etcdctl defrag
+ Finished defragmenting etcd member[127.0.0.1:2379]
+ ```
+ 
++To defragment an etcd data directory directly, while etcd is not running, use the command:
++
++``` sh
++$ etcdctl defrag --data-dir <path-to-etcd-data-dir>
++```
++
+ ## Space quota
+ 
+ The space quota in `etcd` ensures the cluster operates in a reliable fashion. Without a space quota, `etcd` may suffer from poor performance if the keyspace grows excessively large, or it may simply run out of storage space, leading to unpredictable cluster behavior. If the keyspace's backend database for any member exceeds the space quota, `etcd` raises a cluster-wide alarm that puts the cluster into a maintenance mode which only accepts key reads and deletes. Only after freeing enough space in the keyspace and defragmenting the backend database, along with clearing the space quota alarm can the cluster resume normal operation.
+diff --git a/etcdctl/README.md b/etcdctl/README.md
+index 204536a..6823e7c 100644
+--- a/etcdctl/README.md
++++ b/etcdctl/README.md
+@@ -734,11 +734,16 @@ If NOSPACE alarm is present:
+ # alarm:NOSPACE
+ ```
+ 
+-### DEFRAG
++### DEFRAG [options]
+ 
+-DEFRAG defragments the backend database file for a set of given endpoints. When an etcd member reclaims storage space
+-from deleted and compacted keys, the space is kept in a free list and the database file remains the same size. By defragmenting
+-the database, the etcd member releases this free space back to the file system.
++DEFRAG defragments the backend database file for a set of given endpoints while etcd is running, or directly defragments an 
++etcd data directory while etcd is not running. When an etcd member reclaims storage space from deleted and compacted keys, the 
++space is kept in a free list and the database file remains the same size. By defragmenting the database, the etcd member 
++releases this free space back to the file system.
++
++#### Options
++
++- data-dir -- Optional. If present, defragments a data directory not in use by etcd.
+ 
+ #### Output
+ 
+@@ -752,6 +757,15 @@ For each endpoints, prints a message indicating whether the endpoint was success
+ # Failed to defragment etcd member[badendpoint:2379] (grpc: timed out trying to connect)
+ ```
+ 
++To defragment a data directory directly, use the `--data-dir` flag:
++
++``` bash
++# Defragment while etcd is not running
++./etcdctl defrag --data-dir default.etcd
++# success (exit status 0)
++# Error: cannot open database at default.etcd/member/snap/db
++```
++
+ #### Remarks
+ 
+ DEFRAG returns a zero exit code only if it succeeded defragmenting all given endpoints.
+diff --git a/etcdctl/ctlv3/command/defrag_command.go b/etcdctl/ctlv3/command/defrag_command.go
+index b00ca20..a7e6f76 100644
+--- a/etcdctl/ctlv3/command/defrag_command.go
++++ b/etcdctl/ctlv3/command/defrag_command.go
+@@ -17,20 +17,38 @@ package command
+ import (
+ 	"fmt"
+ 	"os"
++	"path/filepath"
++	"time"
+ 
++	"github.com/coreos/etcd/mvcc/backend"
+ 	"github.com/spf13/cobra"
+ )
+ 
++var (
++	defragDataDir string
++)
++
+ // NewDefragCommand returns the cobra command for "Defrag".
+ func NewDefragCommand() *cobra.Command {
+-	return &cobra.Command{
++	cmd := &cobra.Command{
+ 		Use:   "defrag",
+ 		Short: "Defragments the storage of the etcd members with given endpoints",
+ 		Run:   defragCommandFunc,
+ 	}
++	cmd.Flags().StringVar(&defragDataDir, "data-dir", "", "Optional. If present, defragments a data directory not in use by etcd.")
++	return cmd
+ }
+ 
+ func defragCommandFunc(cmd *cobra.Command, args []string) {
++	if len(defragDataDir) > 0 {
++		err := defragData(defragDataDir)
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "Failed to defragment etcd data[%s] (%v)\n", defragDataDir, err)
++			os.Exit(ExitError)
++		}
++		return
++	}
++
+ 	failures := 0
+ 	c := mustClientFromCmd(cmd)
+ 	for _, ep := range c.Endpoints() {
+@@ -49,3 +67,23 @@ func defragCommandFunc(cmd *cobra.Command, args []string) {
+ 		os.Exit(ExitError)
+ 	}
+ }
++
++func defragData(dataDir string) error {
++	var be backend.Backend
++
++	bch := make(chan struct{})
++	dbDir := filepath.Join(dataDir, "member", "snap", "db")
++	go func() {
++		defer close(bch)
++		be = backend.NewDefaultBackend(dbDir)
++
++	}()
++	select {
++	case <-bch:
++	case <-time.After(time.Second):
++		fmt.Fprintf(os.Stderr, "waiting for etcd to close and release its lock on %q. "+
++			"To defrag a running etcd instance, omit --data-dir.\n", dbDir)
++		<-bch
++	}
++	return be.Defrag()
++}

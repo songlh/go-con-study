@@ -1,0 +1,1485 @@
+commit 5cb6dd268b51bb5bf2a9ab511d691763e07c9d05
+Author: sharat <sinsharat@gmail.com>
+Date:   Tue Jan 3 11:20:56 2017 +0530
+
+    etcd-runner: make command compliant
+
+diff --git a/tools/functional-tester/etcd-runner/command/election_command.go b/tools/functional-tester/etcd-runner/command/election_command.go
+new file mode 100644
+index 0000000..2b133a6
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/command/election_command.go
+@@ -0,0 +1,126 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/coreos/etcd/clientv3/concurrency"
++	"github.com/spf13/cobra"
++)
++
++// NewElectionCommand returns the cobra command for "election runner".
++func NewElectionCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "election",
++		Short: "Performs election operation",
++		Run:   runElectionFunc,
++	}
++	cmd.Flags().IntVar(&rounds, "rounds", 100, "number of rounds to run")
++	cmd.Flags().IntVar(&totalClientConnections, "total-client-connections", 10, "total number of client connections")
++	return cmd
++}
++
++func runElectionFunc(cmd *cobra.Command, args []string) {
++	if len(args) > 0 {
++		ExitWithError(ExitBadArgs, errors.New("election does not take any argument"))
++	}
++
++	rcs := make([]roundClient, totalClientConnections)
++	validatec, releasec := make(chan struct{}, len(rcs)), make(chan struct{}, len(rcs))
++	for range rcs {
++		releasec <- struct{}{}
++	}
++
++	eps := endpointsFromFlag(cmd)
++	dialTimeout := dialTimeoutFromCmd(cmd)
++
++	for i := range rcs {
++		v := fmt.Sprintf("%d", i)
++		observedLeader := ""
++		validateWaiters := 0
++
++		rcs[i].c = newClient(eps, dialTimeout)
++		var (
++			s   *concurrency.Session
++			err error
++		)
++		for {
++			s, err = concurrency.NewSession(rcs[i].c)
++			if err == nil {
++				break
++			}
++		}
++		e := concurrency.NewElection(s, "electors")
++
++		rcs[i].acquire = func() error {
++			<-releasec
++			ctx, cancel := context.WithCancel(context.Background())
++			go func() {
++				if ol, ok := <-e.Observe(ctx); ok {
++					observedLeader = string(ol.Kvs[0].Value)
++					if observedLeader != v {
++						cancel()
++					}
++				}
++			}()
++			err = e.Campaign(ctx, v)
++			if err == nil {
++				observedLeader = v
++			}
++			if observedLeader == v {
++				validateWaiters = len(rcs)
++			}
++			select {
++			case <-ctx.Done():
++				return nil
++			default:
++				cancel()
++				return err
++			}
++		}
++		rcs[i].validate = func() error {
++			if l, err := e.Leader(context.TODO()); err == nil && l != observedLeader {
++				return fmt.Errorf("expected leader %q, got %q", observedLeader, l)
++			}
++			validatec <- struct{}{}
++			return nil
++		}
++		rcs[i].release = func() error {
++			for validateWaiters > 0 {
++				select {
++				case <-validatec:
++					validateWaiters--
++				default:
++					return fmt.Errorf("waiting on followers")
++				}
++			}
++			if err := e.Resign(context.TODO()); err != nil {
++				return err
++			}
++			if observedLeader == v {
++				for range rcs {
++					releasec <- struct{}{}
++				}
++			}
++			observedLeader = ""
++			return nil
++		}
++	}
++
++	doRounds(rcs, rounds)
++}
+diff --git a/tools/functional-tester/etcd-runner/command/error.go b/tools/functional-tester/etcd-runner/command/error.go
+new file mode 100644
+index 0000000..3188cd5
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/command/error.go
+@@ -0,0 +1,42 @@
++// Copyright 2015 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"fmt"
++	"os"
++
++	"github.com/coreos/etcd/client"
++)
++
++const (
++	// http://tldp.org/LDP/abs/html/exitcodes.html
++	ExitSuccess = iota
++	ExitError
++	ExitBadConnection
++	ExitInvalidInput // for txn, watch command
++	ExitBadFeature   // provided a valid flag with an unsupported value
++	ExitInterrupted
++	ExitIO
++	ExitBadArgs = 128
++)
++
++func ExitWithError(code int, err error) {
++	fmt.Fprintln(os.Stderr, "Error: ", err)
++	if cerr, ok := err.(*client.ClusterError); ok {
++		fmt.Fprintln(os.Stderr, cerr.Detail())
++	}
++	os.Exit(code)
++}
+diff --git a/tools/functional-tester/etcd-runner/command/global.go b/tools/functional-tester/etcd-runner/command/global.go
+new file mode 100644
+index 0000000..b03d131
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/command/global.go
+@@ -0,0 +1,125 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"fmt"
++	"log"
++	"sync"
++	"time"
++
++	"github.com/coreos/etcd/clientv3"
++
++	"github.com/spf13/cobra"
++)
++
++var (
++	rounds                 int
++	totalClientConnections int
++)
++
++// GlobalFlags are flags that defined globally
++// and are inherited to all sub-commands.
++type GlobalFlags struct {
++	Endpoints   []string
++	DialTimeout time.Duration
++}
++
++type roundClient struct {
++	c        *clientv3.Client
++	progress int
++	acquire  func() error
++	validate func() error
++	release  func() error
++}
++
++func newClient(eps []string, timeout time.Duration) *clientv3.Client {
++	c, err := clientv3.New(clientv3.Config{
++		Endpoints:   eps,
++		DialTimeout: time.Duration(timeout) * time.Second,
++	})
++	if err != nil {
++		log.Fatal(err)
++	}
++	return c
++}
++
++func doRounds(rcs []roundClient, rounds int) {
++	var mu sync.Mutex
++	var wg sync.WaitGroup
++
++	wg.Add(len(rcs))
++	finished := make(chan struct{}, 0)
++	for i := range rcs {
++		go func(rc *roundClient) {
++			defer wg.Done()
++			for rc.progress < rounds {
++				for rc.acquire() != nil { /* spin */
++				}
++
++				mu.Lock()
++				if err := rc.validate(); err != nil {
++					log.Fatal(err)
++				}
++				mu.Unlock()
++
++				time.Sleep(10 * time.Millisecond)
++				rc.progress++
++				finished <- struct{}{}
++
++				mu.Lock()
++				for rc.release() != nil {
++					mu.Unlock()
++					mu.Lock()
++				}
++				mu.Unlock()
++			}
++		}(&rcs[i])
++	}
++
++	start := time.Now()
++	for i := 1; i < len(rcs)*rounds+1; i++ {
++		select {
++		case <-finished:
++			if i%100 == 0 {
++				fmt.Printf("finished %d, took %v\n", i, time.Since(start))
++				start = time.Now()
++			}
++		case <-time.After(time.Minute):
++			log.Panic("no progress after 1 minute!")
++		}
++	}
++	wg.Wait()
++
++	for _, rc := range rcs {
++		rc.c.Close()
++	}
++}
++
++func endpointsFromFlag(cmd *cobra.Command) []string {
++	endpoints, err := cmd.Flags().GetStringSlice("endpoints")
++	if err != nil {
++		ExitWithError(ExitError, err)
++	}
++	return endpoints
++}
++
++func dialTimeoutFromCmd(cmd *cobra.Command) time.Duration {
++	dialTimeout, err := cmd.Flags().GetDuration("dial-timeout")
++	if err != nil {
++		ExitWithError(ExitError, err)
++	}
++	return dialTimeout
++}
+diff --git a/tools/functional-tester/etcd-runner/command/lease_renewer_command.go b/tools/functional-tester/etcd-runner/command/lease_renewer_command.go
+new file mode 100644
+index 0000000..e5257d4
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/command/lease_renewer_command.go
+@@ -0,0 +1,86 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log"
++	"time"
++
++	"github.com/coreos/etcd/clientv3"
++	"github.com/spf13/cobra"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++)
++
++// NewLeaseRenewerCommand returns the cobra command for "lease-renewer runner".
++func NewLeaseRenewerCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "lease-renewer",
++		Short: "Performs lease renew operation",
++		Run:   runLeaseRenewerFunc,
++	}
++	return cmd
++}
++
++func runLeaseRenewerFunc(cmd *cobra.Command, args []string) {
++	if len(args) > 0 {
++		ExitWithError(ExitBadArgs, errors.New("lease-renewer does not take any argument"))
++	}
++
++	eps := endpointsFromFlag(cmd)
++	dialTimeout := dialTimeoutFromCmd(cmd)
++	c := newClient(eps, dialTimeout)
++	ctx := context.Background()
++
++	for {
++		var (
++			l   *clientv3.LeaseGrantResponse
++			lk  *clientv3.LeaseKeepAliveResponse
++			err error
++		)
++		for {
++			l, err = c.Lease.Grant(ctx, 5)
++			if err == nil {
++				break
++			}
++		}
++		expire := time.Now().Add(time.Duration(l.TTL-1) * time.Second)
++
++		for {
++			lk, err = c.Lease.KeepAliveOnce(ctx, l.ID)
++			if grpc.Code(err) == codes.NotFound {
++				if time.Since(expire) < 0 {
++					log.Printf("bad renew! exceeded: %v", time.Since(expire))
++					for {
++						lk, err = c.Lease.KeepAliveOnce(ctx, l.ID)
++						fmt.Println(lk, err)
++						time.Sleep(time.Second)
++					}
++				}
++				log.Printf("lost lease %d, expire: %v\n", l.ID, expire)
++				break
++			}
++			if err != nil {
++				continue
++			}
++			expire = time.Now().Add(time.Duration(lk.TTL-1) * time.Second)
++			log.Printf("renewed lease %d, expire: %v\n", lk.ID, expire)
++			time.Sleep(time.Duration(lk.TTL-2) * time.Second)
++		}
++	}
++}
+diff --git a/tools/functional-tester/etcd-runner/command/lock_racer_command.go b/tools/functional-tester/etcd-runner/command/lock_racer_command.go
+new file mode 100644
+index 0000000..d954426
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/command/lock_racer_command.go
+@@ -0,0 +1,81 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/coreos/etcd/clientv3/concurrency"
++	"github.com/spf13/cobra"
++)
++
++// NewLockRacerCommand returns the cobra command for "lock-racer runner".
++func NewLockRacerCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "lock-racer",
++		Short: "Performs lock race operation",
++		Run:   runRacerFunc,
++	}
++	cmd.Flags().IntVar(&rounds, "rounds", 100, "number of rounds to run")
++	cmd.Flags().IntVar(&totalClientConnections, "total-client-connections", 10, "total number of client connections")
++	return cmd
++}
++
++func runRacerFunc(cmd *cobra.Command, args []string) {
++	if len(args) > 0 {
++		ExitWithError(ExitBadArgs, errors.New("lock-racer does not take any argument"))
++	}
++
++	rcs := make([]roundClient, totalClientConnections)
++	ctx := context.Background()
++	cnt := 0
++
++	eps := endpointsFromFlag(cmd)
++	dialTimeout := dialTimeoutFromCmd(cmd)
++
++	for i := range rcs {
++		var (
++			s   *concurrency.Session
++			err error
++		)
++
++		rcs[i].c = newClient(eps, dialTimeout)
++
++		for {
++			s, err = concurrency.NewSession(rcs[i].c)
++			if err == nil {
++				break
++			}
++		}
++		m := concurrency.NewMutex(s, "racers")
++		rcs[i].acquire = func() error { return m.Lock(ctx) }
++		rcs[i].validate = func() error {
++			if cnt++; cnt != 1 {
++				return fmt.Errorf("bad lock; count: %d", cnt)
++			}
++			return nil
++		}
++		rcs[i].release = func() error {
++			if err := m.Unlock(ctx); err != nil {
++				return err
++			}
++			cnt = 0
++			return nil
++		}
++	}
++	doRounds(rcs, rounds)
++}
+diff --git a/tools/functional-tester/etcd-runner/command/watch_command.go b/tools/functional-tester/etcd-runner/command/watch_command.go
+new file mode 100644
+index 0000000..87b9a66
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/command/watch_command.go
+@@ -0,0 +1,202 @@
++// Copyright 2016 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package command
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log"
++	"sync"
++	"time"
++
++	"github.com/coreos/etcd/clientv3"
++	"github.com/coreos/etcd/pkg/stringutil"
++	"github.com/spf13/cobra"
++	"golang.org/x/time/rate"
++)
++
++// NewWatchCommand returns the cobra command for "watcher runner".
++func NewWatchCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "watcher",
++		Short: "Performs watch operation",
++		Run:   runWatcherFunc,
++	}
++	cmd.Flags().IntVar(&rounds, "rounds", 100, "number of rounds to run")
++	return cmd
++}
++
++func runWatcherFunc(cmd *cobra.Command, args []string) {
++	if len(args) > 0 {
++		ExitWithError(ExitBadArgs, errors.New("watcher does not take any argument"))
++	}
++
++	ctx := context.Background()
++	for round := 0; round < rounds; round++ {
++		fmt.Println("round", round)
++		performWatchOnPrefixes(ctx, cmd, round)
++	}
++}
++
++func performWatchOnPrefixes(ctx context.Context, cmd *cobra.Command, round int) {
++	runningTime := 60 * time.Second // time for which operation should be performed
++	noOfPrefixes := 36              // total number of prefixes which will be watched upon
++	watchPerPrefix := 10            // number of watchers per prefix
++	reqRate := 30                   // put request per second
++	keyPrePrefix := 30              // max number of keyPrePrefixs for put operation
++
++	prefixes := stringutil.UniqueStrings(5, noOfPrefixes)
++	keys := stringutil.RandomStrings(10, keyPrePrefix)
++
++	roundPrefix := fmt.Sprintf("%16x", round)
++
++	eps := endpointsFromFlag(cmd)
++	dialTimeout := dialTimeoutFromCmd(cmd)
++
++	var (
++		revision int64
++		wg       sync.WaitGroup
++		gr       *clientv3.GetResponse
++		err      error
++	)
++
++	client := newClient(eps, dialTimeout)
++	defer client.Close()
++
++	gr, err = getKey(ctx, client, "non-existent")
++	if err != nil {
++		log.Fatalf("failed to get the initial revision: %v", err)
++	}
++	revision = gr.Header.Revision
++
++	ctxt, cancel := context.WithDeadline(ctx, time.Now().Add(runningTime))
++	defer cancel()
++
++	// generate and put keys in cluster
++	limiter := rate.NewLimiter(rate.Limit(reqRate), reqRate)
++
++	go func() {
++		for _, key := range keys {
++			for _, prefix := range prefixes {
++				if err = limiter.Wait(ctxt); err != nil {
++					return
++				}
++				if err = putKeyAtMostOnce(ctxt, client, roundPrefix+"-"+prefix+"-"+key); err != nil {
++					log.Fatalf("failed to put key: %v", err)
++					return
++				}
++			}
++		}
++	}()
++
++	ctxc, cancelc := context.WithCancel(ctx)
++
++	wcs := make([]clientv3.WatchChan, 0)
++	rcs := make([]*clientv3.Client, 0)
++
++	for _, prefix := range prefixes {
++		for j := 0; j < watchPerPrefix; j++ {
++			rc := newClient(eps, dialTimeout)
++			rcs = append(rcs, rc)
++
++			watchPrefix := roundPrefix + "-" + prefix
++
++			wc := rc.Watch(ctxc, watchPrefix, clientv3.WithPrefix(), clientv3.WithRev(revision))
++			wcs = append(wcs, wc)
++
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				checkWatchResponse(wc, watchPrefix, keys)
++			}()
++		}
++	}
++	wg.Wait()
++
++	cancelc()
++
++	// verify all watch channels are closed
++	for e, wc := range wcs {
++		if _, ok := <-wc; ok {
++			log.Fatalf("expected wc to be closed, but received %v", e)
++		}
++	}
++
++	for _, rc := range rcs {
++		rc.Close()
++	}
++
++	if err = deletePrefix(ctx, client, roundPrefix); err != nil {
++		log.Fatalf("failed to clean up keys after test: %v", err)
++	}
++}
++
++func checkWatchResponse(wc clientv3.WatchChan, prefix string, keys []string) {
++	for n := 0; n < len(keys); {
++		wr, more := <-wc
++		if !more {
++			log.Fatalf("expect more keys (received %d/%d) for %s", len(keys), n, prefix)
++		}
++		for _, event := range wr.Events {
++			expectedKey := prefix + "-" + keys[n]
++			receivedKey := string(event.Kv.Key)
++			if expectedKey != receivedKey {
++				log.Fatalf("expected key %q, got %q for prefix : %q\n", expectedKey, receivedKey, prefix)
++			}
++			n++
++		}
++	}
++}
++
++func putKeyAtMostOnce(ctx context.Context, client *clientv3.Client, key string) error {
++	gr, err := getKey(ctx, client, key)
++	if err != nil {
++		return err
++	}
++
++	var modrev int64
++	if len(gr.Kvs) > 0 {
++		modrev = gr.Kvs[0].ModRevision
++	}
++
++	for ctx.Err() == nil {
++		_, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(key), "=", modrev)).Then(clientv3.OpPut(key, key)).Commit()
++
++		if err == nil {
++			return nil
++		}
++	}
++
++	return ctx.Err()
++}
++
++func deletePrefix(ctx context.Context, client *clientv3.Client, key string) error {
++	for ctx.Err() == nil {
++		if _, err := client.Delete(ctx, key, clientv3.WithPrefix()); err == nil {
++			return nil
++		}
++	}
++	return ctx.Err()
++}
++
++func getKey(ctx context.Context, client *clientv3.Client, key string) (*clientv3.GetResponse, error) {
++	for ctx.Err() == nil {
++		if gr, err := client.Get(ctx, key); err == nil {
++			return gr, nil
++		}
++	}
++	return nil, ctx.Err()
++}
+diff --git a/tools/functional-tester/etcd-runner/election.go b/tools/functional-tester/etcd-runner/election.go
+deleted file mode 100644
+index d0762d1..0000000
+--- a/tools/functional-tester/etcd-runner/election.go
++++ /dev/null
+@@ -1,105 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package main
+-
+-import (
+-	"context"
+-	"fmt"
+-
+-	"github.com/coreos/etcd/clientv3/concurrency"
+-)
+-
+-func runElection(getClient getClientFunc, rounds int) {
+-	rcs := make([]roundClient, 15)
+-	validatec, releasec := make(chan struct{}, len(rcs)), make(chan struct{}, len(rcs))
+-	for range rcs {
+-		releasec <- struct{}{}
+-	}
+-
+-	for i := range rcs {
+-		v := fmt.Sprintf("%d", i)
+-		observedLeader := ""
+-		validateWaiters := 0
+-
+-		rcs[i].c = getClient()
+-		var (
+-			s   *concurrency.Session
+-			err error
+-		)
+-		for {
+-			s, err = concurrency.NewSession(rcs[i].c)
+-			if err == nil {
+-				break
+-			}
+-		}
+-		e := concurrency.NewElection(s, "electors")
+-
+-		rcs[i].acquire = func() error {
+-			<-releasec
+-			ctx, cancel := context.WithCancel(context.Background())
+-			go func() {
+-				if ol, ok := <-e.Observe(ctx); ok {
+-					observedLeader = string(ol.Kvs[0].Value)
+-					if observedLeader != v {
+-						cancel()
+-					}
+-				}
+-			}()
+-			err = e.Campaign(ctx, v)
+-			if err == nil {
+-				observedLeader = v
+-			}
+-			if observedLeader == v {
+-				validateWaiters = len(rcs)
+-			}
+-			select {
+-			case <-ctx.Done():
+-				return nil
+-			default:
+-				cancel()
+-				return err
+-			}
+-		}
+-		rcs[i].validate = func() error {
+-			if l, err := e.Leader(context.TODO()); err == nil && l != observedLeader {
+-				return fmt.Errorf("expected leader %q, got %q", observedLeader, l)
+-			}
+-			validatec <- struct{}{}
+-			return nil
+-		}
+-		rcs[i].release = func() error {
+-			for validateWaiters > 0 {
+-				select {
+-				case <-validatec:
+-					validateWaiters--
+-				default:
+-					return fmt.Errorf("waiting on followers")
+-				}
+-			}
+-			if err := e.Resign(context.TODO()); err != nil {
+-				return err
+-			}
+-			if observedLeader == v {
+-				for range rcs {
+-					releasec <- struct{}{}
+-				}
+-			}
+-			observedLeader = ""
+-			return nil
+-		}
+-	}
+-
+-	doRounds(rcs, rounds)
+-}
+diff --git a/tools/functional-tester/etcd-runner/help.go b/tools/functional-tester/etcd-runner/help.go
+new file mode 100644
+index 0000000..18eec45
+--- /dev/null
++++ b/tools/functional-tester/etcd-runner/help.go
+@@ -0,0 +1,174 @@
++// Copyright 2015 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// copied from https://github.com/coreos/rkt/blob/master/rkt/help.go
++
++package main
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++	"strings"
++	"text/tabwriter"
++	"text/template"
++
++	"github.com/coreos/etcd/version"
++	"github.com/spf13/cobra"
++	"github.com/spf13/pflag"
++)
++
++var (
++	commandUsageTemplate *template.Template
++	templFuncs           = template.FuncMap{
++		"descToLines": func(s string) []string {
++			// trim leading/trailing whitespace and split into slice of lines
++			return strings.Split(strings.Trim(s, "\n\t "), "\n")
++		},
++		"cmdName": func(cmd *cobra.Command, startCmd *cobra.Command) string {
++			parts := []string{cmd.Name()}
++			for cmd.HasParent() && cmd.Parent().Name() != startCmd.Name() {
++				cmd = cmd.Parent()
++				parts = append([]string{cmd.Name()}, parts...)
++			}
++			return strings.Join(parts, " ")
++		},
++	}
++)
++
++func init() {
++	commandUsage := `
++{{ $cmd := .Cmd }}\
++{{ $cmdname := cmdName .Cmd .Cmd.Root }}\
++NAME:
++{{ if not .Cmd.HasParent }}\
++{{printf "\t%s - %s" .Cmd.Name .Cmd.Short}}
++{{else}}\
++{{printf "\t%s - %s" $cmdname .Cmd.Short}}
++{{end}}\
++
++USAGE:
++{{printf "\t%s" .Cmd.UseLine}}
++{{ if not .Cmd.HasParent }}\
++
++VERSION:
++{{printf "\t%s" .Version}}
++{{end}}\
++{{if .Cmd.HasSubCommands}}\
++
++API VERSION:
++{{printf "\t%s" .APIVersion}}
++{{end}}\
++{{if .Cmd.HasSubCommands}}\
++
++
++COMMANDS:
++{{range .SubCommands}}\
++{{ $cmdname := cmdName . $cmd }}\
++{{ if .Runnable }}\
++{{printf "\t%s\t%s" $cmdname .Short}}
++{{end}}\
++{{end}}\
++{{end}}\
++{{ if .Cmd.Long }}\
++
++DESCRIPTION:
++{{range $line := descToLines .Cmd.Long}}{{printf "\t%s" $line}}
++{{end}}\
++{{end}}\
++{{if .Cmd.HasLocalFlags}}\
++
++OPTIONS:
++{{.LocalFlags}}\
++{{end}}\
++{{if .Cmd.HasInheritedFlags}}\
++
++GLOBAL OPTIONS:
++{{.GlobalFlags}}\
++{{end}}
++`[1:]
++
++	commandUsageTemplate = template.Must(template.New("command_usage").Funcs(templFuncs).Parse(strings.Replace(commandUsage, "\\\n", "", -1)))
++}
++
++func etcdFlagUsages(flagSet *pflag.FlagSet) string {
++	x := new(bytes.Buffer)
++
++	flagSet.VisitAll(func(flag *pflag.Flag) {
++		if len(flag.Deprecated) > 0 {
++			return
++		}
++		format := ""
++		if len(flag.Shorthand) > 0 {
++			format = "  -%s, --%s"
++		} else {
++			format = "   %s   --%s"
++		}
++		if len(flag.NoOptDefVal) > 0 {
++			format = format + "["
++		}
++		if flag.Value.Type() == "string" {
++			// put quotes on the value
++			format = format + "=%q"
++		} else {
++			format = format + "=%s"
++		}
++		if len(flag.NoOptDefVal) > 0 {
++			format = format + "]"
++		}
++		format = format + "\t%s\n"
++		shorthand := flag.Shorthand
++		fmt.Fprintf(x, format, shorthand, flag.Name, flag.DefValue, flag.Usage)
++	})
++
++	return x.String()
++}
++
++func getSubCommands(cmd *cobra.Command) []*cobra.Command {
++	var subCommands []*cobra.Command
++	for _, subCmd := range cmd.Commands() {
++		subCommands = append(subCommands, subCmd)
++		subCommands = append(subCommands, getSubCommands(subCmd)...)
++	}
++	return subCommands
++}
++
++func usageFunc(cmd *cobra.Command) error {
++	subCommands := getSubCommands(cmd)
++	tabOut := getTabOutWithWriter(os.Stdout)
++	commandUsageTemplate.Execute(tabOut, struct {
++		Cmd         *cobra.Command
++		LocalFlags  string
++		GlobalFlags string
++		SubCommands []*cobra.Command
++		Version     string
++		APIVersion  string
++	}{
++		cmd,
++		etcdFlagUsages(cmd.LocalFlags()),
++		etcdFlagUsages(cmd.InheritedFlags()),
++		subCommands,
++		version.Version,
++		version.APIVersion,
++	})
++	tabOut.Flush()
++	return nil
++}
++
++func getTabOutWithWriter(writer io.Writer) *tabwriter.Writer {
++	aTabOut := new(tabwriter.Writer)
++	aTabOut.Init(writer, 0, 8, 1, '\t', 0)
++	return aTabOut
++}
+diff --git a/tools/functional-tester/etcd-runner/lease_renewer.go b/tools/functional-tester/etcd-runner/lease_renewer.go
+deleted file mode 100644
+index b06a681..0000000
+--- a/tools/functional-tester/etcd-runner/lease_renewer.go
++++ /dev/null
+@@ -1,68 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package main
+-
+-import (
+-	"context"
+-	"fmt"
+-	"log"
+-	"time"
+-
+-	"github.com/coreos/etcd/clientv3"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/codes"
+-)
+-
+-func runLeaseRenewer(getClient getClientFunc) {
+-	c := getClient()
+-	ctx := context.Background()
+-
+-	for {
+-		var (
+-			l   *clientv3.LeaseGrantResponse
+-			lk  *clientv3.LeaseKeepAliveResponse
+-			err error
+-		)
+-		for {
+-			l, err = c.Lease.Grant(ctx, 5)
+-			if err == nil {
+-				break
+-			}
+-		}
+-		expire := time.Now().Add(time.Duration(l.TTL-1) * time.Second)
+-
+-		for {
+-			lk, err = c.Lease.KeepAliveOnce(ctx, l.ID)
+-			if grpc.Code(err) == codes.NotFound {
+-				if time.Since(expire) < 0 {
+-					log.Printf("bad renew! exceeded: %v", time.Since(expire))
+-					for {
+-						lk, err = c.Lease.KeepAliveOnce(ctx, l.ID)
+-						fmt.Println(lk, err)
+-						time.Sleep(time.Second)
+-					}
+-				}
+-				log.Printf("lost lease %d, expire: %v\n", l.ID, expire)
+-				break
+-			}
+-			if err != nil {
+-				continue
+-			}
+-			expire = time.Now().Add(time.Duration(lk.TTL-1) * time.Second)
+-			log.Printf("renewed lease %d, expire: %v\n", lk.ID, expire)
+-			time.Sleep(time.Duration(lk.TTL-2) * time.Second)
+-		}
+-	}
+-}
+diff --git a/tools/functional-tester/etcd-runner/lock_racer.go b/tools/functional-tester/etcd-runner/lock_racer.go
+deleted file mode 100644
+index 63c706e..0000000
+--- a/tools/functional-tester/etcd-runner/lock_racer.go
++++ /dev/null
+@@ -1,57 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package main
+-
+-import (
+-	"context"
+-	"fmt"
+-
+-	"github.com/coreos/etcd/clientv3/concurrency"
+-)
+-
+-func runRacer(getClient getClientFunc, round int) {
+-	rcs := make([]roundClient, 15)
+-	ctx := context.Background()
+-	cnt := 0
+-	for i := range rcs {
+-		rcs[i].c = getClient()
+-		var (
+-			s   *concurrency.Session
+-			err error
+-		)
+-		for {
+-			s, err = concurrency.NewSession(rcs[i].c)
+-			if err == nil {
+-				break
+-			}
+-		}
+-		m := concurrency.NewMutex(s, "racers")
+-		rcs[i].acquire = func() error { return m.Lock(ctx) }
+-		rcs[i].validate = func() error {
+-			if cnt++; cnt != 1 {
+-				return fmt.Errorf("bad lock; count: %d", cnt)
+-			}
+-			return nil
+-		}
+-		rcs[i].release = func() error {
+-			if err := m.Unlock(ctx); err != nil {
+-				return err
+-			}
+-			cnt = 0
+-			return nil
+-		}
+-	}
+-	doRounds(rcs, round)
+-}
+diff --git a/tools/functional-tester/etcd-runner/main.go b/tools/functional-tester/etcd-runner/main.go
+index 360aefe..89e0aba 100644
+--- a/tools/functional-tester/etcd-runner/main.go
++++ b/tools/functional-tester/etcd-runner/main.go
+@@ -12,121 +12,64 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// etcd-runner is a command line application that performs tests on etcd.
+ package main
+ 
+ import (
+-	"flag"
+-	"fmt"
+ 	"log"
+-	"math/rand"
+-	"os"
+-	"strings"
+-	"sync"
+ 	"time"
+ 
+-	"github.com/coreos/etcd/clientv3"
++	"github.com/coreos/etcd/tools/functional-tester/etcd-runner/command"
++	"github.com/spf13/cobra"
+ )
+ 
+-func init() {
+-	rand.Seed(time.Now().UTC().UnixNano())
+-}
+-
+-func main() {
+-	log.SetFlags(log.Lmicroseconds)
+-
+-	endpointStr := flag.String("endpoints", "localhost:2379", "endpoints of etcd cluster")
+-	mode := flag.String("mode", "watcher", "test mode (election, lock-racer, lease-renewer, watcher)")
+-	round := flag.Int("rounds", 100, "number of rounds to run")
+-	clientTimeout := flag.Int("client-timeout", 60, "max timeout seconds for a client to get connection")
+-	flag.Parse()
++const (
++	cliName        = "etcdctl"
++	cliDescription = "A simple command line client for etcd3."
+ 
+-	eps := strings.Split(*endpointStr, ",")
++	defaultDialTimeout = 2 * time.Second
++)
+ 
+-	getClient := func() *clientv3.Client { return newClient(eps, *clientTimeout) }
++var (
++	globalFlags = command.GlobalFlags{}
++)
+ 
+-	switch *mode {
+-	case "election":
+-		runElection(getClient, *round)
+-	case "lock-racer":
+-		runRacer(getClient, *round)
+-	case "lease-renewer":
+-		runLeaseRenewer(getClient)
+-	case "watcher":
+-		runWatcher(getClient, *round)
+-	default:
+-		fmt.Fprintf(os.Stderr, "unsupported mode %v\n", *mode)
++var (
++	rootCmd = &cobra.Command{
++		Use:        cliName,
++		Short:      cliDescription,
++		SuggestFor: []string{"etcdctl"},
+ 	}
+-}
+-
+-type getClientFunc func() *clientv3.Client
++)
+ 
+-func newClient(eps []string, timeout int) *clientv3.Client {
+-	c, err := clientv3.New(clientv3.Config{
+-		Endpoints:   eps,
+-		DialTimeout: time.Duration(timeout) * time.Second,
+-	})
+-	if err != nil {
+-		log.Fatal(err)
+-	}
+-	return c
++func init() {
++	log.SetFlags(log.Lmicroseconds)
++	rootCmd.PersistentFlags().StringSliceVar(&globalFlags.Endpoints, "endpoints", []string{"127.0.0.1:2379"}, "gRPC endpoints")
++	rootCmd.PersistentFlags().DurationVar(&globalFlags.DialTimeout, "dial-timeout", defaultDialTimeout, "dial timeout for client connections")
++
++	rootCmd.AddCommand(
++		command.NewElectionCommand(),
++		command.NewLeaseRenewerCommand(),
++		command.NewLockRacerCommand(),
++		command.NewWatchCommand(),
++	)
+ }
+ 
+-type roundClient struct {
+-	c        *clientv3.Client
+-	progress int
+-	acquire  func() error
+-	validate func() error
+-	release  func() error
++func init() {
++	cobra.EnablePrefixMatching = true
+ }
+ 
+-func doRounds(rcs []roundClient, rounds int) {
+-	var mu sync.Mutex
+-	var wg sync.WaitGroup
+-
+-	wg.Add(len(rcs))
+-	finished := make(chan struct{}, 0)
+-	for i := range rcs {
+-		go func(rc *roundClient) {
+-			defer wg.Done()
+-			for rc.progress < rounds {
+-				for rc.acquire() != nil { /* spin */
+-				}
+-
+-				mu.Lock()
+-				if err := rc.validate(); err != nil {
+-					log.Fatal(err)
+-				}
+-				mu.Unlock()
++func Start() {
++	rootCmd.SetUsageFunc(usageFunc)
+ 
+-				time.Sleep(10 * time.Millisecond)
+-				rc.progress++
+-				finished <- struct{}{}
++	// Make help just show the usage
++	rootCmd.SetHelpTemplate(`{{.UsageString}}`)
+ 
+-				mu.Lock()
+-				for rc.release() != nil {
+-					mu.Unlock()
+-					mu.Lock()
+-				}
+-				mu.Unlock()
+-			}
+-		}(&rcs[i])
++	if err := rootCmd.Execute(); err != nil {
++		command.ExitWithError(command.ExitError, err)
+ 	}
++}
+ 
+-	start := time.Now()
+-	for i := 1; i < len(rcs)*rounds+1; i++ {
+-		select {
+-		case <-finished:
+-			if i%100 == 0 {
+-				fmt.Printf("finished %d, took %v\n", i, time.Since(start))
+-				start = time.Now()
+-			}
+-		case <-time.After(time.Minute):
+-			log.Panic("no progress after 1 minute!")
+-		}
+-	}
+-	wg.Wait()
+-
+-	for _, rc := range rcs {
+-		rc.c.Close()
+-	}
++func main() {
++	Start()
+ }
+diff --git a/tools/functional-tester/etcd-runner/watcher.go b/tools/functional-tester/etcd-runner/watcher.go
+deleted file mode 100644
+index 8fd1f57..0000000
+--- a/tools/functional-tester/etcd-runner/watcher.go
++++ /dev/null
+@@ -1,182 +0,0 @@
+-// Copyright 2016 The etcd Authors
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package main
+-
+-import (
+-	"context"
+-	"fmt"
+-	"log"
+-	"sync"
+-	"time"
+-
+-	"github.com/coreos/etcd/clientv3"
+-	"github.com/coreos/etcd/pkg/stringutil"
+-	"golang.org/x/time/rate"
+-)
+-
+-func runWatcher(getClient getClientFunc, limit int) {
+-	ctx := context.Background()
+-	for round := 0; round < limit; round++ {
+-		fmt.Println("round", round)
+-		performWatchOnPrefixes(ctx, getClient, round)
+-	}
+-}
+-
+-func performWatchOnPrefixes(ctx context.Context, getClient getClientFunc, round int) {
+-	runningTime := 60 * time.Second // time for which operation should be performed
+-	noOfPrefixes := 36              // total number of prefixes which will be watched upon
+-	watchPerPrefix := 10            // number of watchers per prefix
+-	reqRate := 30                   // put request per second
+-	keyPrePrefix := 30              // max number of keyPrePrefixs for put operation
+-
+-	prefixes := stringutil.UniqueStrings(5, noOfPrefixes)
+-	keys := stringutil.RandomStrings(10, keyPrePrefix)
+-
+-	roundPrefix := fmt.Sprintf("%16x", round)
+-
+-	var (
+-		revision int64
+-		wg       sync.WaitGroup
+-		gr       *clientv3.GetResponse
+-		err      error
+-	)
+-
+-	client := getClient()
+-	defer client.Close()
+-
+-	gr, err = getKey(ctx, client, "non-existent")
+-	if err != nil {
+-		log.Fatalf("failed to get the initial revision: %v", err)
+-	}
+-	revision = gr.Header.Revision
+-
+-	ctxt, cancel := context.WithDeadline(ctx, time.Now().Add(runningTime))
+-	defer cancel()
+-
+-	// generate and put keys in cluster
+-	limiter := rate.NewLimiter(rate.Limit(reqRate), reqRate)
+-
+-	go func() {
+-		for _, key := range keys {
+-			for _, prefix := range prefixes {
+-				if err = limiter.Wait(ctxt); err != nil {
+-					return
+-				}
+-				if err = putKeyAtMostOnce(ctxt, client, roundPrefix+"-"+prefix+"-"+key); err != nil {
+-					log.Fatalf("failed to put key: %v", err)
+-					return
+-				}
+-			}
+-		}
+-	}()
+-
+-	ctxc, cancelc := context.WithCancel(ctx)
+-
+-	wcs := make([]clientv3.WatchChan, 0)
+-	rcs := make([]*clientv3.Client, 0)
+-
+-	for _, prefix := range prefixes {
+-		for j := 0; j < watchPerPrefix; j++ {
+-			rc := getClient()
+-			rcs = append(rcs, rc)
+-
+-			watchPrefix := roundPrefix + "-" + prefix
+-
+-			wc := rc.Watch(ctxc, watchPrefix, clientv3.WithPrefix(), clientv3.WithRev(revision))
+-			wcs = append(wcs, wc)
+-
+-			wg.Add(1)
+-			go func() {
+-				defer wg.Done()
+-				checkWatchResponse(wc, watchPrefix, keys)
+-			}()
+-		}
+-	}
+-	wg.Wait()
+-
+-	cancelc()
+-
+-	// verify all watch channels are closed
+-	for e, wc := range wcs {
+-		if _, ok := <-wc; ok {
+-			log.Fatalf("expected wc to be closed, but received %v", e)
+-		}
+-	}
+-
+-	for _, rc := range rcs {
+-		rc.Close()
+-	}
+-
+-	if err = deletePrefix(ctx, client, roundPrefix); err != nil {
+-		log.Fatalf("failed to clean up keys after test: %v", err)
+-	}
+-}
+-
+-func checkWatchResponse(wc clientv3.WatchChan, prefix string, keys []string) {
+-	for n := 0; n < len(keys); {
+-		wr, more := <-wc
+-		if !more {
+-			log.Fatalf("expect more keys (received %d/%d) for %s", len(keys), n, prefix)
+-		}
+-		for _, event := range wr.Events {
+-			expectedKey := prefix + "-" + keys[n]
+-			receivedKey := string(event.Kv.Key)
+-			if expectedKey != receivedKey {
+-				log.Fatalf("expected key %q, got %q for prefix : %q\n", expectedKey, receivedKey, prefix)
+-			}
+-			n++
+-		}
+-	}
+-}
+-
+-func putKeyAtMostOnce(ctx context.Context, client *clientv3.Client, key string) error {
+-	gr, err := getKey(ctx, client, key)
+-	if err != nil {
+-		return err
+-	}
+-
+-	var modrev int64
+-	if len(gr.Kvs) > 0 {
+-		modrev = gr.Kvs[0].ModRevision
+-	}
+-
+-	for ctx.Err() == nil {
+-		_, err := client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(key), "=", modrev)).Then(clientv3.OpPut(key, key)).Commit()
+-
+-		if err == nil {
+-			return nil
+-		}
+-	}
+-
+-	return ctx.Err()
+-}
+-
+-func deletePrefix(ctx context.Context, client *clientv3.Client, key string) error {
+-	for ctx.Err() == nil {
+-		if _, err := client.Delete(ctx, key, clientv3.WithPrefix()); err == nil {
+-			return nil
+-		}
+-	}
+-	return ctx.Err()
+-}
+-
+-func getKey(ctx context.Context, client *clientv3.Client, key string) (*clientv3.GetResponse, error) {
+-	for ctx.Err() == nil {
+-		if gr, err := client.Get(ctx, key); err == nil {
+-			return gr, nil
+-		}
+-	}
+-	return nil, ctx.Err()
+-}

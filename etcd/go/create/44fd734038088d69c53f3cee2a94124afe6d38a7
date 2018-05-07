@@ -1,0 +1,326 @@
+commit 44fd734038088d69c53f3cee2a94124afe6d38a7
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Fri Aug 28 22:04:19 2015 -0700
+
+    storage/backend: add unit tests for backend and batchTx
+
+diff --git a/storage/backend/backend_test.go b/storage/backend/backend_test.go
+index 55d9549..d5d8cd9 100644
+--- a/storage/backend/backend_test.go
++++ b/storage/backend/backend_test.go
+@@ -1,29 +1,113 @@
+ package backend
+ 
+ import (
++	"io/ioutil"
++	"log"
+ 	"os"
+-	"reflect"
++	"path"
+ 	"testing"
+ 	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/boltdb/bolt"
++	"github.com/coreos/etcd/pkg/testutil"
+ )
+ 
+-func TestBackendPut(t *testing.T) {
+-	backend := New("test", 10*time.Second, 10000)
+-	defer backend.Close()
+-	defer os.Remove("test")
++var tmpPath string
+ 
+-	v := []byte("foo")
++func init() {
++	dir, err := ioutil.TempDir(os.TempDir(), "etcd_backend_test")
++	if err != nil {
++		log.Fatal(err)
++	}
++	tmpPath = path.Join(dir, "database")
++}
+ 
+-	batchTx := backend.BatchTx()
+-	batchTx.Lock()
++func TestBackendClose(t *testing.T) {
++	b := newBackend(tmpPath, time.Hour, 10000)
++	defer os.Remove(tmpPath)
+ 
+-	batchTx.UnsafeCreateBucket([]byte("test"))
++	// check close could work
++	done := make(chan struct{})
++	go func() {
++		err := b.Close()
++		if err != nil {
++			t.Errorf("close error = %v, want nil", err)
++		}
++		done <- struct{}{}
++	}()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Errorf("failed to close database in 1s")
++	}
++}
+ 
+-	batchTx.UnsafePut([]byte("test"), []byte("foo"), v)
+-	_, gv := batchTx.UnsafeRange([]byte("test"), v, nil, -1)
+-	if !reflect.DeepEqual(gv[0], v) {
+-		t.Errorf("v = %s, want %s", string(gv[0]), string(v))
++func TestBackendSnapshot(t *testing.T) {
++	b := New(tmpPath, time.Hour, 10000)
++	defer cleanup(b, tmpPath)
++
++	tx := b.BatchTx()
++	tx.Lock()
++	tx.UnsafeCreateBucket([]byte("test"))
++	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
++	tx.Unlock()
++	b.ForceCommit()
++
++	// write snapshot to a new file
++	f, err := ioutil.TempFile(os.TempDir(), "etcd_backend_test")
++	if err != nil {
++		t.Fatal(err)
+ 	}
++	_, err = b.Snapshot(f)
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.Close()
++
++	// bootstrap new backend from the snapshot
++	nb := New(f.Name(), time.Hour, 10000)
++	defer cleanup(nb, f.Name())
++
++	newTx := b.BatchTx()
++	newTx.Lock()
++	ks, _ := newTx.UnsafeRange([]byte("test"), []byte("foo"), []byte("goo"), 0)
++	if len(ks) != 1 {
++		t.Errorf("len(kvs) = %d, want 1", len(ks))
++	}
++	newTx.Unlock()
++}
++
++func TestBackendBatchIntervalCommit(t *testing.T) {
++	// start backend with super short batch interval
++	b := newBackend(tmpPath, time.Nanosecond, 10000)
++	defer cleanup(b, tmpPath)
++
++	tx := b.BatchTx()
++	tx.Lock()
++	tx.UnsafeCreateBucket([]byte("test"))
++	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
++	tx.Unlock()
++
++	// give time for batch interval commit to happen
++	time.Sleep(time.Nanosecond)
++	testutil.WaitSchedule()
++
++	// check whether put happens via db view
++	b.db.View(func(tx *bolt.Tx) error {
++		bucket := tx.Bucket([]byte("test"))
++		if bucket == nil {
++			t.Errorf("bucket test does not exit")
++			return nil
++		}
++		v := bucket.Get([]byte("foo"))
++		if v == nil {
++			t.Errorf("foo key failed to written in backend")
++		}
++		return nil
++	})
++}
+ 
+-	batchTx.Unlock()
++func cleanup(b Backend, path string) {
++	b.Close()
++	os.Remove(path)
+ }
+diff --git a/storage/backend/batch_tx_test.go b/storage/backend/batch_tx_test.go
+new file mode 100644
+index 0000000..9328b45
+--- /dev/null
++++ b/storage/backend/batch_tx_test.go
+@@ -0,0 +1,182 @@
++package backend
++
++import (
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/boltdb/bolt"
++)
++
++func TestBatchTxPut(t *testing.T) {
++	b := newBackend(tmpPath, time.Hour, 10000)
++	defer cleanup(b, tmpPath)
++
++	tx := b.batchTx
++	tx.Lock()
++	defer tx.Unlock()
++
++	// create bucket
++	tx.UnsafeCreateBucket([]byte("test"))
++
++	// put
++	v := []byte("bar")
++	tx.UnsafePut([]byte("test"), []byte("foo"), v)
++
++	// check put result before and after tx is committed
++	for k := 0; k < 2; k++ {
++		_, gv := tx.UnsafeRange([]byte("test"), []byte("foo"), nil, 0)
++		if !reflect.DeepEqual(gv[0], v) {
++			t.Errorf("v = %s, want %s", string(gv[0]), string(v))
++		}
++		tx.commit(false)
++	}
++}
++
++func TestBatchTxRange(t *testing.T) {
++	b := newBackend(tmpPath, time.Hour, 10000)
++	defer cleanup(b, tmpPath)
++
++	tx := b.batchTx
++	tx.Lock()
++	defer tx.Unlock()
++
++	tx.UnsafeCreateBucket([]byte("test"))
++	// put keys
++	allKeys := [][]byte{[]byte("foo"), []byte("foo1"), []byte("foo2")}
++	allVals := [][]byte{[]byte("bar"), []byte("bar1"), []byte("bar2")}
++	for i := range allKeys {
++		tx.UnsafePut([]byte("test"), allKeys[i], allVals[i])
++	}
++
++	tests := []struct {
++		key    []byte
++		endKey []byte
++		limit  int64
++
++		wkeys [][]byte
++		wvals [][]byte
++	}{
++		// single key
++		{
++			[]byte("foo"), nil, 0,
++			allKeys[:1], allVals[:1],
++		},
++		// single key, bad
++		{
++			[]byte("doo"), nil, 0,
++			nil, nil,
++		},
++		// key range
++		{
++			[]byte("foo"), []byte("foo1"), 0,
++			allKeys[:1], allVals[:1],
++		},
++		// key range, get all keys
++		{
++			[]byte("foo"), []byte("foo3"), 0,
++			allKeys, allVals,
++		},
++		// key range, bad
++		{
++			[]byte("goo"), []byte("goo3"), 0,
++			nil, nil,
++		},
++		// key range with effective limit
++		{
++			[]byte("foo"), []byte("foo3"), 1,
++			allKeys[:1], allVals[:1],
++		},
++		// key range with limit
++		{
++			[]byte("foo"), []byte("foo3"), 4,
++			allKeys, allVals,
++		},
++	}
++	for i, tt := range tests {
++		keys, vals := tx.UnsafeRange([]byte("test"), tt.key, tt.endKey, tt.limit)
++		if !reflect.DeepEqual(keys, tt.wkeys) {
++			t.Errorf("#%d: keys = %+v, want %+v", i, keys, tt.wkeys)
++		}
++		if !reflect.DeepEqual(vals, tt.wvals) {
++			t.Errorf("#%d: vals = %+v, want %+v", i, vals, tt.wvals)
++		}
++	}
++}
++
++func TestBatchTxDelete(t *testing.T) {
++	b := newBackend(tmpPath, time.Hour, 10000)
++	defer cleanup(b, tmpPath)
++
++	tx := b.batchTx
++	tx.Lock()
++	defer tx.Unlock()
++
++	tx.UnsafeCreateBucket([]byte("test"))
++	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
++
++	tx.UnsafeDelete([]byte("test"), []byte("foo"))
++
++	// check put result before and after tx is committed
++	for k := 0; k < 2; k++ {
++		ks, _ := tx.UnsafeRange([]byte("test"), []byte("foo"), nil, 0)
++		if len(ks) != 0 {
++			t.Errorf("keys on foo = %v, want nil", ks)
++		}
++		tx.commit(false)
++	}
++}
++
++func TestBatchTxCommit(t *testing.T) {
++	b := newBackend(tmpPath, time.Hour, 10000)
++	defer cleanup(b, tmpPath)
++
++	tx := b.batchTx
++	tx.Lock()
++	tx.UnsafeCreateBucket([]byte("test"))
++	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
++	tx.Unlock()
++
++	tx.Commit()
++
++	// check whether put happens via db view
++	b.db.View(func(tx *bolt.Tx) error {
++		bucket := tx.Bucket([]byte("test"))
++		if bucket == nil {
++			t.Errorf("bucket test does not exit")
++			return nil
++		}
++		v := bucket.Get([]byte("foo"))
++		if v == nil {
++			t.Errorf("foo key failed to written in backend")
++		}
++		return nil
++	})
++}
++
++func TestBatchTxBatchLimitCommit(t *testing.T) {
++	// start backend with batch limit 1
++	b := newBackend(tmpPath, time.Hour, 1)
++	defer cleanup(b, tmpPath)
++
++	tx := b.batchTx
++	tx.Lock()
++	tx.UnsafeCreateBucket([]byte("test"))
++	tx.UnsafePut([]byte("test"), []byte("foo"), []byte("bar"))
++	tx.Unlock()
++
++	// batch limit commit should have been triggered
++	// check whether put happens via db view
++	b.db.View(func(tx *bolt.Tx) error {
++		bucket := tx.Bucket([]byte("test"))
++		if bucket == nil {
++			t.Errorf("bucket test does not exit")
++			return nil
++		}
++		v := bucket.Get([]byte("foo"))
++		if v == nil {
++			t.Errorf("foo key failed to written in backend")
++		}
++		return nil
++	})
++}

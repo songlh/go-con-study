@@ -1,0 +1,1270 @@
+commit 40021ab72e179982d68d76ae6ee38f7a01e9b5da
+Author: Brandon Philips <brandon@ifup.co>
+Date:   Sun Feb 2 17:41:30 2014 -0800
+
+    bump(github.com/coreos/go-etcd): 526d936ffe75284ca80290ea6386f883f573c232
+
+diff --git a/etcd.go b/etcd.go
+index 5edee4c..25455c6 100644
+--- a/etcd.go
++++ b/etcd.go
+@@ -26,8 +26,8 @@ import (
+ 
+ 	"github.com/coreos/etcd/third_party/github.com/coreos/raft"
+ 
+-	ehttp "github.com/coreos/etcd/http"
+ 	"github.com/coreos/etcd/config"
++	ehttp "github.com/coreos/etcd/http"
+ 	"github.com/coreos/etcd/log"
+ 	"github.com/coreos/etcd/metrics"
+ 	"github.com/coreos/etcd/server"
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/client.go b/third_party/github.com/coreos/go-etcd/etcd/client.go
+index caa5fe2..48ba9b4 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/client.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/client.go
+@@ -12,15 +12,9 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"path"
+-	"strings"
+ 	"time"
+ )
+ 
+-const (
+-	HTTP = iota
+-	HTTPS
+-)
+-
+ // See SetConsistency for how to use these constants.
+ const (
+ 	// Using strings rather than iota because the consistency level
+@@ -34,121 +28,174 @@ const (
+ 	defaultBufferSize = 10
+ )
+ 
+-type Cluster struct {
+-	Leader   string   `json:"leader"`
+-	Machines []string `json:"machines"`
+-}
+-
+ type Config struct {
+ 	CertFile    string        `json:"certFile"`
+ 	KeyFile     string        `json:"keyFile"`
+-	CaCertFile  string        `json:"caCertFile"`
+-	Scheme      string        `json:"scheme"`
++	CaCertFile  []string      `json:"caCertFiles"`
+ 	Timeout     time.Duration `json:"timeout"`
+ 	Consistency string        `json: "consistency"`
+ }
+ 
+ type Client struct {
+-	cluster     Cluster `json:"cluster"`
+-	config      Config  `json:"config"`
++	config      Config   `json:"config"`
++	cluster     *Cluster `json:"cluster"`
+ 	httpClient  *http.Client
+ 	persistence io.Writer
+ 	cURLch      chan string
++	keyPrefix   string
+ }
+ 
+ // NewClient create a basic client that is configured to be used
+ // with the given machine list.
+ func NewClient(machines []string) *Client {
+-	// if an empty slice was sent in then just assume localhost
+-	if len(machines) == 0 {
+-		machines = []string{"http://127.0.0.1:4001"}
++	config := Config{
++		// default timeout is one second
++		Timeout: time.Second,
++		// default consistency level is STRONG
++		Consistency: STRONG_CONSISTENCY,
+ 	}
+ 
+-	// default leader and machines
+-	cluster := Cluster{
+-		Leader:   machines[0],
+-		Machines: machines,
++	client := &Client{
++		cluster:   NewCluster(machines),
++		config:    config,
++		keyPrefix: path.Join(version, "keys"),
++	}
++
++	client.initHTTPClient()
++	client.saveConfig()
++
++	return client
++}
++
++// NewTLSClient create a basic client with TLS configuration
++func NewTLSClient(machines []string, cert, key, caCert string) (*Client, error) {
++	// overwrite the default machine to use https
++	if len(machines) == 0 {
++		machines = []string{"https://127.0.0.1:4001"}
+ 	}
+ 
+ 	config := Config{
+-		// default use http
+-		Scheme: "http",
+ 		// default timeout is one second
+ 		Timeout: time.Second,
+ 		// default consistency level is STRONG
+ 		Consistency: STRONG_CONSISTENCY,
++		CertFile:    cert,
++		KeyFile:     key,
++		CaCertFile:  make([]string, 0),
+ 	}
+ 
+ 	client := &Client{
+-		cluster: cluster,
+-		config:  config,
++		cluster:   NewCluster(machines),
++		config:    config,
++		keyPrefix: path.Join(version, "keys"),
+ 	}
+ 
+-	err := setupHttpClient(client)
++	err := client.initHTTPSClient(cert, key)
+ 	if err != nil {
+-		panic(err)
++		return nil, err
+ 	}
+ 
+-	return client
++	err = client.AddRootCA(caCert)
++
++	client.saveConfig()
++
++	return client, nil
+ }
+ 
+-// NewClientFile creates a client from a given file path.
++// NewClientFromFile creates a client from a given file path.
+ // The given file is expected to use the JSON format.
+-func NewClientFile(fpath string) (*Client, error) {
++func NewClientFromFile(fpath string) (*Client, error) {
+ 	fi, err := os.Open(fpath)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++
+ 	defer func() {
+ 		if err := fi.Close(); err != nil {
+ 			panic(err)
+ 		}
+ 	}()
+ 
+-	return NewClientReader(fi)
++	return NewClientFromReader(fi)
+ }
+ 
+-// NewClientReader creates a Client configured from a given reader.
+-// The config is expected to use the JSON format.
+-func NewClientReader(reader io.Reader) (*Client, error) {
+-	var client Client
++// NewClientFromReader creates a Client configured from a given reader.
++// The configuration is expected to use the JSON format.
++func NewClientFromReader(reader io.Reader) (*Client, error) {
++	c := new(Client)
+ 
+ 	b, err := ioutil.ReadAll(reader)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	err = json.Unmarshal(b, &client)
++	err = json.Unmarshal(b, c)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if c.config.CertFile == "" {
++		c.initHTTPClient()
++	} else {
++		err = c.initHTTPSClient(c.config.CertFile, c.config.KeyFile)
++	}
+ 
+-	err = setupHttpClient(&client)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	return &client, nil
++	for _, caCert := range c.config.CaCertFile {
++		if err := c.AddRootCA(caCert); err != nil {
++			return nil, err
++		}
++	}
++
++	return c, nil
+ }
+ 
+-func setupHttpClient(client *Client) error {
+-	if client.config.CertFile != "" && client.config.KeyFile != "" {
+-		err := client.SetCertAndKey(client.config.CertFile, client.config.KeyFile, client.config.CaCertFile)
+-		if err != nil {
+-			return err
+-		}
+-	} else {
+-		client.config.CertFile = ""
+-		client.config.KeyFile = ""
+-		tr := &http.Transport{
+-			Dial: dialTimeout,
+-			TLSClientConfig: &tls.Config{
+-				InsecureSkipVerify: true,
+-			},
+-		}
+-		client.httpClient = &http.Client{Transport: tr}
++// Override the Client's HTTP Transport object
++func (c *Client) SetTransport(tr *http.Transport) {
++	c.httpClient.Transport = tr
++}
++
++// SetKeyPrefix changes the key prefix from the default `/v2/keys` to whatever
++// is set.
++func (c *Client) SetKeyPrefix(prefix string) {
++	c.keyPrefix = prefix
++}
++
++// initHTTPClient initializes a HTTP client for etcd client
++func (c *Client) initHTTPClient() {
++	tr := &http.Transport{
++		Dial: dialTimeout,
++		TLSClientConfig: &tls.Config{
++			InsecureSkipVerify: true,
++		},
++	}
++	c.httpClient = &http.Client{Transport: tr}
++}
++
++// initHTTPClient initializes a HTTPS client for etcd client
++func (c *Client) initHTTPSClient(cert, key string) error {
++	if cert == "" || key == "" {
++		return errors.New("Require both cert and key path")
++	}
++
++	tlsCert, err := tls.LoadX509KeyPair(cert, key)
++	if err != nil {
++		return err
++	}
++
++	tlsConfig := &tls.Config{
++		Certificates:       []tls.Certificate{tlsCert},
++		InsecureSkipVerify: true,
++	}
++
++	tr := &http.Transport{
++		TLSClientConfig: tlsConfig,
++		Dial:            dialTimeout,
+ 	}
+ 
++	c.httpClient = &http.Client{Transport: tr}
+ 	return nil
+ }
+ 
+@@ -179,114 +226,45 @@ func (c *Client) SetConsistency(consistency string) error {
+ 	return nil
+ }
+ 
+-// MarshalJSON implements the Marshaller interface
+-// as defined by the standard JSON package.
+-func (c *Client) MarshalJSON() ([]byte, error) {
+-	b, err := json.Marshal(struct {
+-		Config  Config  `json:"config"`
+-		Cluster Cluster `json:"cluster"`
+-	}{
+-		Config:  c.config,
+-		Cluster: c.cluster,
+-	})
+-
+-	if err != nil {
+-		return nil, err
++// AddRootCA adds a root CA cert for the etcd client
++func (c *Client) AddRootCA(caCert string) error {
++	if c.httpClient == nil {
++		return errors.New("Client has not been initialized yet!")
+ 	}
+ 
+-	return b, nil
+-}
+-
+-// UnmarshalJSON implements the Unmarshaller interface
+-// as defined by the standard JSON package.
+-func (c *Client) UnmarshalJSON(b []byte) error {
+-	temp := struct {
+-		Config  Config  `json: "config"`
+-		Cluster Cluster `json: "cluster"`
+-	}{}
+-	err := json.Unmarshal(b, &temp)
++	certBytes, err := ioutil.ReadFile(caCert)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	c.cluster = temp.Cluster
+-	c.config = temp.Config
+-	return nil
+-}
+-
+-// saveConfig saves the current config using c.persistence.
+-func (c *Client) saveConfig() error {
+-	if c.persistence != nil {
+-		b, err := json.Marshal(c)
+-		if err != nil {
+-			return err
+-		}
++	tr, ok := c.httpClient.Transport.(*http.Transport)
+ 
+-		_, err = c.persistence.Write(b)
+-		if err != nil {
+-			return err
+-		}
++	if !ok {
++		panic("AddRootCA(): Transport type assert should not fail")
+ 	}
+ 
+-	return nil
+-}
+-
+-func (c *Client) SetCertAndKey(cert string, key string, caCert string) error {
+-	if cert != "" && key != "" {
+-		tlsCert, err := tls.LoadX509KeyPair(cert, key)
+-
+-		if err != nil {
+-			return err
+-		}
+-
+-		tlsConfig := &tls.Config{
+-			Certificates: []tls.Certificate{tlsCert},
+-		}
+-
+-		if caCert != "" {
+-			caCertPool := x509.NewCertPool()
+-
+-			certBytes, err := ioutil.ReadFile(caCert)
+-			if err != nil {
+-				return err
+-			}
+-
+-			if !caCertPool.AppendCertsFromPEM(certBytes) {
+-				return errors.New("Unable to load caCert")
+-			}
+-
+-			tlsConfig.RootCAs = caCertPool
+-		} else {
+-			tlsConfig.InsecureSkipVerify = true
+-		}
+-
+-		tr := &http.Transport{
+-			TLSClientConfig: tlsConfig,
+-			Dial:            dialTimeout,
++	if tr.TLSClientConfig.RootCAs == nil {
++		caCertPool := x509.NewCertPool()
++		ok = caCertPool.AppendCertsFromPEM(certBytes)
++		if ok {
++			tr.TLSClientConfig.RootCAs = caCertPool
+ 		}
+-
+-		c.httpClient = &http.Client{Transport: tr}
+-		c.saveConfig()
+-		return nil
++		tr.TLSClientConfig.InsecureSkipVerify = false
++	} else {
++		ok = tr.TLSClientConfig.RootCAs.AppendCertsFromPEM(certBytes)
+ 	}
+-	return errors.New("Require both cert and key path")
+-}
+ 
+-func (c *Client) SetScheme(scheme int) error {
+-	if scheme == HTTP {
+-		c.config.Scheme = "http"
+-		c.saveConfig()
+-		return nil
++	if !ok {
++		err = errors.New("Unable to load caCert")
+ 	}
+-	if scheme == HTTPS {
+-		c.config.Scheme = "https"
+-		c.saveConfig()
+-		return nil
+-	}
+-	return errors.New("Unknown Scheme")
++
++	c.config.CaCertFile = append(c.config.CaCertFile, caCert)
++	c.saveConfig()
++
++	return err
+ }
+ 
+-// SetCluster updates config using the given machine list.
++// SetCluster updates cluster information using the given machine list.
+ func (c *Client) SetCluster(machines []string) bool {
+ 	success := c.internalSyncCluster(machines)
+ 	return success
+@@ -296,16 +274,15 @@ func (c *Client) GetCluster() []string {
+ 	return c.cluster.Machines
+ }
+ 
+-// SyncCluster updates config using the internal machine list.
++// SyncCluster updates the cluster information using the internal machine list.
+ func (c *Client) SyncCluster() bool {
+-	success := c.internalSyncCluster(c.cluster.Machines)
+-	return success
++	return c.internalSyncCluster(c.cluster.Machines)
+ }
+ 
+ // internalSyncCluster syncs cluster information using the given machine list.
+ func (c *Client) internalSyncCluster(machines []string) bool {
+ 	for _, machine := range machines {
+-		httpPath := c.createHttpPath(machine, version+"/machines")
++		httpPath := c.createHttpPath(machine, path.Join(version, "machines"))
+ 		resp, err := c.httpClient.Get(httpPath)
+ 		if err != nil {
+ 			// try another machine in the cluster
+@@ -319,12 +296,11 @@ func (c *Client) internalSyncCluster(machines []string) bool {
+ 			}
+ 
+ 			// update Machines List
+-			c.cluster.Machines = strings.Split(string(b), ", ")
++			c.cluster.updateFromStr(string(b))
+ 
+ 			// update leader
+ 			// the first one in the machine list is the leader
+-			logger.Debugf("update.leader[%s,%s]", c.cluster.Leader, c.cluster.Machines[0])
+-			c.cluster.Leader = c.cluster.Machines[0]
++			c.cluster.switchLeader(0)
+ 
+ 			logger.Debug("sync.machines ", c.cluster.Machines)
+ 			c.saveConfig()
+@@ -337,8 +313,12 @@ func (c *Client) internalSyncCluster(machines []string) bool {
+ // createHttpPath creates a complete HTTP URL.
+ // serverName should contain both the host name and a port number, if any.
+ func (c *Client) createHttpPath(serverName string, _path string) string {
+-	u, _ := url.Parse(serverName)
+-	u.Path = path.Join(u.Path, "/", _path)
++	u, err := url.Parse(serverName)
++	if err != nil {
++		panic(err)
++	}
++
++	u.Path = path.Join(u.Path, _path)
+ 
+ 	if u.Scheme == "" {
+ 		u.Scheme = "http"
+@@ -351,27 +331,6 @@ func dialTimeout(network, addr string) (net.Conn, error) {
+ 	return net.DialTimeout(network, addr, time.Second)
+ }
+ 
+-func (c *Client) updateLeader(u *url.URL) {
+-	var leader string
+-	if u.Scheme == "" {
+-		leader = "http://" + u.Host
+-	} else {
+-		leader = u.Scheme + "://" + u.Host
+-	}
+-
+-	logger.Debugf("update.leader[%s,%s]", c.cluster.Leader, leader)
+-	c.cluster.Leader = leader
+-	c.saveConfig()
+-}
+-
+-// switchLeader switch the current leader to machines[num]
+-func (c *Client) switchLeader(num int) {
+-	logger.Debugf("switch.leader[from %v to %v]",
+-		c.cluster.Leader, c.cluster.Machines[num])
+-
+-	c.cluster.Leader = c.cluster.Machines[num]
+-}
+-
+ func (c *Client) OpenCURL() {
+ 	c.cURLch = make(chan string, defaultBufferSize)
+ }
+@@ -392,3 +351,55 @@ func (c *Client) sendCURL(command string) {
+ func (c *Client) RecvCURL() string {
+ 	return <-c.cURLch
+ }
++
++// saveConfig saves the current config using c.persistence.
++func (c *Client) saveConfig() error {
++	if c.persistence != nil {
++		b, err := json.Marshal(c)
++		if err != nil {
++			return err
++		}
++
++		_, err = c.persistence.Write(b)
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++// MarshalJSON implements the Marshaller interface
++// as defined by the standard JSON package.
++func (c *Client) MarshalJSON() ([]byte, error) {
++	b, err := json.Marshal(struct {
++		Config  Config   `json:"config"`
++		Cluster *Cluster `json:"cluster"`
++	}{
++		Config:  c.config,
++		Cluster: c.cluster,
++	})
++
++	if err != nil {
++		return nil, err
++	}
++
++	return b, nil
++}
++
++// UnmarshalJSON implements the Unmarshaller interface
++// as defined by the standard JSON package.
++func (c *Client) UnmarshalJSON(b []byte) error {
++	temp := struct {
++		Config  Config   `json: "config"`
++		Cluster *Cluster `json: "cluster"`
++	}{}
++	err := json.Unmarshal(b, &temp)
++	if err != nil {
++		return err
++	}
++
++	c.cluster = temp.Cluster
++	c.config = temp.Config
++	return nil
++}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/client_test.go b/third_party/github.com/coreos/go-etcd/etcd/client_test.go
+index b25611b..c245e47 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/client_test.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/client_test.go
+@@ -14,7 +14,9 @@ import (
+ func TestSync(t *testing.T) {
+ 	fmt.Println("Make sure there are three nodes at 0.0.0.0:4001-4003")
+ 
+-	c := NewClient(nil)
++	// Explicit trailing slash to ensure this doesn't reproduce:
++	// https://github.com/coreos/go-etcd/issues/82
++	c := NewClient([]string{"http://127.0.0.1:4001/"})
+ 
+ 	success := c.SyncCluster()
+ 	if !success {
+@@ -79,7 +81,7 @@ func TestPersistence(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	c2, err := NewClientFile("config.json")
++	c2, err := NewClientFromFile("config.json")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/cluster.go b/third_party/github.com/coreos/go-etcd/etcd/cluster.go
+new file mode 100644
+index 0000000..aaa2054
+--- /dev/null
++++ b/third_party/github.com/coreos/go-etcd/etcd/cluster.go
+@@ -0,0 +1,51 @@
++package etcd
++
++import (
++	"net/url"
++	"strings"
++)
++
++type Cluster struct {
++	Leader   string   `json:"leader"`
++	Machines []string `json:"machines"`
++}
++
++func NewCluster(machines []string) *Cluster {
++	// if an empty slice was sent in then just assume HTTP 4001 on localhost
++	if len(machines) == 0 {
++		machines = []string{"http://127.0.0.1:4001"}
++	}
++
++	// default leader and machines
++	return &Cluster{
++		Leader:   machines[0],
++		Machines: machines,
++	}
++}
++
++// switchLeader switch the current leader to machines[num]
++func (cl *Cluster) switchLeader(num int) {
++	logger.Debugf("switch.leader[from %v to %v]",
++		cl.Leader, cl.Machines[num])
++
++	cl.Leader = cl.Machines[num]
++}
++
++func (cl *Cluster) updateFromStr(machines string) {
++	cl.Machines = strings.Split(machines, ", ")
++}
++
++func (cl *Cluster) updateLeader(leader string) {
++	logger.Debugf("update.leader[%s,%s]", cl.Leader, leader)
++	cl.Leader = leader
++}
++
++func (cl *Cluster) updateLeaderFromURL(u *url.URL) {
++	var leader string
++	if u.Scheme == "" {
++		leader = "http://" + u.Host
++	} else {
++		leader = u.Scheme + "://" + u.Host
++	}
++	cl.updateLeader(leader)
++}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete.go
+new file mode 100644
+index 0000000..924778d
+--- /dev/null
++++ b/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete.go
+@@ -0,0 +1,34 @@
++package etcd
++
++import "fmt"
++
++func (c *Client) CompareAndDelete(key string, prevValue string, prevIndex uint64) (*Response, error) {
++	raw, err := c.RawCompareAndDelete(key, prevValue, prevIndex)
++	if err != nil {
++		return nil, err
++	}
++
++	return raw.toResponse()
++}
++
++func (c *Client) RawCompareAndDelete(key string, prevValue string, prevIndex uint64) (*RawResponse, error) {
++	if prevValue == "" && prevIndex == 0 {
++		return nil, fmt.Errorf("You must give either prevValue or prevIndex.")
++	}
++
++	options := options{}
++	if prevValue != "" {
++		options["prevValue"] = prevValue
++	}
++	if prevIndex != 0 {
++		options["prevIndex"] = prevIndex
++	}
++
++	raw, err := c.delete(key, options)
++
++	if err != nil {
++		return nil, err
++	}
++
++	return raw, err
++}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete_test.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete_test.go
+new file mode 100644
+index 0000000..223e50f
+--- /dev/null
++++ b/third_party/github.com/coreos/go-etcd/etcd/compare_and_delete_test.go
+@@ -0,0 +1,46 @@
++package etcd
++
++import (
++	"testing"
++)
++
++func TestCompareAndDelete(t *testing.T) {
++	c := NewClient(nil)
++	defer func() {
++		c.Delete("foo", true)
++	}()
++
++	c.Set("foo", "bar", 5)
++
++	// This should succeed an correct prevValue
++	resp, err := c.CompareAndDelete("foo", "bar", 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !(resp.PrevNode.Value == "bar" && resp.PrevNode.Key == "/foo" && resp.PrevNode.TTL == 5) {
++		t.Fatalf("CompareAndDelete 1 prevNode failed: %#v", resp)
++	}
++
++	resp, _ = c.Set("foo", "bar", 5)
++	// This should fail because it gives an incorrect prevValue
++	_, err = c.CompareAndDelete("foo", "xxx", 0)
++	if err == nil {
++		t.Fatalf("CompareAndDelete 2 should have failed.  The response is: %#v", resp)
++	}
++
++	// This should succeed because it gives an correct prevIndex
++	resp, err = c.CompareAndDelete("foo", "", resp.Node.ModifiedIndex)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !(resp.PrevNode.Value == "bar" && resp.PrevNode.Key == "/foo" && resp.PrevNode.TTL == 5) {
++		t.Fatalf("CompareAndSwap 3 prevNode failed: %#v", resp)
++	}
++
++	c.Set("foo", "bar", 5)
++	// This should fail because it gives an incorrect prevIndex
++	resp, err = c.CompareAndDelete("foo", "", 29817514)
++	if err == nil {
++		t.Fatalf("CompareAndDelete 4 should have failed.  The response is: %#v", resp)
++	}
++}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go b/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go
+index 4099d13..0beaee5 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/compare_and_swap.go
+@@ -2,7 +2,18 @@ package etcd
+ 
+ import "fmt"
+ 
+-func (c *Client) CompareAndSwap(key string, value string, ttl uint64, prevValue string, prevIndex uint64) (*Response, error) {
++func (c *Client) CompareAndSwap(key string, value string, ttl uint64,
++	prevValue string, prevIndex uint64) (*Response, error) {
++	raw, err := c.RawCompareAndSwap(key, value, ttl, prevValue, prevIndex)
++	if err != nil {
++		return nil, err
++	}
++
++	return raw.toResponse()
++}
++
++func (c *Client) RawCompareAndSwap(key string, value string, ttl uint64,
++	prevValue string, prevIndex uint64) (*RawResponse, error) {
+ 	if prevValue == "" && prevIndex == 0 {
+ 		return nil, fmt.Errorf("You must give either prevValue or prevIndex.")
+ 	}
+@@ -21,5 +32,5 @@ func (c *Client) CompareAndSwap(key string, value string, ttl uint64, prevValue
+ 		return nil, err
+ 	}
+ 
+-	return raw.toResponse()
++	return raw, err
+ }
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/config.json b/third_party/github.com/coreos/go-etcd/etcd/config.json
+new file mode 100644
+index 0000000..0e271b1
+--- /dev/null
++++ b/third_party/github.com/coreos/go-etcd/etcd/config.json
+@@ -0,0 +1 @@
++{"config":{"certFile":"","keyFile":"","caCertFiles":null,"timeout":1000000000,"Consistency":"STRONG"},"cluster":{"leader":"http://127.0.0.1:4001","machines":["http://127.0.0.1:4001","http://127.0.0.1:4002"]}}
+\ No newline at end of file
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/debug.go b/third_party/github.com/coreos/go-etcd/etcd/debug.go
+index a4ee8b0..fce23f0 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/debug.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/debug.go
+@@ -1,28 +1,53 @@
+ package etcd
+ 
+ import (
+-	"os"
+-
+-	"github.com/coreos/etcd/third_party/github.com/coreos/go-log/log"
++	"io/ioutil"
++	"log"
++	"strings"
+ )
+ 
+-var logger *log.Logger
++type Logger interface {
++	Debug(args ...interface{})
++	Debugf(fmt string, args ...interface{})
++	Warning(args ...interface{})
++	Warningf(fmt string, args ...interface{})
++}
++
++var logger Logger
+ 
+-func init() {
+-	setLogger(log.PriErr)
++func SetLogger(log Logger) {
++	logger = log
+ }
+ 
+-func OpenDebug() {
+-	setLogger(log.PriDebug)
++func GetLogger() Logger {
++	return logger
+ }
+ 
+-func CloseDebug() {
+-	setLogger(log.PriErr)
++type defaultLogger struct {
++	log *log.Logger
+ }
+ 
+-func setLogger(priority log.Priority) {
+-	logger = log.NewSimple(
+-		log.PriorityFilter(
+-			priority,
+-			log.WriterSink(os.Stdout, log.BasicFormat, log.BasicFields)))
++func (p *defaultLogger) Debug(args ...interface{}) {
++	p.log.Println(args)
++}
++
++func (p *defaultLogger) Debugf(fmt string, args ...interface{}) {
++	// Append newline if necessary
++	if !strings.HasSuffix(fmt, "\n") {
++		fmt = fmt + "\n"
++	}
++	p.log.Printf(fmt, args)
++}
++
++func (p *defaultLogger) Warning(args ...interface{}) {
++	p.Debug(args)
++}
++
++func (p *defaultLogger) Warningf(fmt string, args ...interface{}) {
++	p.Debugf(fmt, args)
++}
++
++func init() {
++	// Default logger uses the go default log.
++	SetLogger(&defaultLogger{log.New(ioutil.Discard, "go-etcd", log.LstdFlags)})
+ }
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/delete.go b/third_party/github.com/coreos/go-etcd/etcd/delete.go
+index 51d1c85..6c60e4d 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/delete.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/delete.go
+@@ -10,7 +10,7 @@ package etcd
+ // then everything under the directory (including all child directories)
+ // will be deleted.
+ func (c *Client) Delete(key string, recursive bool) (*Response, error) {
+-	raw, err := c.DeleteRaw(key, recursive, false)
++	raw, err := c.RawDelete(key, recursive, false)
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -21,7 +21,7 @@ func (c *Client) Delete(key string, recursive bool) (*Response, error) {
+ 
+ // DeleteDir deletes an empty directory or a key value pair
+ func (c *Client) DeleteDir(key string) (*Response, error) {
+-	raw, err := c.DeleteRaw(key, false, true)
++	raw, err := c.RawDelete(key, false, true)
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -30,7 +30,7 @@ func (c *Client) DeleteDir(key string) (*Response, error) {
+ 	return raw.toResponse()
+ }
+ 
+-func (c *Client) DeleteRaw(key string, recursive bool, dir bool) (*RawResponse, error) {
++func (c *Client) RawDelete(key string, recursive bool, dir bool) (*RawResponse, error) {
+ 	ops := options{
+ 		"recursive": recursive,
+ 		"dir":       dir,
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/error.go b/third_party/github.com/coreos/go-etcd/etcd/error.go
+index 9a33d16..7e69287 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/error.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/error.go
+@@ -36,9 +36,13 @@ func newError(errorCode int, cause string, index uint64) *EtcdError {
+ }
+ 
+ func handleError(b []byte) error {
+-	var err EtcdError
++	etcdErr := new(EtcdError)
+ 
+-	json.Unmarshal(b, &err)
++	err := json.Unmarshal(b, etcdErr)
++	if err != nil {
++		logger.Warningf("cannot unmarshal etcd error: %v", err)
++		return err
++	}
+ 
+-	return err
++	return etcdErr
+ }
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/get_test.go b/third_party/github.com/coreos/go-etcd/etcd/get_test.go
+index 06755e5..eccae18 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/get_test.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/get_test.go
+@@ -5,6 +5,26 @@ import (
+ 	"testing"
+ )
+ 
++// cleanNode scrubs Expiration, ModifiedIndex and CreatedIndex of a node.
++func cleanNode(n *Node) {
++	n.Expiration = nil
++	n.ModifiedIndex = 0
++	n.CreatedIndex = 0
++}
++
++// cleanResult scrubs a result object two levels deep of Expiration,
++// ModifiedIndex and CreatedIndex.
++func cleanResult(result *Response) {
++	//  TODO(philips): make this recursive.
++	cleanNode(result.Node)
++	for i, _ := range result.Node.Nodes {
++		cleanNode(&result.Node.Nodes[i])
++		for j, _ := range result.Node.Nodes[i].Nodes {
++			cleanNode(&result.Node.Nodes[i].Nodes[j])
++		}
++	}
++}
++
+ func TestGet(t *testing.T) {
+ 	c := NewClient(nil)
+ 	defer func() {
+@@ -48,25 +68,18 @@ func TestGetAll(t *testing.T) {
+ 
+ 	expected := Nodes{
+ 		Node{
+-			Key:           "/fooDir/k0",
+-			Value:         "v0",
+-			TTL:           5,
+-			ModifiedIndex: 31,
+-			CreatedIndex:  31,
++			Key:   "/fooDir/k0",
++			Value: "v0",
++			TTL:   5,
+ 		},
+ 		Node{
+-			Key:           "/fooDir/k1",
+-			Value:         "v1",
+-			TTL:           5,
+-			ModifiedIndex: 32,
+-			CreatedIndex:  32,
++			Key:   "/fooDir/k1",
++			Value: "v1",
++			TTL:   5,
+ 		},
+ 	}
+ 
+-	// do not check expiration time, too hard to fake
+-	for i, _ := range result.Node.Nodes {
+-		result.Node.Nodes[i].Expiration = nil
+-	}
++	cleanResult(result)
+ 
+ 	if !reflect.DeepEqual(result.Node.Nodes, expected) {
+ 		t.Fatalf("(actual) %v != (expected) %v", result.Node.Nodes, expected)
+@@ -79,16 +92,7 @@ func TestGetAll(t *testing.T) {
+ 	// Return kv-pairs in sorted order
+ 	result, err = c.Get("fooDir", true, true)
+ 
+-	// do not check expiration time, too hard to fake
+-	result.Node.Expiration = nil
+-	for i, _ := range result.Node.Nodes {
+-		result.Node.Nodes[i].Expiration = nil
+-		if result.Node.Nodes[i].Nodes != nil {
+-			for j, _ := range result.Node.Nodes[i].Nodes {
+-				result.Node.Nodes[i].Nodes[j].Expiration = nil
+-			}
+-		}
+-	}
++	cleanResult(result)
+ 
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -100,33 +104,27 @@ func TestGetAll(t *testing.T) {
+ 			Dir: true,
+ 			Nodes: Nodes{
+ 				Node{
+-					Key:           "/fooDir/childDir/k2",
+-					Value:         "v2",
+-					TTL:           5,
+-					ModifiedIndex: 34,
+-					CreatedIndex:  34,
++					Key:   "/fooDir/childDir/k2",
++					Value: "v2",
++					TTL:   5,
+ 				},
+ 			},
+-			TTL:           5,
+-			ModifiedIndex: 33,
+-			CreatedIndex:  33,
++			TTL: 5,
+ 		},
+ 		Node{
+-			Key:           "/fooDir/k0",
+-			Value:         "v0",
+-			TTL:           5,
+-			ModifiedIndex: 31,
+-			CreatedIndex:  31,
++			Key:   "/fooDir/k0",
++			Value: "v0",
++			TTL:   5,
+ 		},
+ 		Node{
+-			Key:           "/fooDir/k1",
+-			Value:         "v1",
+-			TTL:           5,
+-			ModifiedIndex: 32,
+-			CreatedIndex:  32,
++			Key:   "/fooDir/k1",
++			Value: "v1",
++			TTL:   5,
+ 		},
+ 	}
+ 
++	cleanResult(result)
++
+ 	if !reflect.DeepEqual(result.Node.Nodes, expected) {
+ 		t.Fatalf("(actual) %v != (expected) %v", result.Node.Nodes, expected)
+ 	}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/options.go b/third_party/github.com/coreos/go-etcd/etcd/options.go
+index 93efdca..335a0c2 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/options.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/options.go
+@@ -36,6 +36,8 @@ var (
+ 	VALID_DELETE_OPTIONS = validOptions{
+ 		"recursive": reflect.Bool,
+ 		"dir":       reflect.Bool,
++		"prevValue": reflect.String,
++		"prevIndex": reflect.Uint64,
+ 	}
+ )
+ 
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/requests.go b/third_party/github.com/coreos/go-etcd/etcd/requests.go
+index 511c51a..c16f7d4 100644
+--- a/third_party/github.com/coreos/go-etcd/etcd/requests.go
++++ b/third_party/github.com/coreos/go-etcd/etcd/requests.go
+@@ -13,9 +13,6 @@ import (
+ 
+ // get issues a GET request
+ func (c *Client) get(key string, options options) (*RawResponse, error) {
+-	logger.Debugf("get %s [%s]", key, c.cluster.Leader)
+-	p := keyToPath(key)
+-
+ 	// If consistency level is set to STRONG, append
+ 	// the `consistent` query string.
+ 	if c.config.Consistency == STRONG_CONSISTENCY {
+@@ -26,9 +23,8 @@ func (c *Client) get(key string, options options) (*RawResponse, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	p += str
+ 
+-	resp, err := c.sendRequest("GET", p, nil)
++	resp, err := c.sendKeyRequest("GET", key, str, nil)
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -41,16 +37,12 @@ func (c *Client) get(key string, options options) (*RawResponse, error) {
+ func (c *Client) put(key string, value string, ttl uint64,
+ 	options options) (*RawResponse, error) {
+ 
+-	logger.Debugf("put %s, %s, ttl: %d, [%s]", key, value, ttl, c.cluster.Leader)
+-	p := keyToPath(key)
+-
+ 	str, err := options.toParameters(VALID_PUT_OPTIONS)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	p += str
+ 
+-	resp, err := c.sendRequest("PUT", p, buildValues(value, ttl))
++	resp, err := c.sendKeyRequest("PUT", key, str, buildValues(value, ttl))
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -61,10 +53,7 @@ func (c *Client) put(key string, value string, ttl uint64,
+ 
+ // post issues a POST request
+ func (c *Client) post(key string, value string, ttl uint64) (*RawResponse, error) {
+-	logger.Debugf("post %s, %s, ttl: %d, [%s]", key, value, ttl, c.cluster.Leader)
+-	p := keyToPath(key)
+-
+-	resp, err := c.sendRequest("POST", p, buildValues(value, ttl))
++	resp, err := c.sendKeyRequest("POST", key, "", buildValues(value, ttl))
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -75,16 +64,12 @@ func (c *Client) post(key string, value string, ttl uint64) (*RawResponse, error
+ 
+ // delete issues a DELETE request
+ func (c *Client) delete(key string, options options) (*RawResponse, error) {
+-	logger.Debugf("delete %s [%s]", key, c.cluster.Leader)
+-	p := keyToPath(key)
+-
+ 	str, err := options.toParameters(VALID_DELETE_OPTIONS)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	p += str
+ 
+-	resp, err := c.sendRequest("DELETE", p, nil)
++	resp, err := c.sendKeyRequest("DELETE", key, str, nil)
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -93,8 +78,8 @@ func (c *Client) delete(key string, options options) (*RawResponse, error) {
+ 	return resp, nil
+ }
+ 
+-// sendRequest sends a HTTP request and returns a Response as defined by etcd
+-func (c *Client) sendRequest(method string, relativePath string,
++// sendKeyRequest sends a HTTP request and returns a Response as defined by etcd
++func (c *Client) sendKeyRequest(method string, key string, params string,
+ 	values url.Values) (*RawResponse, error) {
+ 
+ 	var req *http.Request
+@@ -105,6 +90,11 @@ func (c *Client) sendRequest(method string, relativePath string,
+ 
+ 	trial := 0
+ 
++	logger.Debugf("%s %s %s [%s]", method, key, params, c.cluster.Leader)
++
++	// Build the request path if no prefix exists
++	relativePath := path.Join(c.keyPrefix, key) + params
++
+ 	// if we connect to a follower, we will retry until we found a leader
+ 	for {
+ 		trial++
+@@ -146,7 +136,8 @@ func (c *Client) sendRequest(method string, relativePath string,
+ 
+ 		// network error, change a machine!
+ 		if resp, err = c.httpClient.Do(req); err != nil {
+-			c.switchLeader(trial % len(c.cluster.Machines))
++			logger.Debug("network error: ", err.Error())
++			c.cluster.switchLeader(trial % len(c.cluster.Machines))
+ 			time.Sleep(time.Millisecond * 200)
+ 			continue
+ 		}
+@@ -195,7 +186,7 @@ func (c *Client) handleResp(resp *http.Response) (bool, []byte) {
+ 		if err != nil {
+ 			logger.Warning(err)
+ 		} else {
+-			c.updateLeader(u)
++			c.cluster.updateLeaderFromURL(u)
+ 		}
+ 
+ 		return false, nil
+@@ -219,18 +210,14 @@ func (c *Client) handleResp(resp *http.Response) (bool, []byte) {
+ 
+ func (c *Client) getHttpPath(random bool, s ...string) string {
+ 	var machine string
++
+ 	if random {
+ 		machine = c.cluster.Machines[rand.Intn(len(c.cluster.Machines))]
+ 	} else {
+ 		machine = c.cluster.Leader
+ 	}
+ 
+-	fullPath := machine + "/" + version
+-	for _, seg := range s {
+-		fullPath = fullPath + "/" + seg
+-	}
+-
+-	return fullPath
++	return machine + "/" + strings.Join(s, "/")
+ }
+ 
+ // buildValues builds a url.Values map according to the given value and ttl
+@@ -249,17 +236,14 @@ func buildValues(value string, ttl uint64) url.Values {
+ }
+ 
+ // convert key string to http path exclude version
+-// for example: key[foo] -> path[keys/foo]
+-// key[/] -> path[keys/]
++// for example: key[foo] -> path[foo]
++// key[] -> path[/]
+ func keyToPath(key string) string {
+-	p := path.Join("keys", key)
++	clean := path.Clean(key)
+ 
+-	// corner case: if key is "/" or "//" ect
+-	// path join will clear the tailing "/"
+-	// we need to add it back
+-	if p == "keys" {
+-		p = "keys/"
++	if clean == "" || clean == "." {
++		return "/"
+ 	}
+ 
+-	return p
++	return clean
+ }
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/requests_test.go b/third_party/github.com/coreos/go-etcd/etcd/requests_test.go
+new file mode 100644
+index 0000000..a7160c1
+--- /dev/null
++++ b/third_party/github.com/coreos/go-etcd/etcd/requests_test.go
+@@ -0,0 +1,50 @@
++package etcd
++
++import (
++	"path"
++	"testing"
++)
++
++func testKey(t *testing.T, in, exp string) {
++	if keyToPath(in) != exp {
++		t.Errorf("Expected %s got %s", exp, keyToPath(in))
++	}
++}
++
++// TestKeyToPath ensures the key cleaning funciton keyToPath works in a number
++// of cases.
++func TestKeyToPath(t *testing.T) {
++	testKey(t, "", "/")
++	testKey(t, "/", "/")
++	testKey(t, "///", "/")
++	testKey(t, "hello/world/", "hello/world")
++	testKey(t, "///hello////world/../", "/hello")
++}
++
++func testPath(t *testing.T, c *Client, in, exp string) {
++	out := c.getHttpPath(false, in)
++
++	if out != exp {
++		t.Errorf("Expected %s got %s", exp, out)
++	}
++}
++
++// TestHttpPath ensures that the URLs generated make sense for the given keys
++func TestHttpPath(t *testing.T) {
++	c := NewClient(nil)
++
++	testPath(t, c,
++		path.Join(c.keyPrefix, "hello") + "?prevInit=true",
++		"http://127.0.0.1:4001/v2/keys/hello?prevInit=true")
++
++	testPath(t, c,
++		path.Join(c.keyPrefix, "///hello///world") + "?prevInit=true",
++		"http://127.0.0.1:4001/v2/keys/hello/world?prevInit=true")
++
++	c = NewClient([]string{"https://discovery.etcd.io"})
++	c.SetKeyPrefix("")
++
++	testPath(t, c,
++		path.Join(c.keyPrefix, "hello") + "?prevInit=true",
++		"https://discovery.etcd.io/hello?prevInit=true")
++}
+diff --git a/third_party/github.com/coreos/go-etcd/etcd/utils.go b/third_party/github.com/coreos/go-etcd/etcd/utils.go
+deleted file mode 100644
+index eb2f604..0000000
+--- a/third_party/github.com/coreos/go-etcd/etcd/utils.go
++++ /dev/null
+@@ -1,33 +0,0 @@
+-// Utility functions
+-
+-package etcd
+-
+-import (
+-	"fmt"
+-	"net/url"
+-	"reflect"
+-)
+-
+-// Convert options to a string of HTML parameters
+-func optionsToString(options options, vops validOptions) (string, error) {
+-	p := "?"
+-	v := url.Values{}
+-	for opKey, opVal := range options {
+-		// Check if the given option is valid (that it exists)
+-		kind := vops[opKey]
+-		if kind == reflect.Invalid {
+-			return "", fmt.Errorf("Invalid option: %v", opKey)
+-		}
+-
+-		// Check if the given option is of the valid type
+-		t := reflect.TypeOf(opVal)
+-		if kind != t.Kind() {
+-			return "", fmt.Errorf("Option %s should be of %v kind, not of %v kind.",
+-				opKey, kind, t.Kind())
+-		}
+-
+-		v.Set(opKey, fmt.Sprintf("%v", opVal))
+-	}
+-	p += v.Encode()
+-	return p, nil
+-}

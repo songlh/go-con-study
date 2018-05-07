@@ -1,0 +1,156 @@
+commit 67e57ffca401631e8364331283cc5678918a6dad
+Author: Jonathan Boulle <jonathanboulle@gmail.com>
+Date:   Tue Sep 16 11:36:37 2014 -0700
+
+    etcdserver: split out client and server listeners
+
+diff --git a/etcdserver/etcdhttp/http.go b/etcdserver/etcdhttp/http.go
+index d313554..c7f98e8 100644
+--- a/etcdserver/etcdhttp/http.go
++++ b/etcdserver/etcdhttp/http.go
+@@ -35,18 +35,17 @@ const (
+ 
+ var errClosed = errors.New("etcdhttp: client closed connection")
+ 
+-// NewHandler generates a muxed http.Handler with the given parameters.
+-func NewHandler(server etcdserver.Server, peers Peers, timeout time.Duration) http.Handler {
++// NewClientHandler generates a muxed http.Handler with the given parameters to serve etcd client requests.
++func NewClientHandler(server etcdserver.Server, peers Peers, timeout time.Duration) http.Handler {
+ 	sh := &serverHandler{
+-		timeout: timeout,
+ 		server:  server,
+ 		peers:   peers,
++		timeout: timeout,
+ 	}
+ 	if sh.timeout == 0 {
+ 		sh.timeout = DefaultTimeout
+ 	}
+ 	mux := http.NewServeMux()
+-	mux.HandleFunc(raftPrefix, sh.serveRaft)
+ 	mux.HandleFunc(keysPrefix, sh.serveKeys)
+ 	mux.HandleFunc(keysPrefix+"/", sh.serveKeys)
+ 	// TODO: dynamic configuration may make this outdated. take care of it.
+@@ -56,6 +55,17 @@ func NewHandler(server etcdserver.Server, peers Peers, timeout time.Duration) ht
+ 	return mux
+ }
+ 
++// NewPeerHandler generates an http.Handler to handle etcd peer (raft) requests.
++func NewPeerHandler(server etcdserver.Server) http.Handler {
++	sh := &serverHandler{
++		server: server,
++	}
++	mux := http.NewServeMux()
++	mux.HandleFunc(raftPrefix, sh.serveRaft)
++	mux.HandleFunc("/", http.NotFound)
++	return mux
++}
++
+ // serverHandler provides http.Handlers for etcd client and raft communication.
+ type serverHandler struct {
+ 	timeout time.Duration
+diff --git a/etcdserver/etcdhttp/http_test.go b/etcdserver/etcdhttp/http_test.go
+index 1910354..1621b2d 100644
+--- a/etcdserver/etcdhttp/http_test.go
++++ b/etcdserver/etcdhttp/http_test.go
+@@ -596,7 +596,7 @@ func TestV2MachinesEndpoint(t *testing.T) {
+ 		{"POST", http.StatusMethodNotAllowed},
+ 	}
+ 
+-	m := NewHandler(nil, Peers{}, time.Hour)
++	m := NewClientHandler(nil, Peers{}, time.Hour)
+ 	s := httptest.NewServer(m)
+ 	defer s.Close()
+ 
+diff --git a/functional/http_functional_test.go b/functional/http_functional_test.go
+index f3c6751..8b65b13 100644
+--- a/functional/http_functional_test.go
++++ b/functional/http_functional_test.go
+@@ -36,7 +36,7 @@ func TestSet(t *testing.T) {
+ 	srv.Start()
+ 	defer srv.Stop()
+ 
+-	h := etcdhttp.NewHandler(srv, nil, time.Hour)
++	h := etcdhttp.NewClientHandler(srv, nil, time.Hour)
+ 	s := httptest.NewServer(h)
+ 	defer s.Close()
+ 
+diff --git a/main.go b/main.go
+index cb4323b..d9095f7 100644
+--- a/main.go
++++ b/main.go
+@@ -27,6 +27,7 @@ var (
+ 	fid       = flag.String("id", "0x1", "ID of this server")
+ 	timeout   = flag.Duration("timeout", 10*time.Second, "Request Timeout")
+ 	laddr     = flag.String("l", ":8080", "HTTP service address (e.g., ':8080')")
++	paddr     = flag.String("r", ":2380", "Peer service address (e.g., ':2380')")
+ 	dir       = flag.String("data-dir", "", "Path to the data directory")
+ 	proxyMode = flag.Bool("proxy-mode", false, "Forward HTTP requests to peers, do not participate in raft.")
+ 
+@@ -41,18 +42,16 @@ func init() {
+ func main() {
+ 	flag.Parse()
+ 
+-	var h http.Handler
+ 	if *proxyMode {
+-		h = startProxy()
++		startProxy()
+ 	} else {
+-		h = startEtcd()
++		startEtcd()
+ 	}
+-
+-	http.Handle("/", h)
+-	log.Fatal(http.ListenAndServe(*laddr, nil))
+ }
+ 
+-func startEtcd() http.Handler {
++// startEtcd launches the etcd server and HTTP handlers for client/server communication.
++// Never returns.
++func startEtcd() {
+ 	id, err := strconv.ParseInt(*fid, 0, 64)
+ 	if err != nil {
+ 		log.Fatal(err)
+@@ -83,7 +82,25 @@ func startEtcd() http.Handler {
+ 		Ticker: time.Tick(100 * time.Millisecond),
+ 	}
+ 	s.Start()
+-	return etcdhttp.NewHandler(s, *peers, *timeout)
++
++	ch := etcdhttp.NewClientHandler(s, *peers, *timeout)
++	ph := etcdhttp.NewPeerHandler(s)
++
++	// Start the peer server in a goroutine
++	go func() {
++		ps := &http.Server{
++			Addr:    *paddr,
++			Handler: ph,
++		}
++		log.Fatal(ps.ListenAndServe())
++	}()
++
++	// Client server takes over the main goroutine
++	cs := &http.Server{
++		Addr:    *laddr,
++		Handler: ch,
++	}
++	log.Fatal(cs.ListenAndServe())
+ }
+ 
+ // startRaft starts a raft node from the given wal dir.
+@@ -118,11 +135,13 @@ func startRaft(id int64, peerIDs []int64, waldir string) (raft.Node, *wal.WAL) {
+ 	return n, w
+ }
+ 
+-func startProxy() http.Handler {
++// startEtcd launches an HTTP proxy for client communication which proxies to other etcd nodes.
++// Never returns.
++func startProxy() {
+ 	h, err := proxy.NewHandler((*peers).Endpoints())
+ 	if err != nil {
+ 		log.Fatal(err)
+ 	}
+-
+-	return h
++	http.Handle("/", h)
++	log.Fatal(http.ListenAndServe(*laddr, h))
+ }

@@ -1,0 +1,2176 @@
+commit 66d2ae7a3949d19ae7917b154a5fbcf23ba2c10a
+Author: Xiang Li <xiangli.cs@gmail.com>
+Date:   Wed Apr 13 21:09:08 2016 -0700
+
+    proxy: move http related thing to httpproxy
+
+diff --git a/etcdmain/etcd.go b/etcdmain/etcd.go
+index 0eb83af..e8d1516 100644
+--- a/etcdmain/etcd.go
++++ b/etcdmain/etcd.go
+@@ -39,7 +39,7 @@ import (
+ 	runtimeutil "github.com/coreos/etcd/pkg/runtime"
+ 	"github.com/coreos/etcd/pkg/transport"
+ 	"github.com/coreos/etcd/pkg/types"
+-	"github.com/coreos/etcd/proxy"
++	"github.com/coreos/etcd/proxy/httpproxy"
+ 	"github.com/coreos/etcd/rafthttp"
+ 	"github.com/coreos/etcd/version"
+ 	"github.com/coreos/go-systemd/daemon"
+@@ -391,7 +391,7 @@ func startProxy(cfg *config) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	pt.MaxIdleConnsPerHost = proxy.DefaultMaxIdleConnsPerHost
++	pt.MaxIdleConnsPerHost = httpproxy.DefaultMaxIdleConnsPerHost
+ 
+ 	tr, err := transport.NewTimeoutTransport(cfg.peerTLSInfo, time.Duration(cfg.proxyDialTimeoutMs)*time.Millisecond, time.Duration(cfg.proxyReadTimeoutMs)*time.Millisecond, time.Duration(cfg.proxyWriteTimeoutMs)*time.Millisecond)
+ 	if err != nil {
+@@ -484,14 +484,14 @@ func startProxy(cfg *config) error {
+ 
+ 		return clientURLs
+ 	}
+-	ph := proxy.NewHandler(pt, uf, time.Duration(cfg.proxyFailureWaitMs)*time.Millisecond, time.Duration(cfg.proxyRefreshIntervalMs)*time.Millisecond)
++	ph := httpproxy.NewHandler(pt, uf, time.Duration(cfg.proxyFailureWaitMs)*time.Millisecond, time.Duration(cfg.proxyRefreshIntervalMs)*time.Millisecond)
+ 	ph = &cors.CORSHandler{
+ 		Handler: ph,
+ 		Info:    cfg.corsInfo,
+ 	}
+ 
+ 	if cfg.isReadonlyProxy() {
+-		ph = proxy.NewReadonlyHandler(ph)
++		ph = httpproxy.NewReadonlyHandler(ph)
+ 	}
+ 	// Start a proxy server goroutine for each listen address
+ 	for _, u := range cfg.lcurls {
+diff --git a/proxy/director.go b/proxy/director.go
+deleted file mode 100644
+index ece8242..0000000
+--- a/proxy/director.go
++++ /dev/null
+@@ -1,155 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"log"
+-	"math/rand"
+-	"net/url"
+-	"sync"
+-	"time"
+-)
+-
+-// defaultRefreshInterval is the default proxyRefreshIntervalMs value
+-// as in etcdmain/config.go.
+-const defaultRefreshInterval = 30000 * time.Millisecond
+-
+-var once sync.Once
+-
+-func newDirector(urlsFunc GetProxyURLs, failureWait time.Duration, refreshInterval time.Duration) *director {
+-	d := &director{
+-		uf:          urlsFunc,
+-		failureWait: failureWait,
+-	}
+-	d.refresh()
+-	go func() {
+-		// In order to prevent missing proxy endpoints in the first try:
+-		// when given refresh interval of defaultRefreshInterval or greater
+-		// and whenever there is no available proxy endpoints,
+-		// give 1-second refreshInterval.
+-		for {
+-			es := d.endpoints()
+-			ri := refreshInterval
+-			if ri >= defaultRefreshInterval {
+-				if len(es) == 0 {
+-					ri = time.Second
+-				}
+-			}
+-			if len(es) > 0 {
+-				once.Do(func() {
+-					var sl []string
+-					for _, e := range es {
+-						sl = append(sl, e.URL.String())
+-					}
+-					plog.Infof("endpoints found %q", sl)
+-				})
+-			}
+-			time.Sleep(ri)
+-			d.refresh()
+-		}
+-	}()
+-	return d
+-}
+-
+-type director struct {
+-	sync.Mutex
+-	ep          []*endpoint
+-	uf          GetProxyURLs
+-	failureWait time.Duration
+-}
+-
+-func (d *director) refresh() {
+-	urls := d.uf()
+-	d.Lock()
+-	defer d.Unlock()
+-	var endpoints []*endpoint
+-	for _, u := range urls {
+-		uu, err := url.Parse(u)
+-		if err != nil {
+-			plog.Printf("upstream URL invalid: %v", err)
+-			continue
+-		}
+-		endpoints = append(endpoints, newEndpoint(*uu, d.failureWait))
+-	}
+-
+-	// shuffle array to avoid connections being "stuck" to a single endpoint
+-	for i := range endpoints {
+-		j := rand.Intn(i + 1)
+-		endpoints[i], endpoints[j] = endpoints[j], endpoints[i]
+-	}
+-
+-	d.ep = endpoints
+-}
+-
+-func (d *director) endpoints() []*endpoint {
+-	d.Lock()
+-	defer d.Unlock()
+-	filtered := make([]*endpoint, 0)
+-	for _, ep := range d.ep {
+-		if ep.Available {
+-			filtered = append(filtered, ep)
+-		}
+-	}
+-
+-	return filtered
+-}
+-
+-func newEndpoint(u url.URL, failureWait time.Duration) *endpoint {
+-	ep := endpoint{
+-		URL:       u,
+-		Available: true,
+-		failFunc:  timedUnavailabilityFunc(failureWait),
+-	}
+-
+-	return &ep
+-}
+-
+-type endpoint struct {
+-	sync.Mutex
+-
+-	URL       url.URL
+-	Available bool
+-
+-	failFunc func(ep *endpoint)
+-}
+-
+-func (ep *endpoint) Failed() {
+-	ep.Lock()
+-	if !ep.Available {
+-		ep.Unlock()
+-		return
+-	}
+-
+-	ep.Available = false
+-	ep.Unlock()
+-
+-	log.Printf("proxy: marked endpoint %s unavailable", ep.URL.String())
+-
+-	if ep.failFunc == nil {
+-		log.Printf("proxy: no failFunc defined, endpoint %s will be unavailable forever.", ep.URL.String())
+-		return
+-	}
+-
+-	ep.failFunc(ep)
+-}
+-
+-func timedUnavailabilityFunc(wait time.Duration) func(*endpoint) {
+-	return func(ep *endpoint) {
+-		time.AfterFunc(wait, func() {
+-			ep.Available = true
+-			log.Printf("proxy: marked endpoint %s available, to retest connectivity", ep.URL.String())
+-		})
+-	}
+-}
+diff --git a/proxy/director_test.go b/proxy/director_test.go
+deleted file mode 100644
+index ac1c82a..0000000
+--- a/proxy/director_test.go
++++ /dev/null
+@@ -1,95 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"net/url"
+-	"reflect"
+-	"sort"
+-	"testing"
+-	"time"
+-)
+-
+-func TestNewDirectorScheme(t *testing.T) {
+-	tests := []struct {
+-		urls []string
+-		want []string
+-	}{
+-		{
+-			urls: []string{"http://192.0.2.8:4002", "http://example.com:8080"},
+-			want: []string{"http://192.0.2.8:4002", "http://example.com:8080"},
+-		},
+-		{
+-			urls: []string{"https://192.0.2.8:4002", "https://example.com:8080"},
+-			want: []string{"https://192.0.2.8:4002", "https://example.com:8080"},
+-		},
+-
+-		// accept urls without a port
+-		{
+-			urls: []string{"http://192.0.2.8"},
+-			want: []string{"http://192.0.2.8"},
+-		},
+-
+-		// accept urls even if they are garbage
+-		{
+-			urls: []string{"http://."},
+-			want: []string{"http://."},
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		uf := func() []string {
+-			return tt.urls
+-		}
+-		got := newDirector(uf, time.Minute, time.Minute)
+-
+-		var gep []string
+-		for _, ep := range got.ep {
+-			gep = append(gep, ep.URL.String())
+-		}
+-		sort.Strings(tt.want)
+-		sort.Strings(gep)
+-		if !reflect.DeepEqual(tt.want, gep) {
+-			t.Errorf("#%d: want endpoints = %#v, got = %#v", i, tt.want, gep)
+-		}
+-	}
+-}
+-
+-func TestDirectorEndpointsFiltering(t *testing.T) {
+-	d := director{
+-		ep: []*endpoint{
+-			{
+-				URL:       url.URL{Scheme: "http", Host: "192.0.2.5:5050"},
+-				Available: false,
+-			},
+-			{
+-				URL:       url.URL{Scheme: "http", Host: "192.0.2.4:4000"},
+-				Available: true,
+-			},
+-		},
+-	}
+-
+-	got := d.endpoints()
+-	want := []*endpoint{
+-		{
+-			URL:       url.URL{Scheme: "http", Host: "192.0.2.4:4000"},
+-			Available: true,
+-		},
+-	}
+-
+-	if !reflect.DeepEqual(want, got) {
+-		t.Fatalf("directed to incorrect endpoint: want = %#v, got = %#v", want, got)
+-	}
+-}
+diff --git a/proxy/doc.go b/proxy/doc.go
+deleted file mode 100644
+index 181a3e0..0000000
+--- a/proxy/doc.go
++++ /dev/null
+@@ -1,18 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-// Package proxy implements etcd proxy node. The etcd proxy acts as a reverse
+-// proxy forwarding client requests to active etcd cluster members, and does
+-// not participate in consensus.
+-package proxy
+diff --git a/proxy/httpproxy/director.go b/proxy/httpproxy/director.go
+new file mode 100644
+index 0000000..0eb4b61
+--- /dev/null
++++ b/proxy/httpproxy/director.go
+@@ -0,0 +1,155 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"log"
++	"math/rand"
++	"net/url"
++	"sync"
++	"time"
++)
++
++// defaultRefreshInterval is the default proxyRefreshIntervalMs value
++// as in etcdmain/config.go.
++const defaultRefreshInterval = 30000 * time.Millisecond
++
++var once sync.Once
++
++func newDirector(urlsFunc GetProxyURLs, failureWait time.Duration, refreshInterval time.Duration) *director {
++	d := &director{
++		uf:          urlsFunc,
++		failureWait: failureWait,
++	}
++	d.refresh()
++	go func() {
++		// In order to prevent missing proxy endpoints in the first try:
++		// when given refresh interval of defaultRefreshInterval or greater
++		// and whenever there is no available proxy endpoints,
++		// give 1-second refreshInterval.
++		for {
++			es := d.endpoints()
++			ri := refreshInterval
++			if ri >= defaultRefreshInterval {
++				if len(es) == 0 {
++					ri = time.Second
++				}
++			}
++			if len(es) > 0 {
++				once.Do(func() {
++					var sl []string
++					for _, e := range es {
++						sl = append(sl, e.URL.String())
++					}
++					plog.Infof("endpoints found %q", sl)
++				})
++			}
++			time.Sleep(ri)
++			d.refresh()
++		}
++	}()
++	return d
++}
++
++type director struct {
++	sync.Mutex
++	ep          []*endpoint
++	uf          GetProxyURLs
++	failureWait time.Duration
++}
++
++func (d *director) refresh() {
++	urls := d.uf()
++	d.Lock()
++	defer d.Unlock()
++	var endpoints []*endpoint
++	for _, u := range urls {
++		uu, err := url.Parse(u)
++		if err != nil {
++			plog.Printf("upstream URL invalid: %v", err)
++			continue
++		}
++		endpoints = append(endpoints, newEndpoint(*uu, d.failureWait))
++	}
++
++	// shuffle array to avoid connections being "stuck" to a single endpoint
++	for i := range endpoints {
++		j := rand.Intn(i + 1)
++		endpoints[i], endpoints[j] = endpoints[j], endpoints[i]
++	}
++
++	d.ep = endpoints
++}
++
++func (d *director) endpoints() []*endpoint {
++	d.Lock()
++	defer d.Unlock()
++	filtered := make([]*endpoint, 0)
++	for _, ep := range d.ep {
++		if ep.Available {
++			filtered = append(filtered, ep)
++		}
++	}
++
++	return filtered
++}
++
++func newEndpoint(u url.URL, failureWait time.Duration) *endpoint {
++	ep := endpoint{
++		URL:       u,
++		Available: true,
++		failFunc:  timedUnavailabilityFunc(failureWait),
++	}
++
++	return &ep
++}
++
++type endpoint struct {
++	sync.Mutex
++
++	URL       url.URL
++	Available bool
++
++	failFunc func(ep *endpoint)
++}
++
++func (ep *endpoint) Failed() {
++	ep.Lock()
++	if !ep.Available {
++		ep.Unlock()
++		return
++	}
++
++	ep.Available = false
++	ep.Unlock()
++
++	log.Printf("proxy: marked endpoint %s unavailable", ep.URL.String())
++
++	if ep.failFunc == nil {
++		log.Printf("proxy: no failFunc defined, endpoint %s will be unavailable forever.", ep.URL.String())
++		return
++	}
++
++	ep.failFunc(ep)
++}
++
++func timedUnavailabilityFunc(wait time.Duration) func(*endpoint) {
++	return func(ep *endpoint) {
++		time.AfterFunc(wait, func() {
++			ep.Available = true
++			log.Printf("proxy: marked endpoint %s available, to retest connectivity", ep.URL.String())
++		})
++	}
++}
+diff --git a/proxy/httpproxy/director_test.go b/proxy/httpproxy/director_test.go
+new file mode 100644
+index 0000000..24bb433
+--- /dev/null
++++ b/proxy/httpproxy/director_test.go
+@@ -0,0 +1,95 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"net/url"
++	"reflect"
++	"sort"
++	"testing"
++	"time"
++)
++
++func TestNewDirectorScheme(t *testing.T) {
++	tests := []struct {
++		urls []string
++		want []string
++	}{
++		{
++			urls: []string{"http://192.0.2.8:4002", "http://example.com:8080"},
++			want: []string{"http://192.0.2.8:4002", "http://example.com:8080"},
++		},
++		{
++			urls: []string{"https://192.0.2.8:4002", "https://example.com:8080"},
++			want: []string{"https://192.0.2.8:4002", "https://example.com:8080"},
++		},
++
++		// accept urls without a port
++		{
++			urls: []string{"http://192.0.2.8"},
++			want: []string{"http://192.0.2.8"},
++		},
++
++		// accept urls even if they are garbage
++		{
++			urls: []string{"http://."},
++			want: []string{"http://."},
++		},
++	}
++
++	for i, tt := range tests {
++		uf := func() []string {
++			return tt.urls
++		}
++		got := newDirector(uf, time.Minute, time.Minute)
++
++		var gep []string
++		for _, ep := range got.ep {
++			gep = append(gep, ep.URL.String())
++		}
++		sort.Strings(tt.want)
++		sort.Strings(gep)
++		if !reflect.DeepEqual(tt.want, gep) {
++			t.Errorf("#%d: want endpoints = %#v, got = %#v", i, tt.want, gep)
++		}
++	}
++}
++
++func TestDirectorEndpointsFiltering(t *testing.T) {
++	d := director{
++		ep: []*endpoint{
++			{
++				URL:       url.URL{Scheme: "http", Host: "192.0.2.5:5050"},
++				Available: false,
++			},
++			{
++				URL:       url.URL{Scheme: "http", Host: "192.0.2.4:4000"},
++				Available: true,
++			},
++		},
++	}
++
++	got := d.endpoints()
++	want := []*endpoint{
++		{
++			URL:       url.URL{Scheme: "http", Host: "192.0.2.4:4000"},
++			Available: true,
++		},
++	}
++
++	if !reflect.DeepEqual(want, got) {
++		t.Fatalf("directed to incorrect endpoint: want = %#v, got = %#v", want, got)
++	}
++}
+diff --git a/proxy/httpproxy/doc.go b/proxy/httpproxy/doc.go
+new file mode 100644
+index 0000000..561a22e
+--- /dev/null
++++ b/proxy/httpproxy/doc.go
+@@ -0,0 +1,18 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package httpproxy implements etcd httpproxy. The etcd proxy acts as a reverse
++// http proxy forwarding client requests to active etcd cluster members, and does
++// not participate in consensus.
++package httpproxy
+diff --git a/proxy/httpproxy/metrics.go b/proxy/httpproxy/metrics.go
+new file mode 100644
+index 0000000..5cb80c7
+--- /dev/null
++++ b/proxy/httpproxy/metrics.go
+@@ -0,0 +1,88 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"net/http"
++	"strconv"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++)
++
++var (
++	requestsIncoming = prometheus.NewCounterVec(
++		prometheus.CounterOpts{
++			Namespace: "etcd",
++			Subsystem: "proxy",
++			Name:      "requests_total",
++			Help:      "Counter requests incoming by method.",
++		}, []string{"method"})
++
++	requestsHandled = prometheus.NewCounterVec(
++		prometheus.CounterOpts{
++			Namespace: "etcd",
++			Subsystem: "proxy",
++			Name:      "handled_total",
++			Help:      "Counter of requests fully handled (by authoratitave servers)",
++		}, []string{"method", "code"})
++
++	requestsDropped = prometheus.NewCounterVec(
++		prometheus.CounterOpts{
++			Namespace: "etcd",
++			Subsystem: "proxy",
++			Name:      "dropped_total",
++			Help:      "Counter of requests dropped on the proxy.",
++		}, []string{"method", "proxying_error"})
++
++	requestsHandlingTime = prometheus.NewHistogramVec(
++		prometheus.HistogramOpts{
++			Namespace: "etcd",
++			Subsystem: "proxy",
++			Name:      "handling_duration_seconds",
++			Help: "Bucketed histogram of handling time of successful events (non-watches), by method " +
++				"(GET/PUT etc.).",
++			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 13),
++		}, []string{"method"})
++)
++
++type forwardingError string
++
++const (
++	zeroEndpoints         forwardingError = "zero_endpoints"
++	failedSendingRequest  forwardingError = "failed_sending_request"
++	failedGettingResponse forwardingError = "failed_getting_response"
++)
++
++func init() {
++	prometheus.MustRegister(requestsIncoming)
++	prometheus.MustRegister(requestsHandled)
++	prometheus.MustRegister(requestsDropped)
++	prometheus.MustRegister(requestsHandlingTime)
++}
++
++func reportIncomingRequest(request *http.Request) {
++	requestsIncoming.WithLabelValues(request.Method).Inc()
++}
++
++func reportRequestHandled(request *http.Request, response *http.Response, startTime time.Time) {
++	method := request.Method
++	requestsHandled.WithLabelValues(method, strconv.Itoa(response.StatusCode)).Inc()
++	requestsHandlingTime.WithLabelValues(method).Observe(time.Since(startTime).Seconds())
++}
++
++func reportRequestDropped(request *http.Request, err forwardingError) {
++	requestsDropped.WithLabelValues(request.Method, string(err)).Inc()
++}
+diff --git a/proxy/httpproxy/proxy.go b/proxy/httpproxy/proxy.go
+new file mode 100644
+index 0000000..e70d474
+--- /dev/null
++++ b/proxy/httpproxy/proxy.go
+@@ -0,0 +1,106 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"encoding/json"
++	"net/http"
++	"strings"
++	"time"
++)
++
++const (
++	// DefaultMaxIdleConnsPerHost indicates the default maximum idle connection
++	// count maintained between proxy and each member. We set it to 128 to
++	// let proxy handle 128 concurrent requests in long term smoothly.
++	// If the number of concurrent requests is bigger than this value,
++	// proxy needs to create one new connection when handling each request in
++	// the delta, which is bad because the creation consumes resource and
++	// may eat up ephemeral ports.
++	DefaultMaxIdleConnsPerHost = 128
++)
++
++// GetProxyURLs is a function which should return the current set of URLs to
++// which client requests should be proxied. This function will be queried
++// periodically by the proxy Handler to refresh the set of available
++// backends.
++type GetProxyURLs func() []string
++
++// NewHandler creates a new HTTP handler, listening on the given transport,
++// which will proxy requests to an etcd cluster.
++// The handler will periodically update its view of the cluster.
++func NewHandler(t *http.Transport, urlsFunc GetProxyURLs, failureWait time.Duration, refreshInterval time.Duration) http.Handler {
++	p := &reverseProxy{
++		director:  newDirector(urlsFunc, failureWait, refreshInterval),
++		transport: t,
++	}
++
++	mux := http.NewServeMux()
++	mux.Handle("/", p)
++	mux.HandleFunc("/v2/config/local/proxy", p.configHandler)
++
++	return mux
++}
++
++// NewReadonlyHandler wraps the given HTTP handler to allow only GET requests
++func NewReadonlyHandler(hdlr http.Handler) http.Handler {
++	readonly := readonlyHandlerFunc(hdlr)
++	return http.HandlerFunc(readonly)
++}
++
++func readonlyHandlerFunc(next http.Handler) func(http.ResponseWriter, *http.Request) {
++	return func(w http.ResponseWriter, req *http.Request) {
++		if req.Method != "GET" {
++			w.WriteHeader(http.StatusNotImplemented)
++			return
++		}
++
++		next.ServeHTTP(w, req)
++	}
++}
++
++func (p *reverseProxy) configHandler(w http.ResponseWriter, r *http.Request) {
++	if !allowMethod(w, r.Method, "GET") {
++		return
++	}
++
++	eps := p.director.endpoints()
++	epstr := make([]string, len(eps))
++	for i, e := range eps {
++		epstr[i] = e.URL.String()
++	}
++
++	proxyConfig := struct {
++		Endpoints []string `json:"endpoints"`
++	}{
++		Endpoints: epstr,
++	}
++
++	json.NewEncoder(w).Encode(proxyConfig)
++}
++
++// allowMethod verifies that the given method is one of the allowed methods,
++// and if not, it writes an error to w.  A boolean is returned indicating
++// whether or not the method is allowed.
++func allowMethod(w http.ResponseWriter, m string, ms ...string) bool {
++	for _, meth := range ms {
++		if m == meth {
++			return true
++		}
++	}
++	w.Header().Set("Allow", strings.Join(ms, ","))
++	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
++	return false
++}
+diff --git a/proxy/httpproxy/proxy_test.go b/proxy/httpproxy/proxy_test.go
+new file mode 100644
+index 0000000..21a9195
+--- /dev/null
++++ b/proxy/httpproxy/proxy_test.go
+@@ -0,0 +1,98 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"io/ioutil"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"testing"
++	"time"
++)
++
++func TestReadonlyHandler(t *testing.T) {
++	fixture := func(w http.ResponseWriter, req *http.Request) {
++		w.WriteHeader(http.StatusOK)
++	}
++	hdlrFunc := readonlyHandlerFunc(http.HandlerFunc(fixture))
++
++	tests := []struct {
++		method string
++		want   int
++	}{
++		// GET is only passing method
++		{"GET", http.StatusOK},
++
++		// everything but GET is StatusNotImplemented
++		{"POST", http.StatusNotImplemented},
++		{"PUT", http.StatusNotImplemented},
++		{"PATCH", http.StatusNotImplemented},
++		{"DELETE", http.StatusNotImplemented},
++		{"FOO", http.StatusNotImplemented},
++	}
++
++	for i, tt := range tests {
++		req, _ := http.NewRequest(tt.method, "http://example.com", nil)
++		rr := httptest.NewRecorder()
++		hdlrFunc(rr, req)
++
++		if tt.want != rr.Code {
++			t.Errorf("#%d: incorrect HTTP status code: method=%s want=%d got=%d", i, tt.method, tt.want, rr.Code)
++		}
++	}
++}
++
++func TestConfigHandlerGET(t *testing.T) {
++	var err error
++	us := make([]*url.URL, 3)
++	us[0], err = url.Parse("http://example1.com")
++	if err != nil {
++		t.Fatal(err)
++	}
++	us[1], err = url.Parse("http://example2.com")
++	if err != nil {
++		t.Fatal(err)
++	}
++	us[2], err = url.Parse("http://example3.com")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	rp := reverseProxy{
++		director: &director{
++			ep: []*endpoint{
++				newEndpoint(*us[0], 1*time.Second),
++				newEndpoint(*us[1], 1*time.Second),
++				newEndpoint(*us[2], 1*time.Second),
++			},
++		},
++	}
++
++	req, _ := http.NewRequest("GET", "http://example.com//v2/config/local/proxy", nil)
++	rr := httptest.NewRecorder()
++	rp.configHandler(rr, req)
++
++	wbody := "{\"endpoints\":[\"http://example1.com\",\"http://example2.com\",\"http://example3.com\"]}\n"
++
++	body, err := ioutil.ReadAll(rr.Body)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if string(body) != wbody {
++		t.Errorf("body = %s, want %s", string(body), wbody)
++	}
++}
+diff --git a/proxy/httpproxy/reverse.go b/proxy/httpproxy/reverse.go
+new file mode 100644
+index 0000000..e683f0c
+--- /dev/null
++++ b/proxy/httpproxy/reverse.go
+@@ -0,0 +1,206 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"log"
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync/atomic"
++
++	"time"
++
++	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
++	"github.com/coreos/etcd/pkg/httputil"
++	"github.com/coreos/pkg/capnslog"
++)
++
++var (
++	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "proxy")
++
++	// Hop-by-hop headers. These are removed when sent to the backend.
++	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
++	// This list of headers borrowed from stdlib httputil.ReverseProxy
++	singleHopHeaders = []string{
++		"Connection",
++		"Keep-Alive",
++		"Proxy-Authenticate",
++		"Proxy-Authorization",
++		"Te", // canonicalized version of "TE"
++		"Trailers",
++		"Transfer-Encoding",
++		"Upgrade",
++	}
++)
++
++func removeSingleHopHeaders(hdrs *http.Header) {
++	for _, h := range singleHopHeaders {
++		hdrs.Del(h)
++	}
++}
++
++type reverseProxy struct {
++	director  *director
++	transport http.RoundTripper
++}
++
++func (p *reverseProxy) ServeHTTP(rw http.ResponseWriter, clientreq *http.Request) {
++	reportIncomingRequest(clientreq)
++	proxyreq := new(http.Request)
++	*proxyreq = *clientreq
++	startTime := time.Now()
++
++	var (
++		proxybody []byte
++		err       error
++	)
++
++	if clientreq.Body != nil {
++		proxybody, err = ioutil.ReadAll(clientreq.Body)
++		if err != nil {
++			msg := fmt.Sprintf("proxy: failed to read request body: %v", err)
++			e := httptypes.NewHTTPError(http.StatusInternalServerError, msg)
++			if we := e.WriteTo(rw); we != nil {
++				plog.Debugf("error writing HTTPError (%v) to %s", we, clientreq.RemoteAddr)
++			}
++			return
++		}
++	}
++
++	// deep-copy the headers, as these will be modified below
++	proxyreq.Header = make(http.Header)
++	copyHeader(proxyreq.Header, clientreq.Header)
++
++	normalizeRequest(proxyreq)
++	removeSingleHopHeaders(&proxyreq.Header)
++	maybeSetForwardedFor(proxyreq)
++
++	endpoints := p.director.endpoints()
++	if len(endpoints) == 0 {
++		msg := "proxy: zero endpoints currently available"
++		reportRequestDropped(clientreq, zeroEndpoints)
++
++		// TODO: limit the rate of the error logging.
++		log.Printf(msg)
++		e := httptypes.NewHTTPError(http.StatusServiceUnavailable, msg)
++		if we := e.WriteTo(rw); we != nil {
++			plog.Debugf("error writing HTTPError (%v) to %s", we, clientreq.RemoteAddr)
++		}
++		return
++	}
++
++	var requestClosed int32
++	completeCh := make(chan bool, 1)
++	closeNotifier, ok := rw.(http.CloseNotifier)
++	cancel := httputil.RequestCanceler(p.transport, proxyreq)
++	if ok {
++		go func() {
++			select {
++			case <-closeNotifier.CloseNotify():
++				atomic.StoreInt32(&requestClosed, 1)
++				log.Printf("proxy: client %v closed request prematurely", clientreq.RemoteAddr)
++				cancel()
++			case <-completeCh:
++			}
++		}()
++
++		defer func() {
++			completeCh <- true
++		}()
++	}
++
++	var res *http.Response
++
++	for _, ep := range endpoints {
++		if proxybody != nil {
++			proxyreq.Body = ioutil.NopCloser(bytes.NewBuffer(proxybody))
++		}
++		redirectRequest(proxyreq, ep.URL)
++
++		res, err = p.transport.RoundTrip(proxyreq)
++		if atomic.LoadInt32(&requestClosed) == 1 {
++			return
++		}
++		if err != nil {
++			reportRequestDropped(clientreq, failedSendingRequest)
++			log.Printf("proxy: failed to direct request to %s: %v", ep.URL.String(), err)
++			ep.Failed()
++			continue
++		}
++
++		break
++	}
++
++	if res == nil {
++		// TODO: limit the rate of the error logging.
++		msg := fmt.Sprintf("proxy: unable to get response from %d endpoint(s)", len(endpoints))
++		reportRequestDropped(clientreq, failedGettingResponse)
++		log.Printf(msg)
++		e := httptypes.NewHTTPError(http.StatusBadGateway, msg)
++		if we := e.WriteTo(rw); we != nil {
++			plog.Debugf("error writing HTTPError (%v) to %s", we, clientreq.RemoteAddr)
++		}
++		return
++	}
++
++	defer res.Body.Close()
++	reportRequestHandled(clientreq, res, startTime)
++	removeSingleHopHeaders(&res.Header)
++	copyHeader(rw.Header(), res.Header)
++
++	rw.WriteHeader(res.StatusCode)
++	io.Copy(rw, res.Body)
++}
++
++func copyHeader(dst, src http.Header) {
++	for k, vv := range src {
++		for _, v := range vv {
++			dst.Add(k, v)
++		}
++	}
++}
++
++func redirectRequest(req *http.Request, loc url.URL) {
++	req.URL.Scheme = loc.Scheme
++	req.URL.Host = loc.Host
++}
++
++func normalizeRequest(req *http.Request) {
++	req.Proto = "HTTP/1.1"
++	req.ProtoMajor = 1
++	req.ProtoMinor = 1
++	req.Close = false
++}
++
++func maybeSetForwardedFor(req *http.Request) {
++	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
++	if err != nil {
++		return
++	}
++
++	// If we aren't the first proxy retain prior
++	// X-Forwarded-For information as a comma+space
++	// separated list and fold multiple headers into one.
++	if prior, ok := req.Header["X-Forwarded-For"]; ok {
++		clientIP = strings.Join(prior, ", ") + ", " + clientIP
++	}
++	req.Header.Set("X-Forwarded-For", clientIP)
++}
+diff --git a/proxy/httpproxy/reverse_test.go b/proxy/httpproxy/reverse_test.go
+new file mode 100644
+index 0000000..8739431
+--- /dev/null
++++ b/proxy/httpproxy/reverse_test.go
+@@ -0,0 +1,245 @@
++// Copyright 2015 CoreOS, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package httpproxy
++
++import (
++	"bytes"
++	"errors"
++	"io/ioutil"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"reflect"
++	"testing"
++)
++
++type staticRoundTripper struct {
++	res *http.Response
++	err error
++}
++
++func (srt *staticRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
++	return srt.res, srt.err
++}
++
++func TestReverseProxyServe(t *testing.T) {
++	u := url.URL{Scheme: "http", Host: "192.0.2.3:4040"}
++
++	tests := []struct {
++		eps  []*endpoint
++		rt   http.RoundTripper
++		want int
++	}{
++		// no endpoints available so no requests are even made
++		{
++			eps: []*endpoint{},
++			rt: &staticRoundTripper{
++				res: &http.Response{
++					StatusCode: http.StatusCreated,
++					Body:       ioutil.NopCloser(&bytes.Reader{}),
++				},
++			},
++			want: http.StatusServiceUnavailable,
++		},
++
++		// error is returned from one endpoint that should be available
++		{
++			eps:  []*endpoint{{URL: u, Available: true}},
++			rt:   &staticRoundTripper{err: errors.New("what a bad trip")},
++			want: http.StatusBadGateway,
++		},
++
++		// endpoint is available and returns success
++		{
++			eps: []*endpoint{{URL: u, Available: true}},
++			rt: &staticRoundTripper{
++				res: &http.Response{
++					StatusCode: http.StatusCreated,
++					Body:       ioutil.NopCloser(&bytes.Reader{}),
++					Header:     map[string][]string{"Content-Type": {"application/json"}},
++				},
++			},
++			want: http.StatusCreated,
++		},
++	}
++
++	for i, tt := range tests {
++		rp := reverseProxy{
++			director:  &director{ep: tt.eps},
++			transport: tt.rt,
++		}
++
++		req, _ := http.NewRequest("GET", "http://192.0.2.2:2379", nil)
++		rr := httptest.NewRecorder()
++		rp.ServeHTTP(rr, req)
++
++		if rr.Code != tt.want {
++			t.Errorf("#%d: unexpected HTTP status code: want = %d, got = %d", i, tt.want, rr.Code)
++		}
++		if gct := rr.Header().Get("Content-Type"); gct != "application/json" {
++			t.Errorf("#%d: Content-Type = %s, want %s", i, gct, "application/json")
++		}
++	}
++}
++
++func TestRedirectRequest(t *testing.T) {
++	loc := url.URL{
++		Scheme: "http",
++		Host:   "bar.example.com",
++	}
++
++	req := &http.Request{
++		Method: "GET",
++		Host:   "foo.example.com",
++		URL: &url.URL{
++			Host: "foo.example.com",
++			Path: "/v2/keys/baz",
++		},
++	}
++
++	redirectRequest(req, loc)
++
++	want := &http.Request{
++		Method: "GET",
++		// this field must not change
++		Host: "foo.example.com",
++		URL: &url.URL{
++			// the Scheme field is updated to that of the provided URL
++			Scheme: "http",
++			// the Host field is updated to that of the provided URL
++			Host: "bar.example.com",
++			Path: "/v2/keys/baz",
++		},
++	}
++
++	if !reflect.DeepEqual(want, req) {
++		t.Fatalf("HTTP request does not match expected criteria: want=%#v got=%#v", want, req)
++	}
++}
++
++func TestMaybeSetForwardedFor(t *testing.T) {
++	tests := []struct {
++		raddr  string
++		fwdFor string
++		want   string
++	}{
++		{"192.0.2.3:8002", "", "192.0.2.3"},
++		{"192.0.2.3:8002", "192.0.2.2", "192.0.2.2, 192.0.2.3"},
++		{"192.0.2.3:8002", "192.0.2.1, 192.0.2.2", "192.0.2.1, 192.0.2.2, 192.0.2.3"},
++		{"example.com:8002", "", "example.com"},
++
++		// While these cases look valid, golang net/http will not let it happen
++		// The RemoteAddr field will always be a valid host:port
++		{":8002", "", ""},
++		{"192.0.2.3", "", ""},
++
++		// blatantly invalid host w/o a port
++		{"12", "", ""},
++		{"12", "192.0.2.3", "192.0.2.3"},
++	}
++
++	for i, tt := range tests {
++		req := &http.Request{
++			RemoteAddr: tt.raddr,
++			Header:     make(http.Header),
++		}
++
++		if tt.fwdFor != "" {
++			req.Header.Set("X-Forwarded-For", tt.fwdFor)
++		}
++
++		maybeSetForwardedFor(req)
++		got := req.Header.Get("X-Forwarded-For")
++		if tt.want != got {
++			t.Errorf("#%d: incorrect header: want = %q, got = %q", i, tt.want, got)
++		}
++	}
++}
++
++func TestRemoveSingleHopHeaders(t *testing.T) {
++	hdr := http.Header(map[string][]string{
++		// single-hop headers that should be removed
++		"Connection":          {"close"},
++		"Keep-Alive":          {"foo"},
++		"Proxy-Authenticate":  {"Basic realm=example.com"},
++		"Proxy-Authorization": {"foo"},
++		"Te":                {"deflate,gzip"},
++		"Trailers":          {"ETag"},
++		"Transfer-Encoding": {"chunked"},
++		"Upgrade":           {"WebSocket"},
++
++		// headers that should persist
++		"Accept": {"application/json"},
++		"X-Foo":  {"Bar"},
++	})
++
++	removeSingleHopHeaders(&hdr)
++
++	want := http.Header(map[string][]string{
++		"Accept": {"application/json"},
++		"X-Foo":  {"Bar"},
++	})
++
++	if !reflect.DeepEqual(want, hdr) {
++		t.Fatalf("unexpected result: want = %#v, got = %#v", want, hdr)
++	}
++}
++
++func TestCopyHeader(t *testing.T) {
++	tests := []struct {
++		src  http.Header
++		dst  http.Header
++		want http.Header
++	}{
++		{
++			src: http.Header(map[string][]string{
++				"Foo": {"bar", "baz"},
++			}),
++			dst: http.Header(map[string][]string{}),
++			want: http.Header(map[string][]string{
++				"Foo": {"bar", "baz"},
++			}),
++		},
++		{
++			src: http.Header(map[string][]string{
++				"Foo":  {"bar"},
++				"Ping": {"pong"},
++			}),
++			dst: http.Header(map[string][]string{}),
++			want: http.Header(map[string][]string{
++				"Foo":  {"bar"},
++				"Ping": {"pong"},
++			}),
++		},
++		{
++			src: http.Header(map[string][]string{
++				"Foo": {"bar", "baz"},
++			}),
++			dst: http.Header(map[string][]string{
++				"Foo": {"qux"},
++			}),
++			want: http.Header(map[string][]string{
++				"Foo": {"qux", "bar", "baz"},
++			}),
++		},
++	}
++
++	for i, tt := range tests {
++		copyHeader(tt.dst, tt.src)
++		if !reflect.DeepEqual(tt.dst, tt.want) {
++			t.Errorf("#%d: unexpected headers: want = %v, got = %v", i, tt.want, tt.dst)
++		}
++	}
++}
+diff --git a/proxy/metrics.go b/proxy/metrics.go
+deleted file mode 100644
+index 3a6fefb..0000000
+--- a/proxy/metrics.go
++++ /dev/null
+@@ -1,88 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"net/http"
+-	"strconv"
+-	"time"
+-
+-	"github.com/prometheus/client_golang/prometheus"
+-)
+-
+-var (
+-	requestsIncoming = prometheus.NewCounterVec(
+-		prometheus.CounterOpts{
+-			Namespace: "etcd",
+-			Subsystem: "proxy",
+-			Name:      "requests_total",
+-			Help:      "Counter requests incoming by method.",
+-		}, []string{"method"})
+-
+-	requestsHandled = prometheus.NewCounterVec(
+-		prometheus.CounterOpts{
+-			Namespace: "etcd",
+-			Subsystem: "proxy",
+-			Name:      "handled_total",
+-			Help:      "Counter of requests fully handled (by authoratitave servers)",
+-		}, []string{"method", "code"})
+-
+-	requestsDropped = prometheus.NewCounterVec(
+-		prometheus.CounterOpts{
+-			Namespace: "etcd",
+-			Subsystem: "proxy",
+-			Name:      "dropped_total",
+-			Help:      "Counter of requests dropped on the proxy.",
+-		}, []string{"method", "proxying_error"})
+-
+-	requestsHandlingTime = prometheus.NewHistogramVec(
+-		prometheus.HistogramOpts{
+-			Namespace: "etcd",
+-			Subsystem: "proxy",
+-			Name:      "handling_duration_seconds",
+-			Help: "Bucketed histogram of handling time of successful events (non-watches), by method " +
+-				"(GET/PUT etc.).",
+-			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 13),
+-		}, []string{"method"})
+-)
+-
+-type forwardingError string
+-
+-const (
+-	zeroEndpoints         forwardingError = "zero_endpoints"
+-	failedSendingRequest  forwardingError = "failed_sending_request"
+-	failedGettingResponse forwardingError = "failed_getting_response"
+-)
+-
+-func init() {
+-	prometheus.MustRegister(requestsIncoming)
+-	prometheus.MustRegister(requestsHandled)
+-	prometheus.MustRegister(requestsDropped)
+-	prometheus.MustRegister(requestsHandlingTime)
+-}
+-
+-func reportIncomingRequest(request *http.Request) {
+-	requestsIncoming.WithLabelValues(request.Method).Inc()
+-}
+-
+-func reportRequestHandled(request *http.Request, response *http.Response, startTime time.Time) {
+-	method := request.Method
+-	requestsHandled.WithLabelValues(method, strconv.Itoa(response.StatusCode)).Inc()
+-	requestsHandlingTime.WithLabelValues(method).Observe(time.Since(startTime).Seconds())
+-}
+-
+-func reportRequestDropped(request *http.Request, err forwardingError) {
+-	requestsDropped.WithLabelValues(request.Method, string(err)).Inc()
+-}
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+deleted file mode 100644
+index bf47f09..0000000
+--- a/proxy/proxy.go
++++ /dev/null
+@@ -1,106 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"encoding/json"
+-	"net/http"
+-	"strings"
+-	"time"
+-)
+-
+-const (
+-	// DefaultMaxIdleConnsPerHost indicates the default maximum idle connection
+-	// count maintained between proxy and each member. We set it to 128 to
+-	// let proxy handle 128 concurrent requests in long term smoothly.
+-	// If the number of concurrent requests is bigger than this value,
+-	// proxy needs to create one new connection when handling each request in
+-	// the delta, which is bad because the creation consumes resource and
+-	// may eat up ephemeral ports.
+-	DefaultMaxIdleConnsPerHost = 128
+-)
+-
+-// GetProxyURLs is a function which should return the current set of URLs to
+-// which client requests should be proxied. This function will be queried
+-// periodically by the proxy Handler to refresh the set of available
+-// backends.
+-type GetProxyURLs func() []string
+-
+-// NewHandler creates a new HTTP handler, listening on the given transport,
+-// which will proxy requests to an etcd cluster.
+-// The handler will periodically update its view of the cluster.
+-func NewHandler(t *http.Transport, urlsFunc GetProxyURLs, failureWait time.Duration, refreshInterval time.Duration) http.Handler {
+-	p := &reverseProxy{
+-		director:  newDirector(urlsFunc, failureWait, refreshInterval),
+-		transport: t,
+-	}
+-
+-	mux := http.NewServeMux()
+-	mux.Handle("/", p)
+-	mux.HandleFunc("/v2/config/local/proxy", p.configHandler)
+-
+-	return mux
+-}
+-
+-// NewReadonlyHandler wraps the given HTTP handler to allow only GET requests
+-func NewReadonlyHandler(hdlr http.Handler) http.Handler {
+-	readonly := readonlyHandlerFunc(hdlr)
+-	return http.HandlerFunc(readonly)
+-}
+-
+-func readonlyHandlerFunc(next http.Handler) func(http.ResponseWriter, *http.Request) {
+-	return func(w http.ResponseWriter, req *http.Request) {
+-		if req.Method != "GET" {
+-			w.WriteHeader(http.StatusNotImplemented)
+-			return
+-		}
+-
+-		next.ServeHTTP(w, req)
+-	}
+-}
+-
+-func (p *reverseProxy) configHandler(w http.ResponseWriter, r *http.Request) {
+-	if !allowMethod(w, r.Method, "GET") {
+-		return
+-	}
+-
+-	eps := p.director.endpoints()
+-	epstr := make([]string, len(eps))
+-	for i, e := range eps {
+-		epstr[i] = e.URL.String()
+-	}
+-
+-	proxyConfig := struct {
+-		Endpoints []string `json:"endpoints"`
+-	}{
+-		Endpoints: epstr,
+-	}
+-
+-	json.NewEncoder(w).Encode(proxyConfig)
+-}
+-
+-// allowMethod verifies that the given method is one of the allowed methods,
+-// and if not, it writes an error to w.  A boolean is returned indicating
+-// whether or not the method is allowed.
+-func allowMethod(w http.ResponseWriter, m string, ms ...string) bool {
+-	for _, meth := range ms {
+-		if m == meth {
+-			return true
+-		}
+-	}
+-	w.Header().Set("Allow", strings.Join(ms, ","))
+-	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+-	return false
+-}
+diff --git a/proxy/proxy_test.go b/proxy/proxy_test.go
+deleted file mode 100644
+index 735068a..0000000
+--- a/proxy/proxy_test.go
++++ /dev/null
+@@ -1,98 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"io/ioutil"
+-	"net/http"
+-	"net/http/httptest"
+-	"net/url"
+-	"testing"
+-	"time"
+-)
+-
+-func TestReadonlyHandler(t *testing.T) {
+-	fixture := func(w http.ResponseWriter, req *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-	}
+-	hdlrFunc := readonlyHandlerFunc(http.HandlerFunc(fixture))
+-
+-	tests := []struct {
+-		method string
+-		want   int
+-	}{
+-		// GET is only passing method
+-		{"GET", http.StatusOK},
+-
+-		// everything but GET is StatusNotImplemented
+-		{"POST", http.StatusNotImplemented},
+-		{"PUT", http.StatusNotImplemented},
+-		{"PATCH", http.StatusNotImplemented},
+-		{"DELETE", http.StatusNotImplemented},
+-		{"FOO", http.StatusNotImplemented},
+-	}
+-
+-	for i, tt := range tests {
+-		req, _ := http.NewRequest(tt.method, "http://example.com", nil)
+-		rr := httptest.NewRecorder()
+-		hdlrFunc(rr, req)
+-
+-		if tt.want != rr.Code {
+-			t.Errorf("#%d: incorrect HTTP status code: method=%s want=%d got=%d", i, tt.method, tt.want, rr.Code)
+-		}
+-	}
+-}
+-
+-func TestConfigHandlerGET(t *testing.T) {
+-	var err error
+-	us := make([]*url.URL, 3)
+-	us[0], err = url.Parse("http://example1.com")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	us[1], err = url.Parse("http://example2.com")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	us[2], err = url.Parse("http://example3.com")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	rp := reverseProxy{
+-		director: &director{
+-			ep: []*endpoint{
+-				newEndpoint(*us[0], 1*time.Second),
+-				newEndpoint(*us[1], 1*time.Second),
+-				newEndpoint(*us[2], 1*time.Second),
+-			},
+-		},
+-	}
+-
+-	req, _ := http.NewRequest("GET", "http://example.com//v2/config/local/proxy", nil)
+-	rr := httptest.NewRecorder()
+-	rp.configHandler(rr, req)
+-
+-	wbody := "{\"endpoints\":[\"http://example1.com\",\"http://example2.com\",\"http://example3.com\"]}\n"
+-
+-	body, err := ioutil.ReadAll(rr.Body)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if string(body) != wbody {
+-		t.Errorf("body = %s, want %s", string(body), wbody)
+-	}
+-}
+diff --git a/proxy/reverse.go b/proxy/reverse.go
+deleted file mode 100644
+index 4d754e3..0000000
+--- a/proxy/reverse.go
++++ /dev/null
+@@ -1,206 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"io"
+-	"io/ioutil"
+-	"log"
+-	"net"
+-	"net/http"
+-	"net/url"
+-	"strings"
+-	"sync/atomic"
+-
+-	"time"
+-
+-	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
+-	"github.com/coreos/etcd/pkg/httputil"
+-	"github.com/coreos/pkg/capnslog"
+-)
+-
+-var (
+-	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "proxy")
+-
+-	// Hop-by-hop headers. These are removed when sent to the backend.
+-	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
+-	// This list of headers borrowed from stdlib httputil.ReverseProxy
+-	singleHopHeaders = []string{
+-		"Connection",
+-		"Keep-Alive",
+-		"Proxy-Authenticate",
+-		"Proxy-Authorization",
+-		"Te", // canonicalized version of "TE"
+-		"Trailers",
+-		"Transfer-Encoding",
+-		"Upgrade",
+-	}
+-)
+-
+-func removeSingleHopHeaders(hdrs *http.Header) {
+-	for _, h := range singleHopHeaders {
+-		hdrs.Del(h)
+-	}
+-}
+-
+-type reverseProxy struct {
+-	director  *director
+-	transport http.RoundTripper
+-}
+-
+-func (p *reverseProxy) ServeHTTP(rw http.ResponseWriter, clientreq *http.Request) {
+-	reportIncomingRequest(clientreq)
+-	proxyreq := new(http.Request)
+-	*proxyreq = *clientreq
+-	startTime := time.Now()
+-
+-	var (
+-		proxybody []byte
+-		err       error
+-	)
+-
+-	if clientreq.Body != nil {
+-		proxybody, err = ioutil.ReadAll(clientreq.Body)
+-		if err != nil {
+-			msg := fmt.Sprintf("proxy: failed to read request body: %v", err)
+-			e := httptypes.NewHTTPError(http.StatusInternalServerError, msg)
+-			if we := e.WriteTo(rw); we != nil {
+-				plog.Debugf("error writing HTTPError (%v) to %s", we, clientreq.RemoteAddr)
+-			}
+-			return
+-		}
+-	}
+-
+-	// deep-copy the headers, as these will be modified below
+-	proxyreq.Header = make(http.Header)
+-	copyHeader(proxyreq.Header, clientreq.Header)
+-
+-	normalizeRequest(proxyreq)
+-	removeSingleHopHeaders(&proxyreq.Header)
+-	maybeSetForwardedFor(proxyreq)
+-
+-	endpoints := p.director.endpoints()
+-	if len(endpoints) == 0 {
+-		msg := "proxy: zero endpoints currently available"
+-		reportRequestDropped(clientreq, zeroEndpoints)
+-
+-		// TODO: limit the rate of the error logging.
+-		log.Printf(msg)
+-		e := httptypes.NewHTTPError(http.StatusServiceUnavailable, msg)
+-		if we := e.WriteTo(rw); we != nil {
+-			plog.Debugf("error writing HTTPError (%v) to %s", we, clientreq.RemoteAddr)
+-		}
+-		return
+-	}
+-
+-	var requestClosed int32
+-	completeCh := make(chan bool, 1)
+-	closeNotifier, ok := rw.(http.CloseNotifier)
+-	cancel := httputil.RequestCanceler(p.transport, proxyreq)
+-	if ok {
+-		go func() {
+-			select {
+-			case <-closeNotifier.CloseNotify():
+-				atomic.StoreInt32(&requestClosed, 1)
+-				log.Printf("proxy: client %v closed request prematurely", clientreq.RemoteAddr)
+-				cancel()
+-			case <-completeCh:
+-			}
+-		}()
+-
+-		defer func() {
+-			completeCh <- true
+-		}()
+-	}
+-
+-	var res *http.Response
+-
+-	for _, ep := range endpoints {
+-		if proxybody != nil {
+-			proxyreq.Body = ioutil.NopCloser(bytes.NewBuffer(proxybody))
+-		}
+-		redirectRequest(proxyreq, ep.URL)
+-
+-		res, err = p.transport.RoundTrip(proxyreq)
+-		if atomic.LoadInt32(&requestClosed) == 1 {
+-			return
+-		}
+-		if err != nil {
+-			reportRequestDropped(clientreq, failedSendingRequest)
+-			log.Printf("proxy: failed to direct request to %s: %v", ep.URL.String(), err)
+-			ep.Failed()
+-			continue
+-		}
+-
+-		break
+-	}
+-
+-	if res == nil {
+-		// TODO: limit the rate of the error logging.
+-		msg := fmt.Sprintf("proxy: unable to get response from %d endpoint(s)", len(endpoints))
+-		reportRequestDropped(clientreq, failedGettingResponse)
+-		log.Printf(msg)
+-		e := httptypes.NewHTTPError(http.StatusBadGateway, msg)
+-		if we := e.WriteTo(rw); we != nil {
+-			plog.Debugf("error writing HTTPError (%v) to %s", we, clientreq.RemoteAddr)
+-		}
+-		return
+-	}
+-
+-	defer res.Body.Close()
+-	reportRequestHandled(clientreq, res, startTime)
+-	removeSingleHopHeaders(&res.Header)
+-	copyHeader(rw.Header(), res.Header)
+-
+-	rw.WriteHeader(res.StatusCode)
+-	io.Copy(rw, res.Body)
+-}
+-
+-func copyHeader(dst, src http.Header) {
+-	for k, vv := range src {
+-		for _, v := range vv {
+-			dst.Add(k, v)
+-		}
+-	}
+-}
+-
+-func redirectRequest(req *http.Request, loc url.URL) {
+-	req.URL.Scheme = loc.Scheme
+-	req.URL.Host = loc.Host
+-}
+-
+-func normalizeRequest(req *http.Request) {
+-	req.Proto = "HTTP/1.1"
+-	req.ProtoMajor = 1
+-	req.ProtoMinor = 1
+-	req.Close = false
+-}
+-
+-func maybeSetForwardedFor(req *http.Request) {
+-	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
+-	if err != nil {
+-		return
+-	}
+-
+-	// If we aren't the first proxy retain prior
+-	// X-Forwarded-For information as a comma+space
+-	// separated list and fold multiple headers into one.
+-	if prior, ok := req.Header["X-Forwarded-For"]; ok {
+-		clientIP = strings.Join(prior, ", ") + ", " + clientIP
+-	}
+-	req.Header.Set("X-Forwarded-For", clientIP)
+-}
+diff --git a/proxy/reverse_test.go b/proxy/reverse_test.go
+deleted file mode 100644
+index 01f5cfc..0000000
+--- a/proxy/reverse_test.go
++++ /dev/null
+@@ -1,245 +0,0 @@
+-// Copyright 2015 CoreOS, Inc.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//     http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package proxy
+-
+-import (
+-	"bytes"
+-	"errors"
+-	"io/ioutil"
+-	"net/http"
+-	"net/http/httptest"
+-	"net/url"
+-	"reflect"
+-	"testing"
+-)
+-
+-type staticRoundTripper struct {
+-	res *http.Response
+-	err error
+-}
+-
+-func (srt *staticRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+-	return srt.res, srt.err
+-}
+-
+-func TestReverseProxyServe(t *testing.T) {
+-	u := url.URL{Scheme: "http", Host: "192.0.2.3:4040"}
+-
+-	tests := []struct {
+-		eps  []*endpoint
+-		rt   http.RoundTripper
+-		want int
+-	}{
+-		// no endpoints available so no requests are even made
+-		{
+-			eps: []*endpoint{},
+-			rt: &staticRoundTripper{
+-				res: &http.Response{
+-					StatusCode: http.StatusCreated,
+-					Body:       ioutil.NopCloser(&bytes.Reader{}),
+-				},
+-			},
+-			want: http.StatusServiceUnavailable,
+-		},
+-
+-		// error is returned from one endpoint that should be available
+-		{
+-			eps:  []*endpoint{{URL: u, Available: true}},
+-			rt:   &staticRoundTripper{err: errors.New("what a bad trip")},
+-			want: http.StatusBadGateway,
+-		},
+-
+-		// endpoint is available and returns success
+-		{
+-			eps: []*endpoint{{URL: u, Available: true}},
+-			rt: &staticRoundTripper{
+-				res: &http.Response{
+-					StatusCode: http.StatusCreated,
+-					Body:       ioutil.NopCloser(&bytes.Reader{}),
+-					Header:     map[string][]string{"Content-Type": {"application/json"}},
+-				},
+-			},
+-			want: http.StatusCreated,
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		rp := reverseProxy{
+-			director:  &director{ep: tt.eps},
+-			transport: tt.rt,
+-		}
+-
+-		req, _ := http.NewRequest("GET", "http://192.0.2.2:2379", nil)
+-		rr := httptest.NewRecorder()
+-		rp.ServeHTTP(rr, req)
+-
+-		if rr.Code != tt.want {
+-			t.Errorf("#%d: unexpected HTTP status code: want = %d, got = %d", i, tt.want, rr.Code)
+-		}
+-		if gct := rr.Header().Get("Content-Type"); gct != "application/json" {
+-			t.Errorf("#%d: Content-Type = %s, want %s", i, gct, "application/json")
+-		}
+-	}
+-}
+-
+-func TestRedirectRequest(t *testing.T) {
+-	loc := url.URL{
+-		Scheme: "http",
+-		Host:   "bar.example.com",
+-	}
+-
+-	req := &http.Request{
+-		Method: "GET",
+-		Host:   "foo.example.com",
+-		URL: &url.URL{
+-			Host: "foo.example.com",
+-			Path: "/v2/keys/baz",
+-		},
+-	}
+-
+-	redirectRequest(req, loc)
+-
+-	want := &http.Request{
+-		Method: "GET",
+-		// this field must not change
+-		Host: "foo.example.com",
+-		URL: &url.URL{
+-			// the Scheme field is updated to that of the provided URL
+-			Scheme: "http",
+-			// the Host field is updated to that of the provided URL
+-			Host: "bar.example.com",
+-			Path: "/v2/keys/baz",
+-		},
+-	}
+-
+-	if !reflect.DeepEqual(want, req) {
+-		t.Fatalf("HTTP request does not match expected criteria: want=%#v got=%#v", want, req)
+-	}
+-}
+-
+-func TestMaybeSetForwardedFor(t *testing.T) {
+-	tests := []struct {
+-		raddr  string
+-		fwdFor string
+-		want   string
+-	}{
+-		{"192.0.2.3:8002", "", "192.0.2.3"},
+-		{"192.0.2.3:8002", "192.0.2.2", "192.0.2.2, 192.0.2.3"},
+-		{"192.0.2.3:8002", "192.0.2.1, 192.0.2.2", "192.0.2.1, 192.0.2.2, 192.0.2.3"},
+-		{"example.com:8002", "", "example.com"},
+-
+-		// While these cases look valid, golang net/http will not let it happen
+-		// The RemoteAddr field will always be a valid host:port
+-		{":8002", "", ""},
+-		{"192.0.2.3", "", ""},
+-
+-		// blatantly invalid host w/o a port
+-		{"12", "", ""},
+-		{"12", "192.0.2.3", "192.0.2.3"},
+-	}
+-
+-	for i, tt := range tests {
+-		req := &http.Request{
+-			RemoteAddr: tt.raddr,
+-			Header:     make(http.Header),
+-		}
+-
+-		if tt.fwdFor != "" {
+-			req.Header.Set("X-Forwarded-For", tt.fwdFor)
+-		}
+-
+-		maybeSetForwardedFor(req)
+-		got := req.Header.Get("X-Forwarded-For")
+-		if tt.want != got {
+-			t.Errorf("#%d: incorrect header: want = %q, got = %q", i, tt.want, got)
+-		}
+-	}
+-}
+-
+-func TestRemoveSingleHopHeaders(t *testing.T) {
+-	hdr := http.Header(map[string][]string{
+-		// single-hop headers that should be removed
+-		"Connection":          {"close"},
+-		"Keep-Alive":          {"foo"},
+-		"Proxy-Authenticate":  {"Basic realm=example.com"},
+-		"Proxy-Authorization": {"foo"},
+-		"Te":                {"deflate,gzip"},
+-		"Trailers":          {"ETag"},
+-		"Transfer-Encoding": {"chunked"},
+-		"Upgrade":           {"WebSocket"},
+-
+-		// headers that should persist
+-		"Accept": {"application/json"},
+-		"X-Foo":  {"Bar"},
+-	})
+-
+-	removeSingleHopHeaders(&hdr)
+-
+-	want := http.Header(map[string][]string{
+-		"Accept": {"application/json"},
+-		"X-Foo":  {"Bar"},
+-	})
+-
+-	if !reflect.DeepEqual(want, hdr) {
+-		t.Fatalf("unexpected result: want = %#v, got = %#v", want, hdr)
+-	}
+-}
+-
+-func TestCopyHeader(t *testing.T) {
+-	tests := []struct {
+-		src  http.Header
+-		dst  http.Header
+-		want http.Header
+-	}{
+-		{
+-			src: http.Header(map[string][]string{
+-				"Foo": {"bar", "baz"},
+-			}),
+-			dst: http.Header(map[string][]string{}),
+-			want: http.Header(map[string][]string{
+-				"Foo": {"bar", "baz"},
+-			}),
+-		},
+-		{
+-			src: http.Header(map[string][]string{
+-				"Foo":  {"bar"},
+-				"Ping": {"pong"},
+-			}),
+-			dst: http.Header(map[string][]string{}),
+-			want: http.Header(map[string][]string{
+-				"Foo":  {"bar"},
+-				"Ping": {"pong"},
+-			}),
+-		},
+-		{
+-			src: http.Header(map[string][]string{
+-				"Foo": {"bar", "baz"},
+-			}),
+-			dst: http.Header(map[string][]string{
+-				"Foo": {"qux"},
+-			}),
+-			want: http.Header(map[string][]string{
+-				"Foo": {"qux", "bar", "baz"},
+-			}),
+-		},
+-	}
+-
+-	for i, tt := range tests {
+-		copyHeader(tt.dst, tt.src)
+-		if !reflect.DeepEqual(tt.dst, tt.want) {
+-			t.Errorf("#%d: unexpected headers: want = %v, got = %v", i, tt.want, tt.dst)
+-		}
+-	}
+-}
+diff --git a/test b/test
+index 7c1f9c5..8f0c2da 100755
+--- a/test
++++ b/test
+@@ -28,7 +28,7 @@ ln -s ${PWD}/cmd/vendor $GOPATH/src
+ 
+ # Hack: gofmt ./ will recursively check the .git directory. So use *.go for gofmt.
+ PKGS=`ls pkg/*/*go  | cut -f1,2 -d/ | sort | uniq`
+-TESTABLE_AND_FORMATTABLE="client clientv3 discovery error etcdctl/ctlv2 etcdctl/ctlv3 etcdmain etcdserver etcdserver/auth etcdserver/api/v2http etcdserver/api/v2http/httptypes $PKGS proxy raft snap storage storage/backend store version wal"
++TESTABLE_AND_FORMATTABLE="client clientv3 discovery error etcdctl/ctlv2 etcdctl/ctlv3 etcdmain etcdserver etcdserver/auth etcdserver/api/v2http etcdserver/api/v2http/httptypes $PKGS proxy/httpproxy raft snap storage storage/backend store version wal"
+ # TODO: add it to race testing when the issue is resolved
+ # https://github.com/golang/go/issues/9946
+ NO_RACE_TESTABLE="rafthttp"

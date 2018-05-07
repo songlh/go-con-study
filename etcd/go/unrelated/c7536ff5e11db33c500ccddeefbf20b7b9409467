@@ -1,0 +1,128 @@
+commit c7536ff5e11db33c500ccddeefbf20b7b9409467
+Author: Ben Johnson <benbjohnson@yahoo.com>
+Date:   Mon Dec 16 16:50:15 2013 -0700
+
+    Add Tuning section to README.
+
+diff --git a/README.md b/README.md
+index 7b37553..78a32a6 100644
+--- a/README.md
++++ b/README.md
+@@ -1169,7 +1169,50 @@ openssl ca -config openssl.cnf -policy policy_anything -extensions ssl_client -o
+ 
+ ### Tuning
+ 
+-TODO
++The default settings in etcd should work well for installations on a local network where the average network latency is low.
++However, when using etcd across multiple data centers or over networks with high latency you may need to tweak the heartbeat and election timeout settings.
++
++The underlying distributed consensus protocol relies on two separate timeouts to ensure that nodes can handoff leadership if one stalls or goes offline.
++The first timeout is called the *Heartbeat Timeout*.
++This is the frequency with which the leader will notify followers that it is still the leader.
++etcd batches commands together for higher throughput so this heartbeat timeout is also a delay for how long it takes for commands to be committed.
++By default, etcd uses a `50ms` heartbeat timeout.
++
++The second timeout is the *Election Timeout*.
++This timeout is how long a follower node will go without hearing a heartbeat before attempting to become leader itself.
++By default, etcd uses a `200ms` election timeout.
++
++Adjusting these values is a trade off.
++Lowering the heartbeat timeout will cause individual commands to be committed faster but it will lower the overall throughput of etcd.
++If your etcd instances have low utilization then lowering the heartbeat timeout can improve your command response time.
++
++The election timeout should be set based on the heartbeat timeout and your network ping time between nodes.
++Election timeouts should be at least 10 times your ping time so it can account for variance in your network.
++For example, if the ping time between your nodes is 10ms then you should have at least a 100ms election timeout.
++
++You should also set your election timeout to at least 4 to 5 times your heartbeat timeout to account for variance in leader replication.
++For a heartbeat timeout of 50ms you should set your election timeout to at least 200ms - 250ms.
++
++You can override the default values on the command line:
++
++```sh
++# Command line arguments:
++$ etcd -peer-heartbeat-timeout=100 -peer-election-timeout=500
++
++# Environment variables:
++$ ETCD_PEER_HEARTBEAT_TIMEOUT=100 ETCD_PEER_ELECTION_TIMEOUT=500 etcd
++```
++
++Or you can set the values within the configuration file:
++
++```toml
++[peer]
++heartbeat_timeout = 100
++election_timeout = 100
++```
++
++The values are specified in milliseconds.
++
+ 
+ ## Project Details
+ 
+diff --git a/etcd.go b/etcd.go
+index 13504ac..64a7a08 100644
+--- a/etcd.go
++++ b/etcd.go
+@@ -86,11 +86,11 @@ func main() {
+ 	ps := server.NewPeerServer(info.Name, config.DataDir, info.RaftURL, info.RaftListenHost, &peerTLSConfig, &info.RaftTLS, registry, store, config.SnapshotCount)
+ 	ps.MaxClusterSize = config.MaxClusterSize
+ 	ps.RetryTimes = config.MaxRetryAttempts
+-	if config.HeartbeatTimeout > 0 {
+-		ps.HeartbeatTimeout = time.Duration(config.HeartbeatTimeout) * time.Millisecond
++	if config.Peer.HeartbeatTimeout > 0 {
++		ps.HeartbeatTimeout = time.Duration(config.Peer.HeartbeatTimeout) * time.Millisecond
+ 	}
+-	if config.ElectionTimeout > 0 {
+-		ps.ElectionTimeout = time.Duration(config.ElectionTimeout) * time.Millisecond
++	if config.Peer.ElectionTimeout > 0 {
++		ps.ElectionTimeout = time.Duration(config.Peer.ElectionTimeout) * time.Millisecond
+ 	}
+ 
+ 	// Create client server.
+diff --git a/server/config.go b/server/config.go
+index 6b07518..75585e8 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -67,14 +67,14 @@ type Config struct {
+ 	ShowVersion      bool
+ 	Verbose          bool `toml:"verbose" env:"ETCD_VERBOSE"`
+ 	VeryVerbose      bool `toml:"very_verbose" env:"ETCD_VERY_VERBOSE"`
+-	HeartbeatTimeout int  `toml:"peer_heartbeat_timeout" env:"ETCD_PEER_HEARTBEAT_TIMEOUT"`
+-	ElectionTimeout  int  `toml:"peer_election_timeout" env:"ETCD_PEER_ELECTION_TIMEOUT"`
+ 	Peer             struct {
+ 		Addr     string `toml:"addr" env:"ETCD_PEER_ADDR"`
+ 		BindAddr string `toml:"bind_addr" env:"ETCD_PEER_BIND_ADDR"`
+ 		CAFile   string `toml:"ca_file" env:"ETCD_PEER_CA_FILE"`
+ 		CertFile string `toml:"cert_file" env:"ETCD_PEER_CERT_FILE"`
+ 		KeyFile  string `toml:"key_file" env:"ETCD_PEER_KEY_FILE"`
++		HeartbeatTimeout int  `toml:"heartbeat_timeout" env:"ETCD_PEER_HEARTBEAT_TIMEOUT"`
++		ElectionTimeout  int  `toml:"election_timeout" env:"ETCD_PEER_ELECTION_TIMEOUT"`
+ 	}
+ }
+ 
+@@ -86,10 +86,10 @@ func NewConfig() *Config {
+ 	c.MaxClusterSize = 9
+ 	c.MaxResultBuffer = 1024
+ 	c.MaxRetryAttempts = 3
+-	c.Peer.Addr = "127.0.0.1:7001"
+ 	c.SnapshotCount = 10000
+-	c.ElectionTimeout = 0
+-	c.HeartbeatTimeout = 0
++	c.Peer.Addr = "127.0.0.1:7001"
++	c.Peer.HeartbeatTimeout = 0
++	c.Peer.ElectionTimeout = 0
+ 	return c
+ }
+ 
+@@ -236,8 +236,8 @@ func (c *Config) LoadFlags(arguments []string) error {
+ 	f.IntVar(&c.MaxResultBuffer, "max-result-buffer", c.MaxResultBuffer, "")
+ 	f.IntVar(&c.MaxRetryAttempts, "max-retry-attempts", c.MaxRetryAttempts, "")
+ 	f.IntVar(&c.MaxClusterSize, "max-cluster-size", c.MaxClusterSize, "")
+-	f.IntVar(&c.HeartbeatTimeout, "peer-heartbeat-timeout", c.HeartbeatTimeout, "")
+-	f.IntVar(&c.ElectionTimeout, "peer-election-timeout", c.ElectionTimeout, "")
++	f.IntVar(&c.Peer.HeartbeatTimeout, "peer-heartbeat-timeout", c.Peer.HeartbeatTimeout, "")
++	f.IntVar(&c.Peer.ElectionTimeout, "peer-election-timeout", c.Peer.ElectionTimeout, "")
+ 
+ 	f.StringVar(&cors, "cors", "", "")
+ 

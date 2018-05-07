@@ -1,0 +1,687 @@
+commit a2256a6f24115237f0046435d67e5548fe12744a
+Author: Gyuho Lee <gyuhox@gmail.com>
+Date:   Wed Dec 6 14:24:11 2017 -0800
+
+    hack/scripts-dev/Makefile: grpc-proxy with additional metrics URLs
+    
+    Signed-off-by: Gyuho Lee <gyuhox@gmail.com>
+
+diff --git a/hack/scripts-dev/Makefile b/hack/scripts-dev/Makefile
+index 3569beb..dd6a56e 100644
+--- a/hack/scripts-dev/Makefile
++++ b/hack/scripts-dev/Makefile
+@@ -167,6 +167,61 @@ push-docker-release-master:
+ # Example:
+ #   make build-docker-test -f ./hack/scripts-dev/Makefile
+ #   make compile-with-docker-test -f ./hack/scripts-dev/Makefile
++#   make build-docker-static-ip-test -f ./hack/scripts-dev/Makefile
++#   gcloud docker -- login -u _json_key -p "$(cat /etc/gcp-key-etcd-development.json)" https://gcr.io
++#   make push-docker-static-ip-test -f ./hack/scripts-dev/Makefile
++#   gsutil -m acl ch -u allUsers:R -r gs://artifacts.etcd-development.appspot.com
++#   make pull-docker-static-ip-test -f ./hack/scripts-dev/Makefile
++#   make docker-static-ip-test-certs-run -f ./hack/scripts-dev/Makefile
++#   make docker-static-ip-test-certs-metrics-proxy-run -f ./hack/scripts-dev/Makefile
++
++build-docker-static-ip-test:
++	$(info GO_VERSION: $(_GO_VERSION))
++	@cat ./hack/scripts-dev/docker-static-ip/Dockerfile | sed s/REPLACE_ME_GO_VERSION/$(_GO_VERSION)/ \
++	  > ./hack/scripts-dev/docker-static-ip/.Dockerfile
++
++	docker build \
++	  --tag gcr.io/etcd-development/etcd-static-ip-test:go$(_GO_VERSION) \
++	  --file ./hack/scripts-dev/docker-static-ip/.Dockerfile \
++	  ./hack/scripts-dev/docker-static-ip
++
++push-docker-static-ip-test:
++	$(info GO_VERSION: $(_GO_VERSION))
++	gcloud docker -- push gcr.io/etcd-development/etcd-static-ip-test:go$(_GO_VERSION)
++
++pull-docker-static-ip-test:
++	$(info GO_VERSION: $(_GO_VERSION))
++	docker pull gcr.io/etcd-development/etcd-static-ip-test:go$(_GO_VERSION)
++
++docker-static-ip-test-certs-run:
++	$(info GO_VERSION: $(_GO_VERSION))
++	$(info HOST_TMP_DIR: $(HOST_TMP_DIR))
++	$(info TMP_DIR_MOUNT_FLAG: $(_TMP_DIR_MOUNT_FLAG))
++	docker run \
++	  --rm \
++	  --tty \
++	  $(_TMP_DIR_MOUNT_FLAG) \
++	  --mount type=bind,source=`pwd`/bin,destination=/etcd \
++	  --mount type=bind,source=`pwd`/hack/scripts-dev/docker-static-ip/certs,destination=/certs \
++	  gcr.io/etcd-development/etcd-static-ip-test:go$(_GO_VERSION) \
++	  /bin/bash -c "cd /etcd && /certs/run.sh && rm -rf m*.etcd"
++
++docker-static-ip-test-certs-metrics-proxy-run:
++	$(info GO_VERSION: $(_GO_VERSION))
++	$(info HOST_TMP_DIR: $(HOST_TMP_DIR))
++	$(info TMP_DIR_MOUNT_FLAG: $(_TMP_DIR_MOUNT_FLAG))
++	docker run \
++	  --rm \
++	  --tty \
++	  $(_TMP_DIR_MOUNT_FLAG) \
++	  --mount type=bind,source=`pwd`/bin,destination=/etcd \
++	  --mount type=bind,source=`pwd`/hack/scripts-dev/docker-static-ip/certs-metrics-proxy,destination=/certs-metrics-proxy \
++	  gcr.io/etcd-development/etcd-static-ip-test:go$(_GO_VERSION) \
++	  /bin/bash -c "cd /etcd && /certs-metrics-proxy/run.sh && rm -rf m*.etcd"
++
++# Example:
++#   make build-docker-test -f ./hack/scripts-dev/Makefile
++#   make compile-with-docker-test -f ./hack/scripts-dev/Makefile
+ #   make build-docker-dns-test -f ./hack/scripts-dev/Makefile
+ #   gcloud docker -- login -u _json_key -p "$(cat /etc/gcp-key-etcd-development.json)" https://gcr.io
+ #   make push-docker-dns-test -f ./hack/scripts-dev/Makefile
+diff --git a/hack/scripts-dev/docker-static-ip/Dockerfile b/hack/scripts-dev/docker-static-ip/Dockerfile
+new file mode 100644
+index 0000000..77a6c7b
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/Dockerfile
+@@ -0,0 +1,37 @@
++FROM ubuntu:16.10
++
++RUN rm /bin/sh && ln -s /bin/bash /bin/sh
++RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
++
++RUN apt-get -y update \
++  && apt-get -y install \
++  build-essential \
++  gcc \
++  apt-utils \
++  pkg-config \
++  software-properties-common \
++  apt-transport-https \
++  libssl-dev \
++  sudo \
++  bash \
++  curl \
++  tar \
++  git \
++  netcat \
++  bind9 \
++  dnsutils \
++  && apt-get -y update \
++  && apt-get -y upgrade \
++  && apt-get -y autoremove \
++  && apt-get -y autoclean
++
++ENV GOROOT /usr/local/go
++ENV GOPATH /go
++ENV PATH ${GOPATH}/bin:${GOROOT}/bin:${PATH}
++ENV GO_VERSION REPLACE_ME_GO_VERSION
++ENV GO_DOWNLOAD_URL https://storage.googleapis.com/golang
++RUN rm -rf ${GOROOT} \
++  && curl -s ${GO_DOWNLOAD_URL}/go${GO_VERSION}.linux-amd64.tar.gz | tar -v -C /usr/local/ -xz \
++  && mkdir -p ${GOPATH}/src ${GOPATH}/bin \
++  && go version \
++  && go get -v -u github.com/mattn/goreman
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/Procfile b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/Procfile
+new file mode 100644
+index 0000000..44d2278
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/Procfile
+@@ -0,0 +1,8 @@
++# Use goreman to run `go get github.com/mattn/goreman`
++etcd1: ./etcd --name m1 --data-dir /tmp/m1.data --listen-client-urls https://127.0.0.1:2379 --advertise-client-urls https://localhost:2379 --listen-peer-urls https://127.0.0.1:2380 --initial-advertise-peer-urls=https://localhost:2380 --initial-cluster-token tkn --initial-cluster=m1=https://localhost:2380,m2=https://localhost:22380,m3=https://localhost:32380 --initial-cluster-state new --peer-cert-file=/certs-metrics-proxy/server.crt --peer-key-file=/certs-metrics-proxy/server.key.insecure --peer-trusted-ca-file=/certs-metrics-proxy/ca.crt --peer-client-cert-auth --cert-file=/certs-metrics-proxy/server.crt --key-file=/certs-metrics-proxy/server.key.insecure --trusted-ca-file=/certs-metrics-proxy/ca.crt --client-cert-auth --listen-metrics-urls=https://localhost:2378,http://localhost:9379
++
++etcd2: ./etcd --name m2 --data-dir /tmp/m2.data --listen-client-urls https://127.0.0.1:22379 --advertise-client-urls https://localhost:22379 --listen-peer-urls https://127.0.0.1:22380 --initial-advertise-peer-urls=https://localhost:22380 --initial-cluster-token tkn --initial-cluster=m1=https://localhost:2380,m2=https://localhost:22380,m3=https://localhost:32380 --initial-cluster-state new --peer-cert-file=/certs-metrics-proxy/server.crt --peer-key-file=/certs-metrics-proxy/server.key.insecure --peer-trusted-ca-file=/certs-metrics-proxy/ca.crt --peer-client-cert-auth --cert-file=/certs-metrics-proxy/server.crt --key-file=/certs-metrics-proxy/server.key.insecure --trusted-ca-file=/certs-metrics-proxy/ca.crt --client-cert-auth --listen-metrics-urls=https://localhost:22378,http://localhost:29379
++
++etcd3: ./etcd --name m3 --data-dir /tmp/m3.data --listen-client-urls https://127.0.0.1:32379 --advertise-client-urls https://localhost:32379 --listen-peer-urls https://127.0.0.1:32380 --initial-advertise-peer-urls=https://localhost:32380 --initial-cluster-token tkn --initial-cluster=m1=https://localhost:2380,m2=https://localhost:22380,m3=https://localhost:32380 --initial-cluster-state new --peer-cert-file=/certs-metrics-proxy/server.crt --peer-key-file=/certs-metrics-proxy/server.key.insecure --peer-trusted-ca-file=/certs-metrics-proxy/ca.crt --peer-client-cert-auth --cert-file=/certs-metrics-proxy/server.crt --key-file=/certs-metrics-proxy/server.key.insecure --trusted-ca-file=/certs-metrics-proxy/ca.crt --client-cert-auth --listen-metrics-urls=https://localhost:32378,http://localhost:39379
++
++proxy: ./etcd grpc-proxy start --advertise-client-url=localhost:23790 --listen-addr=localhost:23790 --endpoints=https://localhost:2379,https://localhost:22379,https://localhost:32379 --data-dir=/tmp/proxy.data --cacert=/certs-metrics-proxy/ca.crt --cert=/certs-metrics-proxy/server.crt --key=/certs-metrics-proxy/server.key.insecure --trusted-ca-file=/certs-metrics-proxy/ca.crt --cert-file=/certs-metrics-proxy/server.crt --key-file=/certs-metrics-proxy/server.key.insecure --metrics-addr=http://localhost:9378
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/ca-csr.json b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/ca-csr.json
+new file mode 100644
+index 0000000..ecafaba
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/ca-csr.json
+@@ -0,0 +1,19 @@
++{
++  "key": {
++    "algo": "rsa",
++    "size": 2048
++  },
++  "names": [
++    {
++      "O": "etcd",
++      "OU": "etcd Security",
++      "L": "San Francisco",
++      "ST": "California",
++      "C": "USA"
++    }
++  ],
++  "CN": "ca",
++  "ca": {
++    "expiry": "87600h"
++  }
++}
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/ca.crt b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/ca.crt
+new file mode 100644
+index 0000000..0d8dc38
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/ca.crt
+@@ -0,0 +1,22 @@
++-----BEGIN CERTIFICATE-----
++MIIDsTCCApmgAwIBAgIUYWIIesEznr7VfYawvmttxxmOfeUwDQYJKoZIhvcNAQEL
++BQAwbzEMMAoGA1UEBhMDVVNBMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
++Ew1TYW4gRnJhbmNpc2NvMQ0wCwYDVQQKEwRldGNkMRYwFAYDVQQLEw1ldGNkIFNl
++Y3VyaXR5MQswCQYDVQQDEwJjYTAeFw0xNzEyMDYyMTUzMDBaFw0yNzEyMDQyMTUz
++MDBaMG8xDDAKBgNVBAYTA1VTQTETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UE
++BxMNU2FuIEZyYW5jaXNjbzENMAsGA1UEChMEZXRjZDEWMBQGA1UECxMNZXRjZCBT
++ZWN1cml0eTELMAkGA1UEAxMCY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
++AoIBAQDDN/cW7rl/qz59gF3csnDhp5BAxVY7n0+inzZO+MZIdkCFuus6Klc6mWMY
++/ZGvpWxVDgQvYBs310eq4BrM2BjwWNfgqIn6bHVwwGfngojcDEHlZHw1e9sdBlO5
++e/rNONpNtMUjUeukhzFwPOdsUfweAGsqj4VYJV+kkS3uGmCGIj+3wIF411FliiQP
++WiyLG16BwR1Vem2qOotCRgCawKSb4/wKfF8dvv00IjP5Jcy+aXLQ4ULW1fvj3cRR
++JLdZmZ/PF0Cqm75qw2IqzIhRB5b1e8HyRPeNtEZ7frNLZyFhLgHJbRFF5WooFX79
++q9py8dERBXOxCKrSdqEOre0OU/4pAgMBAAGjRTBDMA4GA1UdDwEB/wQEAwIBBjAS
++BgNVHRMBAf8ECDAGAQH/AgECMB0GA1UdDgQWBBS+CaA8UIkIJT9xhXff4p143UuW
++7TANBgkqhkiG9w0BAQsFAAOCAQEAK7lScAUi+R68oxxmgZ/pdEr9wsMj4xtss+GO
++UDgzxudpT1nYQ2iBudC3LIuTiaUHUSseVleXEKeNbKhKhVhlIwhmPxiOgbbFu9hr
++e2Z87SjtdlbE/KcYFw0W/ukWYxYrq08BB19w2Mqd8J5CnLcj4/0iiH1uARo1swFy
++GUYAJ2I147sHIDbbmLKuxbdf4dcrkf3D4inBOLcRhS/MzaXfdMFntzJDQAo5YwFI
++zZ4TRGOhj8IcU1Cn5SVufryWy3qJ+sKHDYsGQQ/ArBXwQnO3NAFCpEN9rDDuQVmH
+++ATHDFBQZcGfN4GDh74FGnliRjip2sO4oWTfImmgJGGAn+P2CA==
++-----END CERTIFICATE-----
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/gencert.json b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/gencert.json
+new file mode 100644
+index 0000000..09b6726
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/gencert.json
+@@ -0,0 +1,13 @@
++{
++  "signing": {
++    "default": {
++        "usages": [
++          "signing",
++          "key encipherment",
++          "server auth",
++          "client auth"
++        ],
++        "expiry": "87600h"
++    }
++  }
++}
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/gencerts.sh b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/gencerts.sh
+new file mode 100755
+index 0000000..efc098f
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/gencerts.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++
++if ! [[ "$0" =~ "./gencerts.sh" ]]; then
++	echo "must be run from 'fixtures'"
++	exit 255
++fi
++
++if ! which cfssl; then
++	echo "cfssl is not installed"
++	exit 255
++fi
++
++cfssl gencert --initca=true ./ca-csr.json | cfssljson --bare ./ca
++mv ca.pem ca.crt
++openssl x509 -in ca.crt -noout -text
++
++# generate wildcard certificates DNS: *.etcd.local
++cfssl gencert \
++    --ca ./ca.crt \
++    --ca-key ./ca-key.pem \
++    --config ./gencert.json \
++    ./server-ca-csr.json | cfssljson --bare ./server
++mv server.pem server.crt
++mv server-key.pem server.key.insecure
++
++rm -f *.csr *.pem *.stderr *.txt
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/run.sh b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/run.sh
+new file mode 100755
+index 0000000..6089f3e
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/run.sh
+@@ -0,0 +1,119 @@
++#!/bin/sh
++rm -rf /tmp/m1.data /tmp/m2.data /tmp/m3.data /tmp/proxy.data
++
++goreman -f /certs-metrics-proxy/Procfile start &
++
++# TODO: remove random sleeps
++sleep 7s
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert=/certs-metrics-proxy/ca.crt \
++  --cert=/certs-metrics-proxy/server.crt \
++  --key=/certs-metrics-proxy/server.key.insecure \
++  --endpoints=https://localhost:2379 \
++  endpoint health --cluster
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert=/certs-metrics-proxy/ca.crt \
++  --cert=/certs-metrics-proxy/server.crt \
++  --key=/certs-metrics-proxy/server.key.insecure \
++  --endpoints=https://localhost:2379,https://localhost:22379,https://localhost:32379 \
++  put abc def
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert=/certs-metrics-proxy/ca.crt \
++  --cert=/certs-metrics-proxy/server.crt \
++  --key=/certs-metrics-proxy/server.key.insecure \
++  --endpoints=https://localhost:2379,https://localhost:22379,https://localhost:32379 \
++  get abc
++
++#################
++sleep 3s && printf "\n\n" && echo "curl https://localhost:2378/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:2378/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "curl https://localhost:2379/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:2379/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "curl http://localhost:9379/metrics"
++curl -L http://localhost:9379/metrics | grep Put | tail -3
++#################
++
++#################
++sleep 3s && printf "\n\n" && echo "curl https://localhost:22378/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:22378/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "curl https://localhost:22379/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:22379/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "curl http://localhost:29379/metrics"
++curl -L http://localhost:29379/metrics | grep Put | tail -3
++#################
++
++#################
++sleep 3s && printf "\n\n" && echo "curl https://localhost:32378/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:32378/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "curl https://localhost:32379/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:32379/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "curl http://localhost:39379/metrics"
++curl -L http://localhost:39379/metrics | grep Put | tail -3
++#################
++
++#################
++sleep 3s && printf "\n\n" && echo "Requests to gRPC proxy localhost:23790"
++ETCDCTL_API=3 ./etcdctl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  --endpoints=localhost:23790 \
++  put ghi jkl
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  --endpoints=localhost:23790 \
++  get ghi
++
++sleep 3s && printf "\n" && echo "Requests to gRPC proxy https://localhost:23790/metrics"
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:23790/metrics | grep Put | tail -3
++
++sleep 3s && printf "\n" && echo "Requests to gRPC proxy http://localhost:9378/metrics"
++curl -L http://localhost:9378/metrics | grep Put | tail -3
++<<COMMENT
++curl \
++  --cacert /certs-metrics-proxy/ca.crt \
++  --cert /certs-metrics-proxy/server.crt \
++  --key /certs-metrics-proxy/server.key.insecure \
++  -L https://localhost:9378/metrics | grep Put | tail -3
++COMMENT
++#################
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server-ca-csr.json b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server-ca-csr.json
+new file mode 100644
+index 0000000..4cc3892
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server-ca-csr.json
+@@ -0,0 +1,19 @@
++{
++  "key": {
++    "algo": "rsa",
++    "size": 2048
++  },
++  "names": [
++    {
++      "O": "etcd",
++      "OU": "etcd Security",
++      "L": "San Francisco",
++      "ST": "California",
++      "C": "USA"
++    }
++  ],
++  "hosts": [
++    "127.0.0.1",
++    "localhost"
++  ]
++}
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server.crt b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server.crt
+new file mode 100644
+index 0000000..2a57e2e
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server.crt
+@@ -0,0 +1,24 @@
++-----BEGIN CERTIFICATE-----
++MIID/DCCAuSgAwIBAgIUSB2TVFR5v0lf79bffoZGdiRNB3YwDQYJKoZIhvcNAQEL
++BQAwbzEMMAoGA1UEBhMDVVNBMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
++Ew1TYW4gRnJhbmNpc2NvMQ0wCwYDVQQKEwRldGNkMRYwFAYDVQQLEw1ldGNkIFNl
++Y3VyaXR5MQswCQYDVQQDEwJjYTAeFw0xNzEyMDYyMTUzMDBaFw0yNzEyMDQyMTUz
++MDBaMGIxDDAKBgNVBAYTA1VTQTETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UE
++BxMNU2FuIEZyYW5jaXNjbzENMAsGA1UEChMEZXRjZDEWMBQGA1UECxMNZXRjZCBT
++ZWN1cml0eTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALRv9k58Emso
++T4is8s2Vf8hxO3eVJxMd5IUSzmAPsFBcZEKpXo3AbK1CeZVn8aOJWd12cwnziTU9
++31baCKvT6Tm2kRoBXW/wHuxcuazL8xqg15xRQy+//skUEAR3rODyy5hl9dSBE7hl
++QHhpMZx66nF+AEZzgEHo7C1MV8BDDT28nDE1SLgHlzugYeLoWvGiN4KrCGbUizby
++90O6WFZVasHYk5l0TcNiX2EUVOkKeBdZo6bBa2qTf++Q0SX8KUOdsg+avZjjs+qu
++C8mIYhtwFLdhs/0jthgg4/mD73PZBLuK2CuYqvLZtWvDdnn99cZK86rLUwOD4jL2
++lr6BTuwsp48CAwEAAaOBnDCBmTAOBgNVHQ8BAf8EBAMCBaAwHQYDVR0lBBYwFAYI
++KwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFCOx2DWC
++ooWTJHTR/Gf4litdPu4nMB8GA1UdIwQYMBaAFL4JoDxQiQglP3GFd9/inXjdS5bt
++MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEA
++RkRCpvtmCd+l6yHXGeL43rqseIEBT2ujGctRWkjwfe3INgiUHrIsTayoNk9fqmuV
++YBOW5z5vtfAOT/obFevfyqjEaHpl8qkGIty1e8s0xtT4n8tgtO5zhVAyt5bZ52UN
++1P7uUJ+j7dVuqV9+AUHlGeWAassmVWbqd3gVA/nhemIgOtqxbCcZ5277t3k7ALLe
++JUMDyFAYHz8ZcOk92wFT1mMrbt60zsWIb9vWkgdYHdC+DODhQDWNdvm6yW6cBm8m
++iUwTpNQ4W0UdjaQV4u7GU4kJUwCHnR4m/AoC/6/pUhjlBv5oU5TVKPqKr05q/FBZ
++VKLrBSYLChjrTPx0C4BqLA==
++-----END CERTIFICATE-----
+diff --git a/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server.key.insecure b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server.key.insecure
+new file mode 100644
+index 0000000..5b477f5
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs-metrics-proxy/server.key.insecure
+@@ -0,0 +1,27 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIEowIBAAKCAQEAtG/2TnwSayhPiKzyzZV/yHE7d5UnEx3khRLOYA+wUFxkQqle
++jcBsrUJ5lWfxo4lZ3XZzCfOJNT3fVtoIq9PpObaRGgFdb/Ae7Fy5rMvzGqDXnFFD
++L7/+yRQQBHes4PLLmGX11IETuGVAeGkxnHrqcX4ARnOAQejsLUxXwEMNPbycMTVI
++uAeXO6Bh4uha8aI3gqsIZtSLNvL3Q7pYVlVqwdiTmXRNw2JfYRRU6Qp4F1mjpsFr
++apN/75DRJfwpQ52yD5q9mOOz6q4LyYhiG3AUt2Gz/SO2GCDj+YPvc9kEu4rYK5iq
++8tm1a8N2ef31xkrzqstTA4PiMvaWvoFO7CynjwIDAQABAoIBAAr+W1py0sh2n0nr
++h6ug9TUoOQBTNRtEEf1NpQdTTWHID0/Ec/9c/wIbb777o0xcfP4yTlYH4Y894tKu
++3CJj+ezLQ9H6zU+ZqLir+aAemQRBUoGyrc5F+2cS8tri08Ss5ly1saGt756nhKMR
++fbVUA97AV5HzTZg2cdVctmf/bdoZ/ou7v52thPnEfHPtvGFHKEm7ztJq+2RLNZqC
++kGbToGPF19KWh+cLL5IhGraqKnXXuUjMi1RvxLmA4vztfGCkz9145hrAuSEFEs1y
++Fq7IAAHtzzhEcaHpqg+FqqmXQEVrH6+p62/PzfTJdlkzWzroQMdJIib++iX3tN+c
++CR+loMkCgYEAy40Q+4Z+zQ6c2vp8DXal7dLF2FkQ4Ltee6H7J/vJ91w19ThXnCgr
++EkNerYrnLSpQDS4gkXxl7/+m08R5nziopdTSPwtWJjHJoESMhsjLuyXY03IXV/C8
++7xY4L1Uwqp7b6ueqAX3x6HGgBdgty921Lvf7t+kvRkwvcj8Xh7oPJQUCgYEA4u48
++k+HFJDwtw0ZmQZ5ntB7Nn3deoygA1tE+Q9GZadGV0nmUjViZCG6DA+V8h2IYMnyd
++QLQWBdJyhGnAANWajYaUNLfQXbf7Ucb2VbiqMpfD6jgb00OUrv5eZTExDE0QDNJ6
++nMeYQJj7TAuuab9UdUsE2uLderHlB29DQ4eXvoMCgYACdCLeRVLF+gUeBqL0Lpf1
++c/L6lqhDbT7IUr2KT9ixaKUl3ZYAxeMvByze/qumubnZTtMJrew0pmpGZznoF3DA
++/v3B0MsrDrKVgf4Hqef6y4v/kIKDht1gLG5k86vwgpW4ES7VccU2vhfluiNjL7r9
++Y/Pe1arCOCziPax08GM6WQKBgQDAJ8c32acbZbHCdqxDyCQ8CxFGhMeoFEmRnSDC
++QItNZWEeFkFJ5sm+sAVUmU/3O4MNzSNDFLrJN0gtA3bHvhfe2yRH95YCpbWzq2wP
++bg0ARi5o+BXnsIQIIfBAc4T6y45ZrSiR9RjhKikwXXvUo2Sa5Wk5B31PVa9/uiEU
++344IjQKBgCpjpncuUe4ioAI6kmSlaF9FpRKBQbA4NmMD6/scc1r4N1rBO+w4a8oi
++8N+6tmFds4Vl5A9M0OpJ2zwOVOp62EWuYo0zAdcigg6zI2kxZKMG7GeUC9yga3Zr
++FE5npYNx2ypha2FM3DTXm7jUB4Lb0cMGD3Fa0pRTmp+wjaInEu4b
++-----END RSA PRIVATE KEY-----
+diff --git a/hack/scripts-dev/docker-static-ip/certs/Procfile b/hack/scripts-dev/docker-static-ip/certs/Procfile
+new file mode 100644
+index 0000000..8731170
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/Procfile
+@@ -0,0 +1,6 @@
++# Use goreman to run `go get github.com/mattn/goreman`
++etcd1: ./etcd --name m1 --data-dir /tmp/m1.data --listen-client-urls https://127.0.0.1:2379 --advertise-client-urls https://localhost:2379 --listen-peer-urls https://127.0.0.1:2380 --initial-advertise-peer-urls=https://localhost:2380 --initial-cluster-token tkn --initial-cluster=m1=https://localhost:2380,m2=https://localhost:22380,m3=https://localhost:32380 --initial-cluster-state new --peer-cert-file=/certs/server.crt --peer-key-file=/certs/server.key.insecure --peer-trusted-ca-file=/certs/ca.crt --peer-client-cert-auth --cert-file=/certs/server.crt --key-file=/certs/server.key.insecure --trusted-ca-file=/certs/ca.crt --client-cert-auth
++
++etcd2: ./etcd --name m2 --data-dir /tmp/m2.data --listen-client-urls https://127.0.0.1:22379 --advertise-client-urls https://localhost:22379 --listen-peer-urls https://127.0.0.1:22380 --initial-advertise-peer-urls=https://localhost:22380 --initial-cluster-token tkn --initial-cluster=m1=https://localhost:2380,m2=https://localhost:22380,m3=https://localhost:32380 --initial-cluster-state new --peer-cert-file=/certs/server.crt --peer-key-file=/certs/server.key.insecure --peer-trusted-ca-file=/certs/ca.crt --peer-client-cert-auth --cert-file=/certs/server.crt --key-file=/certs/server.key.insecure --trusted-ca-file=/certs/ca.crt --client-cert-auth
++
++etcd3: ./etcd --name m3 --data-dir /tmp/m3.data --listen-client-urls https://127.0.0.1:32379 --advertise-client-urls https://localhost:32379 --listen-peer-urls https://127.0.0.1:32380 --initial-advertise-peer-urls=https://localhost:32380 --initial-cluster-token tkn --initial-cluster=m1=https://localhost:2380,m2=https://localhost:22380,m3=https://localhost:32380 --initial-cluster-state new --peer-cert-file=/certs/server.crt --peer-key-file=/certs/server.key.insecure --peer-trusted-ca-file=/certs/ca.crt --peer-client-cert-auth --cert-file=/certs/server.crt --key-file=/certs/server.key.insecure --trusted-ca-file=/certs/ca.crt --client-cert-auth
+\ No newline at end of file
+diff --git a/hack/scripts-dev/docker-static-ip/certs/ca-csr.json b/hack/scripts-dev/docker-static-ip/certs/ca-csr.json
+new file mode 100644
+index 0000000..ecafaba
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/ca-csr.json
+@@ -0,0 +1,19 @@
++{
++  "key": {
++    "algo": "rsa",
++    "size": 2048
++  },
++  "names": [
++    {
++      "O": "etcd",
++      "OU": "etcd Security",
++      "L": "San Francisco",
++      "ST": "California",
++      "C": "USA"
++    }
++  ],
++  "CN": "ca",
++  "ca": {
++    "expiry": "87600h"
++  }
++}
+diff --git a/hack/scripts-dev/docker-static-ip/certs/ca.crt b/hack/scripts-dev/docker-static-ip/certs/ca.crt
+new file mode 100644
+index 0000000..7bdc3bc
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/ca.crt
+@@ -0,0 +1,22 @@
++-----BEGIN CERTIFICATE-----
++MIIDsTCCApmgAwIBAgIUPGAgz9+DjeuPzrVKqSTcklFhOZMwDQYJKoZIhvcNAQEL
++BQAwbzEMMAoGA1UEBhMDVVNBMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
++Ew1TYW4gRnJhbmNpc2NvMQ0wCwYDVQQKEwRldGNkMRYwFAYDVQQLEw1ldGNkIFNl
++Y3VyaXR5MQswCQYDVQQDEwJjYTAeFw0xNzEyMDYyMTUzMDBaFw0yNzEyMDQyMTUz
++MDBaMG8xDDAKBgNVBAYTA1VTQTETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UE
++BxMNU2FuIEZyYW5jaXNjbzENMAsGA1UEChMEZXRjZDEWMBQGA1UECxMNZXRjZCBT
++ZWN1cml0eTELMAkGA1UEAxMCY2EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
++AoIBAQDHLx2A7Qs+qnL/CQUSU4mT0u4FXC2FUIIsq7rSEjZrVNTALgFWFPVh/NU4
++5LNf4Ef1V2vFCgqoa5OTjvIGx3SYLddC1Hne45vLZwjqo4WxNExUykYhkUeqirxV
++HL3jrobbBk6AWTy8/4etsCXNMrmcQgTuV6Yff0IIhHi1N5GyTFWQIx0VQEYGR0Iy
++pvpwNb7NvSN8qJJPlaNzQweWxbxtfq/Lz6THvH4amrlUqDBJleB0BPlztiAinh6e
++n94rcJhTK79pkRk7rDNTwzOl2GCUsRu3hZPsMqr4GhVcvsHOFYqHNrUtqMbVHYDI
++AKkLbQoUpKlQHgWqvTaDKp9z9jkxAgMBAAGjRTBDMA4GA1UdDwEB/wQEAwIBBjAS
++BgNVHRMBAf8ECDAGAQH/AgECMB0GA1UdDgQWBBTAR9YYHDMfW5gTDi2ER6HBrxl8
++1jANBgkqhkiG9w0BAQsFAAOCAQEAKiZ/j7ybugOMUf9RNl40cKh/J/AbTUklUxc9
++gvYpAf6nIruhrllYXxY8f1jmB6wPTCIHfsUuo6CxjdB8DRYGZay3+fCOSuYmoQZG
++04nRnyD4sCAeOj8I7ugRTOb76Fo/CusS+g4d8peJE23W6qd0jth3EgVFjbNbTB7u
++eZUuL6S0TyXaxLprLty3fSd+ykWlRphYTZQa5NLnD8fcWEr9W8uWZT6kY2bOuoJk
++6m27hH89ux+hjurTDzzOhxK65am4qf3RWKknQ2ujAEfGU69mAaFgS1UQ8uNJ8lRi
++62atiGpca1anYv6HmoRWnQmsI62BATgYOdjuFMMywj/TUpmWXg==
++-----END CERTIFICATE-----
+diff --git a/hack/scripts-dev/docker-static-ip/certs/gencert.json b/hack/scripts-dev/docker-static-ip/certs/gencert.json
+new file mode 100644
+index 0000000..09b6726
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/gencert.json
+@@ -0,0 +1,13 @@
++{
++  "signing": {
++    "default": {
++        "usages": [
++          "signing",
++          "key encipherment",
++          "server auth",
++          "client auth"
++        ],
++        "expiry": "87600h"
++    }
++  }
++}
+diff --git a/hack/scripts-dev/docker-static-ip/certs/gencerts.sh b/hack/scripts-dev/docker-static-ip/certs/gencerts.sh
+new file mode 100755
+index 0000000..efc098f
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/gencerts.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++
++if ! [[ "$0" =~ "./gencerts.sh" ]]; then
++	echo "must be run from 'fixtures'"
++	exit 255
++fi
++
++if ! which cfssl; then
++	echo "cfssl is not installed"
++	exit 255
++fi
++
++cfssl gencert --initca=true ./ca-csr.json | cfssljson --bare ./ca
++mv ca.pem ca.crt
++openssl x509 -in ca.crt -noout -text
++
++# generate wildcard certificates DNS: *.etcd.local
++cfssl gencert \
++    --ca ./ca.crt \
++    --ca-key ./ca-key.pem \
++    --config ./gencert.json \
++    ./server-ca-csr.json | cfssljson --bare ./server
++mv server.pem server.crt
++mv server-key.pem server.key.insecure
++
++rm -f *.csr *.pem *.stderr *.txt
+diff --git a/hack/scripts-dev/docker-static-ip/certs/run.sh b/hack/scripts-dev/docker-static-ip/certs/run.sh
+new file mode 100755
+index 0000000..6d25038
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/run.sh
+@@ -0,0 +1,28 @@
++#!/bin/sh
++rm -rf /tmp/m1.data /tmp/m2.data /tmp/m3.data
++
++goreman -f /certs/Procfile start &
++
++# TODO: remove random sleeps
++sleep 7s
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert=/certs/ca.crt \
++  --cert=/certs/server.crt \
++  --key=/certs/server.key.insecure \
++  --endpoints=https://localhost:2379 \
++  endpoint health --cluster
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert=/certs/ca.crt \
++  --cert=/certs/server.crt \
++  --key=/certs/server.key.insecure \
++  --endpoints=https://localhost:2379,https://localhost:22379,https://localhost:32379 \
++  put abc def
++
++ETCDCTL_API=3 ./etcdctl \
++  --cacert=/certs/ca.crt \
++  --cert=/certs/server.crt \
++  --key=/certs/server.key.insecure \
++  --endpoints=https://localhost:2379,https://localhost:22379,https://localhost:32379 \
++  get abc
+diff --git a/hack/scripts-dev/docker-static-ip/certs/server-ca-csr.json b/hack/scripts-dev/docker-static-ip/certs/server-ca-csr.json
+new file mode 100644
+index 0000000..4cc3892
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/server-ca-csr.json
+@@ -0,0 +1,19 @@
++{
++  "key": {
++    "algo": "rsa",
++    "size": 2048
++  },
++  "names": [
++    {
++      "O": "etcd",
++      "OU": "etcd Security",
++      "L": "San Francisco",
++      "ST": "California",
++      "C": "USA"
++    }
++  ],
++  "hosts": [
++    "127.0.0.1",
++    "localhost"
++  ]
++}
+diff --git a/hack/scripts-dev/docker-static-ip/certs/server.crt b/hack/scripts-dev/docker-static-ip/certs/server.crt
+new file mode 100644
+index 0000000..e31d06f
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/server.crt
+@@ -0,0 +1,24 @@
++-----BEGIN CERTIFICATE-----
++MIID/DCCAuSgAwIBAgIUUE16LbRYR6ClYnxxrCPCzjfJdJ4wDQYJKoZIhvcNAQEL
++BQAwbzEMMAoGA1UEBhMDVVNBMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
++Ew1TYW4gRnJhbmNpc2NvMQ0wCwYDVQQKEwRldGNkMRYwFAYDVQQLEw1ldGNkIFNl
++Y3VyaXR5MQswCQYDVQQDEwJjYTAeFw0xNzEyMDYyMTUzMDBaFw0yNzEyMDQyMTUz
++MDBaMGIxDDAKBgNVBAYTA1VTQTETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UE
++BxMNU2FuIEZyYW5jaXNjbzENMAsGA1UEChMEZXRjZDEWMBQGA1UECxMNZXRjZCBT
++ZWN1cml0eTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANtWJZind1Sh
++JaS06CgUW2B0JOoLxFW5q6hkoTjum/J4cVanwy20dlSrbceIU2xqxYgtPtpN+Oon
++lWHddmU2K5qs0eL+3uIpLdev7i0TARozZK/ZeKr0iLSfil9RG+hupHu5dXXa5eiS
++YWQg0QrRHfbFQGnDa10qNNj1hHG6d8Kt9pqXoR+5H9dGZFapCvev7XidzmBt5WH6
++ZwlDgAWwc1HDtFKNsWZs+ZZSXOpOJqjPI+ae9uKTGpsqB8ilzQi7KeBJ90wslP2l
++cFdOt6vJsUY8MZAfPzGawwS7tRERvGgXGK+wS2osS2BsvEVIKbG8zoPUL3dpZrNv
++kpaor63A6DUCAwEAAaOBnDCBmTAOBgNVHQ8BAf8EBAMCBaAwHQYDVR0lBBYwFAYI
++KwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFLgi8Ltb
++cO92qVvvuPjXpouAber8MB8GA1UdIwQYMBaAFMBH1hgcMx9bmBMOLYRHocGvGXzW
++MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEA
++jfsERigblBrRAXviH8MpjHFuv0TPUSe8h1CfFWeEhWCKmMuzM7FxAgMn4KRI3ZhJ
++upkQHjABXRlCpAb63SnIvOOenwvzLEWVYDvDTcsq1Tql3onsUpn1+RQ8jzpH/0AD
++DbNY/dzAujz2TD0Y2CswAsscwRkMbShfcTXkMXzY7waCrQl2eri+r7u5iJHKyhIP
++LaQ3kLtdhjTztLxPOLKEIALA0sEnAiWw6P/rzXLA+fNAVYPKtkBPZNvfwgQDqgOf
++U327K/2fbtsdhaxUZTEhZpsJi5jSJK44O6vB7GnfCB7EBKQkBi/TEOT+EYim2Kam
++1VbLtlqkJL1pTrCIe0p8WQ==
++-----END CERTIFICATE-----
+diff --git a/hack/scripts-dev/docker-static-ip/certs/server.key.insecure b/hack/scripts-dev/docker-static-ip/certs/server.key.insecure
+new file mode 100644
+index 0000000..2bfc3d9
+--- /dev/null
++++ b/hack/scripts-dev/docker-static-ip/certs/server.key.insecure
+@@ -0,0 +1,27 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIEpAIBAAKCAQEA21YlmKd3VKElpLToKBRbYHQk6gvEVbmrqGShOO6b8nhxVqfD
++LbR2VKttx4hTbGrFiC0+2k346ieVYd12ZTYrmqzR4v7e4ikt16/uLRMBGjNkr9l4
++qvSItJ+KX1Eb6G6ke7l1ddrl6JJhZCDRCtEd9sVAacNrXSo02PWEcbp3wq32mpeh
++H7kf10ZkVqkK96/teJ3OYG3lYfpnCUOABbBzUcO0Uo2xZmz5llJc6k4mqM8j5p72
++4pMamyoHyKXNCLsp4En3TCyU/aVwV063q8mxRjwxkB8/MZrDBLu1ERG8aBcYr7BL
++aixLYGy8RUgpsbzOg9Qvd2lms2+SlqivrcDoNQIDAQABAoIBAQDTHetYMTEqE2Yx
++UDP5iAagI4r4gFT9kpaIojuQmhMe4xFssFOspXwUaWFkYnKx81+ogKxz4gNKFsmx
++hkIUj3yPB/OKQ3pzQ+GtLtjZJ+ayum8a1/9Oxcrj2ICO2Ho9Umod8Nf/lbAgGO2H
++PBMaD0iBI0Gpy4CHDz4I6uENusbVaWW9K8LmyKTEYB570mhU5doRLbMplTPzud8A
++aCDXDC+Jpj9fxBDfSfbKLSHTvQHDTN0PKLV2lRVzcL/Gjf/mKFhcsXcOiCNXSshY
++xveaWgyAKyi81V8SjDB8LLvgBe8zHbnXFUMGWNF7yrdA5plDtio+6NbY1g7Grr3/
++/VsQfRptAoGBAP04vVEAgt6dU6T9+F8nOsCYWHHFJZUCJyLOU3oSZqPoDEDnULF1
++6uLNs+NHuUakX++10iRHnu9wbZQzvsDAggBgIhUwiDfTTMWH7nQEoYNSkcuei9Ir
++g6HFQnBneJ12TUHvVis5OF03UPaegQz0DaMd9QGsuSFpmFPh6egVFcPXAoGBAN2+
++OrBGxhomL1WAubZdU+nwUoaAx8xlPV39s6a/H4da2yfMBbQEDrppp966Kz1+jrgO
++WKXiz7mlkjhfzx1PXF2Tg7PkcdW6FPG3z/qZQj8TrLMbkxPGSPxTBHiLYYimcFJW
++uhhqysF48jP3DRFxA3r33SJuDgW9sLRt9qM147LTAoGAPTXT/ZqkB+/74ixKN6Yh
+++6BX8Nh5JzXoA+/gGegMy54yKBZCWUNpzf1veIdD8CGX1zgaXg66CqMguexwNePT
++CQgz9O9QXj5DlpQvPfhImpgBCjl/DwTZwucOEmHQtC9+qWuTZstkJpRSi+rwwxLT
++oRSCvy7jaYI/Ajff9Ovz4O0CgYEAmSEnUlhtsd0wzvEoTsHAk0s9ElmYoJRBfskW
++6U4PLeAWfDMutRQgP6d7IBqchckCMiTmHxi0rtWiVoADfZAyjwSx7OcTna71i7+O
++RtbTos+pcb7XIM7L1ERYUA6g+kdGRfZSaU5GWrl1OWGgiqzq5F6LPZ2W3WwTvWY6
++7pbmebUCgYBZcKX7CFOPXPn2ijlnUDi5QD9PzEONBCrPVwvaT2Jj+BCAOO1m+eSb
++YGvhyYmtL78xthw1vzBP0s1oyP9FHmlX9bgX09rnZJD5l9vHAG3l8W2Y8VElc9et
++7brrx7VPynFZ1kR+ktiBQhLQgxxFsad1SXjsenkp/18sssoONaQaYw==
++-----END RSA PRIVATE KEY-----
