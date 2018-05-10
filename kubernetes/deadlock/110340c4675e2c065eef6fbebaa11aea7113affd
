@@ -1,0 +1,79 @@
+Author: gmarek <gmarek@google.com>
+Date:   Mon Feb 29 09:51:50 2016 +0100
+
+    Workaround proxy deadlock in metrics gatherer.
+
+diff --git a/pkg/metrics/kubelet_metrics.go b/pkg/metrics/kubelet_metrics.go
+index 4cacfd0..2c77965 100644
+--- a/pkg/metrics/kubelet_metrics.go
++++ b/pkg/metrics/kubelet_metrics.go
+@@ -18,6 +18,7 @@ package metrics
+ 
+ import (
+ 	"fmt"
++	"time"
+ 
+ 	"k8s.io/kubernetes/pkg/util/sets"
+ 
+@@ -133,14 +134,27 @@ func parseKubeletMetrics(data string) (KubeletMetrics, error) {
+ }
+ 
+ func (g *MetricsGrabber) getMetricsFromNode(nodeName string, kubeletPort int) (string, error) {
+-	rawOutput, err := g.client.Get().
+-		Prefix("proxy").
+-		Resource("nodes").
+-		Name(fmt.Sprintf("%v:%v", nodeName, kubeletPort)).
+-		Suffix("metrics").
+-		Do().Raw()
+-	if err != nil {
+-		return "", err
++	// There's a problem with timing out during proxy. Wrapping this in a goroutine to prevent deadlock.
++	// Hanging goroutine will be leaked.
++	finished := make(chan struct{})
++	var err error
++	var rawOutput []byte
++	go func() {
++		rawOutput, err = g.client.Get().
++			Prefix("proxy").
++			Resource("nodes").
++			Name(fmt.Sprintf("%v:%v", nodeName, kubeletPort)).
++			Suffix("metrics").
++			Do().Raw()
++		finished <- struct{}{}
++	}()
++	select {
++	case <-time.After(ProxyTimeout):
++		return "", fmt.Errorf("Timed out when waiting for proxy to gather metrics from %v", nodeName)
++	case <-finished:
++		if err != nil {
++			return "", err
++		}
++		return string(rawOutput), nil
+ 	}
+-	return string(rawOutput), nil
+ }
+diff --git a/pkg/metrics/metrics_grabber.go b/pkg/metrics/metrics_grabber.go
+index 62eabff..ac95999 100644
+--- a/pkg/metrics/metrics_grabber.go
++++ b/pkg/metrics/metrics_grabber.go
+@@ -19,6 +19,7 @@ package metrics
+ import (
+ 	"fmt"
+ 	"strings"
++	"time"
+ 
+ 	"k8s.io/kubernetes/pkg/api"
+ 	client "k8s.io/kubernetes/pkg/client/unversioned"
+@@ -29,6 +30,10 @@ import (
+ 	"github.com/golang/glog"
+ )
+ 
++const (
++	ProxyTimeout = 2 * time.Minute
++)
++
+ type MetricsCollection struct {
+ 	ApiServerMetrics         ApiServerMetrics
+ 	ControllerManagerMetrics ControllerManagerMetrics
+
+commit 110340c4675e2c065eef6fbebaa11aea7113affd
