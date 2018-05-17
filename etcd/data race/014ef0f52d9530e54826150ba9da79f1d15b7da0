@@ -1,0 +1,140 @@
+commit 014ef0f52d9530e54826150ba9da79f1d15b7da0
+Author: Yicheng Qin <qycqycqycqycqyc@gmail.com>
+Date:   Fri Nov 7 16:04:09 2014 -0800
+
+    etcdserver: fix data race in cluster
+    
+    The data race happens when etcd updates member attributes and fetches
+    member info in http handler at the same time.
+
+diff --git a/etcdserver/cluster.go b/etcdserver/cluster.go
+index 7519706..461488f 100644
+--- a/etcdserver/cluster.go
++++ b/etcdserver/cluster.go
+@@ -121,7 +121,7 @@ func (c *Cluster) Members() []*Member {
+ 	defer c.Unlock()
+ 	var sms SortableMemberSlice
+ 	for _, m := range c.members {
+-		sms = append(sms, m)
++		sms = append(sms, m.Clone())
+ 	}
+ 	sort.Sort(sms)
+ 	return []*Member(sms)
+@@ -136,7 +136,7 @@ func (s SortableMemberSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+ func (c *Cluster) Member(id types.ID) *Member {
+ 	c.Lock()
+ 	defer c.Unlock()
+-	return c.members[id]
++	return c.members[id].Clone()
+ }
+ 
+ // MemberByName returns a Member with the given name if exists.
+@@ -153,7 +153,7 @@ func (c *Cluster) MemberByName(name string) *Member {
+ 			memb = m
+ 		}
+ 	}
+-	return memb
++	return memb.Clone()
+ }
+ 
+ func (c *Cluster) MemberIDs() []types.ID {
+@@ -335,6 +335,12 @@ func (c *Cluster) RemoveMember(id types.ID) {
+ 	c.removed[id] = true
+ }
+ 
++func (c *Cluster) UpdateMemberAttributes(id types.ID, attr Attributes) {
++	c.Lock()
++	defer c.Unlock()
++	c.members[id].Attributes = attr
++}
++
+ // nodeToMember builds member through a store node.
+ // the child nodes of the given node should be sorted by key.
+ func nodeToMember(n *store.NodeExtern) (*Member, error) {
+diff --git a/etcdserver/member.go b/etcdserver/member.go
+index cce6a5a..843886d 100644
+--- a/etcdserver/member.go
++++ b/etcdserver/member.go
+@@ -80,6 +80,27 @@ func (m *Member) PickPeerURL() string {
+ 	return m.PeerURLs[rand.Intn(len(m.PeerURLs))]
+ }
+ 
++func (m *Member) Clone() *Member {
++	if m == nil {
++		return nil
++	}
++	mm := &Member{
++		ID: m.ID,
++		Attributes: Attributes{
++			Name: m.Name,
++		},
++	}
++	if m.PeerURLs != nil {
++		mm.PeerURLs = make([]string, len(m.PeerURLs))
++		copy(mm.PeerURLs, m.PeerURLs)
++	}
++	if m.ClientURLs != nil {
++		mm.ClientURLs = make([]string, len(m.ClientURLs))
++		copy(mm.ClientURLs, m.ClientURLs)
++	}
++	return mm
++}
++
+ func memberStoreKey(id types.ID) string {
+ 	return path.Join(storeMembersPrefix, id.String())
+ }
+diff --git a/etcdserver/member_test.go b/etcdserver/member_test.go
+index 12fa210..1ad254d 100644
+--- a/etcdserver/member_test.go
++++ b/etcdserver/member_test.go
+@@ -18,6 +18,7 @@ package etcdserver
+ 
+ import (
+ 	"net/url"
++	"reflect"
+ 	"testing"
+ 	"time"
+ 
+@@ -88,3 +89,21 @@ func TestMemberPick(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestMemberClone(t *testing.T) {
++	tests := []*Member{
++		newTestMemberp(1, nil, "abc", nil),
++		newTestMemberp(1, []string{"http://a"}, "abc", nil),
++		newTestMemberp(1, nil, "abc", []string{"http://b"}),
++		newTestMemberp(1, []string{"http://a"}, "abc", []string{"http://b"}),
++	}
++	for i, tt := range tests {
++		nm := tt.Clone()
++		if nm == tt {
++			t.Errorf("#%d: the pointers are the same, and clone doesn't happen", i)
++		}
++		if !reflect.DeepEqual(nm, tt) {
++			t.Errorf("#%d: member = %+v, want %+v", i, nm, tt)
++		}
++	}
++}
+diff --git a/etcdserver/server.go b/etcdserver/server.go
+index 26c6229..6772857 100644
+--- a/etcdserver/server.go
++++ b/etcdserver/server.go
+@@ -618,13 +618,11 @@ func (s *EtcdServer) applyRequest(r pb.Request) Response {
+ 		default:
+ 			if storeMemberAttributeRegexp.MatchString(r.Path) {
+ 				id := mustParseMemberIDFromKey(path.Dir(r.Path))
+-				m := s.Cluster.Member(id)
+-				if m == nil {
+-					log.Panicf("fetch member %s should never fail", id)
+-				}
+-				if err := json.Unmarshal([]byte(r.Val), &m.Attributes); err != nil {
++				var attr Attributes
++				if err := json.Unmarshal([]byte(r.Val), &attr); err != nil {
+ 					log.Panicf("unmarshal %s should never fail: %v", r.Val, err)
+ 				}
++				s.Cluster.UpdateMemberAttributes(id, attr)
+ 			}
+ 			return f(s.store.Set(r.Path, r.Dir, r.Val, expr))
+ 		}

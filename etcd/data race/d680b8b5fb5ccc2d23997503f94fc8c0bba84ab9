@@ -1,0 +1,50 @@
+commit d680b8b5fb5ccc2d23997503f94fc8c0bba84ab9
+Author: Anthony Romano <anthony.romano@coreos.com>
+Date:   Mon Nov 28 15:49:03 2016 -0800
+
+    grpcproxy: fix race between watch ranges delete() and broadcasts empty()
+    
+    Checking empty() wasn't grabbing the broadcasts lock so the race detector
+    flags it as a data race with coalesce(). Instead, just return the number
+    of remaining watches following delete() and get rid of empty().
+
+diff --git a/proxy/grpcproxy/watch_broadcasts.go b/proxy/grpcproxy/watch_broadcasts.go
+index 3ca6fa2..81e8571 100644
+--- a/proxy/grpcproxy/watch_broadcasts.go
++++ b/proxy/grpcproxy/watch_broadcasts.go
+@@ -96,7 +96,8 @@ func (wbs *watchBroadcasts) add(w *watcher) {
+ 	wbs.bcasts[wb] = struct{}{}
+ }
+ 
+-func (wbs *watchBroadcasts) delete(w *watcher) {
++// delete removes a watcher and returns the number of remaining watchers.
++func (wbs *watchBroadcasts) delete(w *watcher) int {
+ 	wbs.mu.Lock()
+ 	defer wbs.mu.Unlock()
+ 
+@@ -110,10 +111,9 @@ func (wbs *watchBroadcasts) delete(w *watcher) {
+ 		delete(wbs.bcasts, wb)
+ 		wb.stop()
+ 	}
++	return len(wbs.bcasts)
+ }
+ 
+-func (wbs *watchBroadcasts) empty() bool { return len(wbs.bcasts) == 0 }
+-
+ func (wbs *watchBroadcasts) stop() {
+ 	wbs.mu.Lock()
+ 	for wb := range wbs.bcasts {
+diff --git a/proxy/grpcproxy/watch_ranges.go b/proxy/grpcproxy/watch_ranges.go
+index 2746445..31c6b59 100644
+--- a/proxy/grpcproxy/watch_ranges.go
++++ b/proxy/grpcproxy/watch_ranges.go
+@@ -53,8 +53,7 @@ func (wrs *watchRanges) delete(w *watcher) {
+ 	if !ok {
+ 		panic("deleting missing range")
+ 	}
+-	wbs.delete(w)
+-	if wbs.empty() {
++	if wbs.delete(w) == 0 {
+ 		wbs.stop()
+ 		delete(wrs.bcasts, w.wr)
+ 	}
