@@ -8,7 +8,7 @@ import (
 	"fmt"
 )
 
-func TestMutexSessionRelockBug(t *testing.T) {
+func TestMutexSessionRelockBug5199(t *testing.T) {
 	fmt.Println("starting to test.....")
 	clus := NewClusterV3(t, &ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
