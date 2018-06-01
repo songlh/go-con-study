@@ -13,12 +13,12 @@ func TestMutexSessionRelockBug5199(t *testing.T) {
 	clus := NewClusterV3(t, &ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 	cli := clus.RandClient()
-	m := concurrency.NewMutexBug(cli, "test-mutex")
-	if err := m.LockBug(context.TODO()); err != nil {
+	m := concurrency.NewMutex(cli, "test-mutex")
+	if err := m.Lock(context.TODO()); err != nil {
 		t.Fatal(err)
 	}
-	m2 := concurrency.NewMutexBug(cli, "test-mutex")
-	if err := m2.LockBug(context.TODO()); err != nil {
+	m2 := concurrency.NewMutex(cli, "test-mutex")
+	if err := m2.Lock(context.TODO()); err != nil {
 		t.Fatal(err)
 	}
 }
