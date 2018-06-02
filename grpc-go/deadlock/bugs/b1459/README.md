@@ -1,4 +1,4 @@
-### How to run bug1459?
+### How to run [bug1459](https://github.com/grpc/grpc-go/issues/1459)?
 
 ```bash
 $ cd ${GOPATH}
