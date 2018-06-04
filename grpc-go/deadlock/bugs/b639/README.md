@@ -3,6 +3,7 @@
 ```bash
 $ cd ${GOPATH}
 $ go get -u google.golang.org/grpc  
+$ cd ${GOPATH}/src/google.golang.org/grpc
 $ git checkout -b b639 306a1ee0fe2c012a074592da8ffe4e33b5204f2a
 $ go run grpc-go-b639.go
 ```
