@@ -48,8 +48,8 @@ def analysis_total_result(results):
             percentages[9] += 1
 
     print("go goroutine execution time percentage report:")
-    print("This go trace log have totally {0},"
-          " max execution time is {1} ns".format(len(results), max_exec_time))
+    print("This go trace log have totally {0} goroutines,"
+          " max execution time is {1} ns.".format(len(results), max_exec_time))
 
     for key in percentages:
         print("{0}% --------- {1}%, {2}".format(key*10, (key+1)*10, percentages[key]))

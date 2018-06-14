@@ -19,7 +19,7 @@ For example, you url is http://127.0.0.1:36627/.
 ```bash
   $ python gotrace_parser.py -u http://127.0.0.1:36627/
   go goroutine execution time percentage report:
-  This go trace log have totally 100, max execution time is 47848111956 ns
+  This go trace log have totally 100 goroutines, max execution time is 47848111956 ns.
   0% --------- 10%, 2
   10% --------- 20%, 3
   20% --------- 30%, 5
