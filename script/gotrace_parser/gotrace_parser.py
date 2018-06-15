@@ -13,6 +13,10 @@ BASE_URL = ''
 BASE_GOROUTINE = 'Goroutine analysis'
 MAIN_GOROUTINE = 'runtime.main'
 
+IGNORE_GOROUTINE = ['runtime/trace.Start.func1', 'runtime.timerproc',
+                    'runtime.ensureSigM.func1', 'main.main.func2',
+                     'os/signal.loop']
+
 
 def analysis_total_result(results):
     if len(results) == 0:
@@ -112,6 +116,8 @@ def main():
 
     for _link in goroutine_links:
         goroutine_link = BASE_URL + _link.get('href')
+        if _link.get_text() in IGNORE_GOROUTINE:
+            continue
         results = parse_each_page(goroutine_link)
         total_results.update(results)
 
