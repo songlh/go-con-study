@@ -225,7 +225,6 @@ RUN ./contrib/download-frozen-image-v2.sh /docker-frozen-images \
 
 # Install tomlv, runc, containerd, grimes, docker-proxy
 # Please edit hack/dockerfile/install-binaries.sh to update them.
-COPY hack/dockerfile/binaries-commits /tmp/binaries-commits
 COPY hack/dockerfile/install-binaries.sh /tmp/install-binaries.sh
 RUN /tmp/install-binaries.sh tomlv runc containerd tini proxy
 

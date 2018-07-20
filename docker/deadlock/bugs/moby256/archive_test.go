@@ -3,7 +3,6 @@ package docker
 import (
 	"io"
 	"io/ioutil"
-	"os"
 	"os/exec"
 	"testing"
 	"fmt"
