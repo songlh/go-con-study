@@ -25,10 +25,13 @@ def analysis_total_result(results):
     new_results = sorted(results.iteritems(), key=lambda (k, v): (v, k), reverse=True)
     # MAIN_GOROUTINE time is max
     max_exec_time = new_results[0][1]
+    min_exec_time = new_results[len(new_results)-1][1]
     percentages = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0}
+    all_exec_time = []
 
     for _result in new_results:
         _exec_time = _result[1]
+        all_exec_time.append(_exec_time)
         _percentage = (_exec_time * 1.0) / max_exec_time
         if _percentage < 0.1:
             percentages[0] += 1
@@ -55,8 +58,24 @@ def analysis_total_result(results):
     print("This go trace log have totally {0} goroutines,"
           " max execution time is {1} ns.".format(len(results), max_exec_time))
 
+    total_time = 0
+    for key in results.iterkeys():
+        total_time += results[key]
+    print("Average time each goroutine running is {}".format(total_time/len(results)))
+
+    # print("<90% goroutine is {}".format((total_time-little_time)/(len(results)-little_time_count)))
+    sorted_all_exec_time = sorted(all_exec_time)
+    all_little_time = sorted_all_exec_time[:int(len(sorted_all_exec_time)*0.9)]
+    all_little_time_count = 0
+    for item in all_little_time:
+        all_little_time_count += item
+
+    print("average <90% goroutine is {}".format(all_little_time_count / len(all_little_time)))
+
     for key in percentages:
         print("{0}% --------- {1}%, {2}".format(key*10, (key+1)*10, percentages[key]))
+
+    print("mini time is {}".format(min_exec_time))
 
 
 def parse_each_page(url):
