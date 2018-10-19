@@ -28,7 +28,7 @@ def list_go_file(path):
                     for line in lines:
                         items = line.split()
                         for item in items:
-                            if 'pool.Get()' in item or 'pool.Put(':
+                            if 'pool.Get()' in item or 'pool.Put(' in item:
                                 print(item)
                                 pool_usage_count += 1
 
