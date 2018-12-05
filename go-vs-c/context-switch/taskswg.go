@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const numThread = 64
+const numThread = 2
 const workCount = 1000000
 var wg sync.WaitGroup
 
